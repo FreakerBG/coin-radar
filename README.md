@@ -43,6 +43,8 @@ Monitoring runs every 15 seconds only while the mounted dashboard is open and mo
 
 ## Validation
 
+X cache isolation regression checks: `node --experimental-strip-types --test scripts/check-social-cache.mjs`. These exercise the actual social route handlers with simulated authentication, D1, and provider responses (not live integration tests). Shared cache writes contain public evidence only; legacy cache rows are projected through the same allowlist when read. Quota and connection fields are constructed for the current request. Free cache reads remain available when the paid request cap is zero. No database migration is needed for this fix.
+
 `node --experimental-strip-types scripts/check-research.mjs` checks financial caps, entry vetoes, exact alert boundaries, outage behavior and social sample deduplication. Type check and production build through existing scripts. SQL migration/reservation/lock/event deduplication queries were checked against SQLite. X live API calls require credentials and were not exercised. No browser QA performed.
 
 ## Provider documentation
