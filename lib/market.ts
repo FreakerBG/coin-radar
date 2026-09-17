@@ -11,7 +11,8 @@ export function assess(c:Pick<Coin,'liquidity'|'volume'|'change1h'|'change24h'|'
  if(c.change1h!=null&&c.change1h>50)risks.push('More than 50% growth in one hour: elevated reversal risk.');
  if(c.change24h!=null&&c.change24h<-30)risks.push('Price has fallen more than 30% in 24 hours.');
  if(c.liquidity&&c.volume!=null&&c.volume/c.liquidity>30)risks.push('Very high volume relative to liquidity; activity may be distorted.');
- return {score:Math.round(score),verdict:risks.length?'High caution':score>=65?'Research candidate':'Watch',reasons,risks};
+ const displayedScore=Math.floor(score);
+ return {score:displayedScore,verdict:risks.length?'High caution':displayedScore>=65?'Research candidate':'Watch',reasons,risks};
 }
 const cache=new Map<string,{expires:number;value:unknown}>();
 export async function fetchJson(url:string,ttl=60000,headers?:Record<string,string>):Promise<any>{

@@ -9,7 +9,7 @@ const port = 5173;
 export default defineConfig({
   testDir: 'e2e',
   // Keep traces outside the project: writes under the watched root can restart the dev server.
-  outputDir: path.join(tmpdir(), 'coin-radar-playwright'),
+  outputDir: process.env.PLAYWRIGHT_OUTPUT_DIR || path.join(tmpdir(), 'coin-radar-playwright'),
   fullyParallel: false,
   workers: 1,
   retries: 0,

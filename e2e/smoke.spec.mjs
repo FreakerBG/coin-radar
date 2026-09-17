@@ -91,7 +91,7 @@ test('Advisor explains signed-out and unavailable account states', async ({page}
   await expect(page.getByRole('alert').filter({hasText: 'Research storage unavailable.'})).toBeVisible();
 });
 
-for (const width of [360, 390]) {
+for (const width of [320, 360, 390]) {
   test(`narrow mobile viewport (${width}px) has no horizontal page overflow`, async ({page}) => {
     await page.setViewportSize({width, height: 800});
     await mockApis(page);

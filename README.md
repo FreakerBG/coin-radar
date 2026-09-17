@@ -64,14 +64,16 @@ Test groups:
 
 Route tests run the real route handlers and `lib/research-db.ts` against an in-memory SQLite database built from `drizzle/0000_rare_terror.sql`, through a D1-shaped adapter. Only runtime boundaries are replaced: Cloudflare `env`, Sites authentication headers and `fetch`. DEX Screener, CoinDesk and X responses are fixtures. No test makes a network request, uses real credentials or touches production D1; no live X request is made.
 
-Browser smoke (`e2e/`) starts the local dev server (mock Sites sign-in, local Miniflare) and fulfils every `/api/*` call in the browser from fixtures, aborting any non-local request. It covers initial render, provider outage, tab switching, device-local watchlist/alert settings, signed-out and unavailable Advisor account states, and horizontal overflow at 360 and 390 px. It does not cover authenticated D1 flows, real providers or production hosting. At 320 px the tab strip still overflows by about 8 px.
+Browser smoke (`e2e/`) starts the local dev server (mock Sites sign-in, local Miniflare) and fulfils every `/api/*` call in the browser from fixtures, aborting any non-local request. It covers initial render, provider outage, tab switching, device-local watchlist/alert settings, signed-out and unavailable Advisor account states, and horizontal overflow at 320, 360 and 390 px. It does not cover authenticated D1 flows, real providers or production hosting.
+
+GitHub Actions runs `npm run verify` and the Chromium browser smoke suite on Linux for every pull request and every push to `main`. Browser traces are retained for seven days when the smoke job fails.
 
 Known limitations, not changed in Stage 02:
 
 - Monitor and social locks expire after 60 seconds. A scan longer than that can overlap the next; event IDs prevent duplicate events, but overlapping scans can write an older observed peak.
 - Configuration saves are last-writer-wins across tabs. `revision` columns are incremented but not checked.
 - Failed paid X attempts consume the reserved request, by design. The daily cap uses the UTC date.
-- A market score of 64.5 displays as 65 but stays `Watch`; the verdict uses the unrounded score. Allocation rounding can land one cent below an exact cent value, never above.
+- Allocation rounding can land one cent below an exact cent value, never above.
 - No migration is required for Stage 02.
 
 ## Provider documentation

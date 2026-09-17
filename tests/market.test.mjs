@@ -150,9 +150,10 @@ describe('research score', () => {
     assert.equal(assess({...strong, change1h: 20, buys: 20, ageHours: 23}).verdict, 'High caution', 'risk vetoes a high score');
   });
 
-  test('a fractional score is displayed rounded but the verdict uses the unrounded value', () => {
-    // Known presentation mismatch, kept fail-closed: 64.5 displays as 65 but stays Watch.
-    const result = assess({liquidity: 100000, volume: 100000, change1h: 4.5, change24h: 0, buys: 0, sells: 0, ageHours: 24});
-    assert.deepEqual([result.score, result.verdict], [65, 'Watch']);
+  test('fractional scores are floored so the displayed score and verdict agree', () => {
+    const below = assess({liquidity: 100000, volume: 100000, change1h: 4.99, change24h: 0, buys: 0, sells: 0, ageHours: 24});
+    const candidate = assess({liquidity: 100000, volume: 100000, change1h: 5.01, change24h: 0, buys: 0, sells: 0, ageHours: 24});
+    assert.deepEqual([below.score, below.verdict], [64, 'Watch']);
+    assert.deepEqual([candidate.score, candidate.verdict], [65, 'Research candidate']);
   });
 });
