@@ -1,22 +1,5 @@
-import assert from 'node:assert/strict';
-import {defaultConfig,sizePosition,evaluatePosition,socialSummary} from '../lib/advisor.ts';
-const config={...defaultConfig,bankroll:1000};
-const coin={verdict:'Research candidate'};
-assert.equal(sizePosition(config,0,coin,false).amount,0,'unreviewed token must never receive an allocation');
-assert.equal(sizePosition(config,0,{verdict:'High caution'},true).amount,0,'market risk must veto an entry');
-assert.equal(sizePosition(config,0,coin,true).amount,10,'1% total-loss ceiling caps principal, not only planned stop loss');
-assert.equal(sizePosition(config,997,coin,true).amount,3,'remaining capital must cap allocation');
-assert.equal(sizePosition(config,1005,coin,true).amount,0,'overcommitted accounts cannot add exposure');
-assert.equal(sizePosition({...config,bankroll:0},0,coin,true).amount,0,'missing budget must fail closed');
-const p={entryPrice:1,peakPrice:1,entryLiquidity:100000,takeProfitPct:50,stopPct:20,trailingPct:15,liquidityDropPct:30};
-assert(evaluatePosition(p,.8,100000).events.some(e=>e.kind==='loss_threshold'));
-assert(evaluatePosition(p,1.5,100000).events.some(e=>e.kind==='profit_target'));
-assert(evaluatePosition({...p,peakPrice:2},1.7,100000).events.some(e=>e.kind==='trailing_pullback'));
-assert(evaluatePosition(p,1,70000).events.some(e=>e.kind==='liquidity_drop'));
-assert(evaluatePosition(p,null,100000).events.some(e=>e.kind==='data_unavailable'));
-assert.equal(evaluatePosition({...p,peakPrice:2},null,100000).peak,2,'outage cannot reset the high-water mark');
-assert.equal(evaluatePosition(p,1.1,100000).events.length,0,'ordinary movement must not trigger exits');
-assert(!evaluatePosition({...p,peakPrice:2},1.9,100000).events.some(e=>e.kind==='trailing_pullback'));
-const social=socialSummary([{text:'Buy this https://a.test',author_id:'one'},{text:'BUY   this https://b.test',author_id:'one'},{text:'Different opinion',author_id:'two'}]);
-assert.equal(social.duplicateText,1);assert.equal(social.uniqueAuthors,2);
-console.log('PASS: allocation vetoes/caps, profit/loss/trailing/liquidity alerts, outage handling and social sample deduplication.');
+// Documented entry point for the research logic checks; the tests live in tests/.
+// Run with Node >=22.13: node --experimental-strip-types scripts/check-research.mjs
+// (also available as npm run test:research)
+import '../tests/advisor.test.mjs';
+import '../tests/market.test.mjs';

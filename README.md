@@ -15,7 +15,7 @@ X requires an `X_BEARER_TOKEN` server-side secret set in Sites environment setti
 - `GET /api/market?addresses=<addresses>`: watchlist batch, up to 30.
 - `GET /api/news`: CoinDesk RSS headlines, five-minute best-effort cache.
 - `GET /api/portfolio`: authenticated user config, open recorded positions, latest 100 events.
-- `POST /api/portfolio`: authenticated same-origin config/record-position/mark-closed actions. Validates input. Position IDs make retries idempotent. No trade execution.
+- `POST /api/portfolio`: authenticated same-origin config/record-position/mark-closed actions. Validates input. Position IDs make retries idempotent. The 30 open-position limit is applied atomically. No trade execution.
 - `GET /api/advisor?address=<mint>`: fresh market screening plus conditional position ceiling. API allocation remains zero while safety is unverified. Frontend can calculate a conditional amount after explicit manual review.
 - `POST /api/monitor`: authenticated same-origin position check. Reads exact recorded pools, updates observed peaks, emits one durable event per position and rule. Per-user lock prevents overlapping checks. Closed positions excluded.
 - `GET /api/social[?address=<mint>]`: connection state, cached evidence, daily usage. No paid request.
@@ -43,7 +43,38 @@ Monitoring runs every 15 seconds only while the mounted dashboard is open and mo
 
 ## Validation
 
-`node --experimental-strip-types scripts/check-research.mjs` checks financial caps, entry vetoes, exact alert boundaries, outage behavior and social sample deduplication. Type check and production build through existing scripts. SQL migration/reservation/lock/event deduplication queries were checked against SQLite. X live API calls require credentials and were not exercised. No browser QA performed.
+Node 22.13 or newer. Run `npm ci` first.
+
+| Command | Runs |
+| --- | --- |
+| `npm run verify` | `typecheck`, `lint`, `test`, `build` in that order; stops at the first failure. |
+| `npm run typecheck` | `tsc --noEmit` without writing `tsconfig.tsbuildinfo`. |
+| `npm run lint` | ESLint. Violations that existed before Stage 02 are recorded in `eslint-suppressions.json`; any new violation fails. |
+| `npm test` | All offline tests in `tests/` (Node test runner). |
+| `npm run test:research` | Advisor and market logic only. Also `node --experimental-strip-types scripts/check-research.mjs`. |
+| `npm run test:social-cache` | X cache isolation only. Also `node --experimental-strip-types --test scripts/check-social-cache.mjs`. |
+| `npm run test:browser` | Playwright smoke tests (not part of `verify`). Needs Chromium: `npx playwright install chromium`. |
+
+Test groups:
+
+- `advisor.test.mjs`: position sizing vetoes, caps, cent rounding and settings boundaries; exact loss, profit, trailing and liquidity thresholds (equality triggers each rule); unavailable price/liquidity; observed peaks; social sample summary.
+- `market.test.mjs`: input sanitizing, pair normalization, every score and warning boundary, verdicts, safe links; paid promotion never changes the result.
+- `social-cache.test.mjs`: two users sharing one cache row, legacy row projection, per-request quota and connection state, fresh/stale/zero-cap paths, removed credential, atomic quota, provider failure and malformed responses, contract lock release, auth and same-origin guards.
+- `portfolio-route.test.mjs`, `advisor-route.test.mjs`, `monitor-route.test.mjs`, `research-db.test.mjs`: auth, same-origin, validation, per-user isolation, idempotent recording, the 30-position limit, zero API allocation, social exclusion, per-user monitor locks, durable event deduplication, outages and lock release.
+
+Route tests run the real route handlers and `lib/research-db.ts` against an in-memory SQLite database built from `drizzle/0000_rare_terror.sql`, through a D1-shaped adapter. Only runtime boundaries are replaced: Cloudflare `env`, Sites authentication headers and `fetch`. DEX Screener, CoinDesk and X responses are fixtures. No test makes a network request, uses real credentials or touches production D1; no live X request is made.
+
+Browser smoke (`e2e/`) starts the local dev server (mock Sites sign-in, local Miniflare) and fulfils every `/api/*` call in the browser from fixtures, aborting any non-local request. It covers initial render, provider outage, tab switching, device-local watchlist/alert settings, signed-out and unavailable Advisor account states, and horizontal overflow at 320, 360 and 390 px. It does not cover authenticated D1 flows, real providers or production hosting.
+
+GitHub Actions runs `npm run verify` and the Chromium browser smoke suite on Linux for every pull request and every push to `main`. Browser traces are retained for seven days when the smoke job fails.
+
+Known limitations, not changed in Stage 02:
+
+- Monitor and social locks expire after 60 seconds. A scan longer than that can overlap the next; event IDs prevent duplicate events, but overlapping scans can write an older observed peak.
+- Configuration saves are last-writer-wins across tabs. `revision` columns are incremented but not checked.
+- Failed paid X attempts consume the reserved request, by design. The daily cap uses the UTC date.
+- Allocation rounding can land one cent below an exact cent value, never above.
+- No migration is required for Stage 02.
 
 ## Provider documentation
 
