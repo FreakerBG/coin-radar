@@ -12,12 +12,16 @@
     "start": "node --import ./scripts/sites-env.mjs ./node_modules/wrangler/bin/wrangler.js dev --config dist/server/wrangler.json --local --persist-to .wrangler/state --ip 127.0.0.1 --inspector-port 0",
     "lint": "eslint . --ignore-pattern dist --ignore-pattern .next",
     "typecheck": "tsc --noEmit --incremental false",
-    "test": "node --experimental-strip-types --test --test-reporter=spec \"tests/**/*.test.mjs\"",
+    "test": "npm run test:migrations && node --experimental-strip-types --test --test-reporter=spec \"tests/*.test.mjs\"",
+    "test:migrations": "node --experimental-strip-types --test --test-reporter=spec \"tests/migrations/*.test.mjs\"",
     "test:research": "node --experimental-strip-types --test --test-reporter=spec tests/advisor.test.mjs tests/market.test.mjs",
     "test:social-cache": "node --experimental-strip-types --test --test-reporter=spec tests/social-cache.test.mjs",
     "test:browser": "playwright test",
     "verify": "npm run typecheck && npm run lint && npm run test && npm run build",
-    "db:generate": "drizzle-kit generate"
+    "db:generate": "drizzle-kit generate",
+    "db:migrations:check": "node scripts/db-migrations.mjs check",
+    "db:migrate:local": "node scripts/db-migrations.mjs apply-local",
+    "db:migrations:list:local": "node scripts/db-migrations.mjs list-local"
   },
   "dependencies": {
     "@base-ui/react": "^1.7.0",
