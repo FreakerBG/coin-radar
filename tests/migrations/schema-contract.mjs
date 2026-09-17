@@ -1,60 +1,15 @@
-// What the application requires of the migrated D1 schema, derived from the SQL in app/ and lib/.
+// Checks the application's schema requirements (lib/schema-requirements.ts) against a migrated database.
 // Constraints are checked by meaning (affinity, nullability, unique keys, application-style inserts),
 // not by SQL text, so harmless formatting or column-order changes in new migrations do not fail.
 import {readdirSync, readFileSync} from 'node:fs';
 import path from 'node:path';
+import {requiredTables, schemaProbes} from '../../lib/schema-requirements.ts';
 import {projectRoot} from '../../scripts/migrations.mjs';
 import {applicationTables, columns, primaryKey, uniqueKeys} from '../helpers/migration-db.mjs';
 
-const PROBE = 'schema-contract-probe';
+export {requiredTables};
 
-// columns: required columns and SQLite affinity. key: the conflict target the application relies on.
-// inserted: the columns the application's INSERT supplies; every other column must be nullable or defaulted.
-// All listed columns are NOT NULL unless named in `nullable`.
-export const requiredTables = {
-  // lib/research-db.ts getConfig reads by user; POST /api/portfolio upserts ON CONFLICT(user_id), bumping revision.
-  research_accounts: {
-    columns: {user_id: 'TEXT', config: 'TEXT', revision: 'INTEGER'},
-    key: ['user_id'],
-    inserted: ['user_id', 'config'],
-    defaults: {revision: 0},
-  },
-  // Owned by user_id. INSERT OR IGNORE on id makes recording idempotent; open means closed_at IS NULL.
-  research_positions: {
-    columns: {id: 'TEXT', user_id: 'TEXT', data: 'TEXT', closed_at: 'TEXT', revision: 'INTEGER'},
-    nullable: ['closed_at'],
-    key: ['id'],
-    inserted: ['id', 'user_id', 'data'],
-    defaults: {closed_at: null, revision: 0},
-  },
-  // Owned by user_id. POST /api/monitor stores one event per position and rule (INSERT OR IGNORE on id);
-  // GET /api/portfolio orders by created_at.
-  research_events: {
-    columns: {id: 'TEXT', user_id: 'TEXT', position_id: 'TEXT', kind: 'TEXT', data: 'TEXT', created_at: 'TEXT'},
-    key: ['id'],
-    inserted: ['id', 'user_id', 'position_id', 'kind', 'data', 'created_at'],
-  },
-  // acquireLock upserts ON CONFLICT(id) and compares expires as epoch milliseconds.
-  research_locks: {
-    columns: {id: 'TEXT', owner: 'TEXT', expires: 'INTEGER'},
-    key: ['id'],
-    inserted: ['id', 'owner', 'expires'],
-  },
-  // One row of public X evidence per contract, shared by all users (ON CONFLICT(address)); fetched_at is
-  // epoch milliseconds. Per-user quota or connection state must never be stored here.
-  social_cache: {
-    columns: {address: 'TEXT', data: 'TEXT', fetched_at: 'INTEGER'},
-    key: ['address'],
-    inserted: ['address', 'data', 'fetched_at'],
-    shared: true,
-  },
-  // Per-user UTC-daily quota rows (id x:<user>:<date>); the reservation upserts ON CONFLICT(id).
-  social_usage: {
-    columns: {id: 'TEXT', requests: 'INTEGER'},
-    key: ['id'],
-    inserted: ['id', 'requests'],
-  },
-};
+const PROBE = 'schema-contract-probe';
 
 // SQLite's type-affinity rules (https://www.sqlite.org/datatype3.html#determination_of_column_affinity).
 export function affinity(declaredType) {
@@ -131,8 +86,14 @@ function sourceFiles(directory) {
   });
 }
 
-// Every D1 statement the application prepares. A prepare() whose SQL is not a plain string literal,
-// and any exec() call, is reported so this check is extended rather than silently skipping it.
+// prepare() calls whose SQL is generated at runtime, with every statement they can issue.
+const generatedStatements = {
+  'app/api/health/route.ts': {calls: 1, statements: () => schemaProbes().map(probe => probe.sql)},
+};
+
+// Every D1 statement the application prepares. A prepare() whose SQL is neither a plain string literal
+// nor registered in generatedStatements, and any exec() call, is reported so this check is extended
+// rather than skipping it.
 export function applicationStatements() {
   const statements = [];
   const unchecked = [];
@@ -143,11 +104,14 @@ export function applicationStatements() {
     const literals = [...source.matchAll(/\.prepare\(\s*(['"`])((?:(?!\1)[^\\]|\\.)*)\1\s*\)/g)]
       .filter(([, quote, sql]) => quote !== '`' || !sql.includes('${'))
       .map(([, , sql]) => sql.replace(/\\(.)/g, '$1'));
-    if (literals.length !== calls) unchecked.push(`${name}: ${calls - literals.length} prepare() call(s) without a plain SQL string literal`);
+    const generated = generatedStatements[name];
+    if (calls - literals.length !== (generated?.calls ?? 0)) {
+      unchecked.push(`${name}: ${calls - literals.length} prepare() call(s) without a plain SQL string literal`);
+    }
     // D1's exec() runs raw SQL that is never prepared here (RegExp exec() is reported too; check it by hand).
     const execs = source.match(/\.exec\(/g)?.length ?? 0;
     if (execs) unchecked.push(`${name}: ${execs} exec() call(s) whose SQL is not checked`);
-    statements.push(...literals.map(sql => ({file: name, sql})));
+    statements.push(...literals.map(sql => ({file: name, sql})), ...(generated?.statements() ?? []).map(sql => ({file: name, sql})));
   }
   return {statements, unchecked};
 }

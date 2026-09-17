@@ -20,6 +20,9 @@ X requires an `X_BEARER_TOKEN` server-side secret set in Sites environment setti
 - `POST /api/monitor`: authenticated same-origin position check. Reads exact recorded pools, updates observed peaks, emits one durable event per position and rule. Per-user lock prevents overlapping checks. Closed positions excluded.
 - `GET /api/social[?address=<mint>]`: connection state, cached evidence, daily usage. No paid request.
 - `POST /api/social` with `{address}`: authenticated same-origin on-demand exact-contract X recent search; max 25 posts, author IDs and engagement counts, 15-minute D1 cache. No user expansions. Includes sample deduplication; does not claim whole-market social velocity. Per-contract lock and atomic per-user UTC daily request cap. Failed attempts conservatively consume the request allowance. Provider billing can differ from request count; enforce dollar spend at X.
+- `GET /api/health`: authenticated, read-only check that D1 is reachable and has every table and column the routes use. Returns `ok`/`compatible`, or 503 with `storage: unavailable` or `schema: incompatible`. No writes, no provider requests, no schema details in the response.
+
+Route failures write one redacted JSON line per failure (`coin_radar.failure`, with route, operation, level and error) to the Worker log. Records never include request bodies, user identifiers, email addresses or credentials; see [docs/deployment-runbook.md](docs/deployment-runbook.md).
 
 All monetary inputs are USD. Access relies on private Sites sign-in. Do not make public with paid integrations without reviewing access and abuse protection.
 
@@ -62,6 +65,8 @@ Test groups:
 - `market.test.mjs`: input sanitizing, pair normalization, every score and warning boundary, verdicts, safe links; paid promotion never changes the result.
 - `social-cache.test.mjs`: two users sharing one cache row, legacy row projection, per-request quota and connection state, fresh/stale/zero-cap paths, removed credential, atomic quota, provider failure and malformed responses, contract lock release, auth and same-origin guards.
 - `portfolio-route.test.mjs`, `advisor-route.test.mjs`, `monitor-route.test.mjs`, `research-db.test.mjs`: auth, same-origin, validation, per-user isolation, idempotent recording, the 30-position limit, zero API allocation, social exclusion, per-user monitor locks, durable event deduplication, outages and lock release.
+- `health-route.test.mjs`: sign-in guard, one read-only probe per required table, missing binding, missing table or column reported only in failure records, storage errors.
+- `diagnostics.test.mjs`: redaction of credentials, bearer tokens and emails; record format and levels; failure records from portfolio, advisor, monitor (including lock release), social, market and news without response changes; validation errors are not failures.
 - `migrations/structure.test.mjs`: journal, file and snapshot ordering, duplicate and missing migrations, the immutability lock, the build's migration check and the migration CLI.
 - `migrations/fresh.test.mjs`: every migration applied once, in order, to a new temporary database file; the schema contract the routes rely on (`migrations/schema-contract.mjs`); every application SQL statement compiled against the result; parity with `db/schema.ts`; a real read/write round trip.
 - `migrations/upgrade.test.mjs`: populated databases (`migrations/upgrade-fixtures.mjs`, including pre-Stage-02 shared X cache rows) upgraded from every historical version with no data lost or changed, then served by the real portfolio, monitor and social routes; self-tests proving destructive or incompatible migrations are reported.

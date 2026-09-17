@@ -70,6 +70,7 @@ export const upgradeFixtures = {
       const portfolio = await import('../../app/api/portfolio/route.ts');
       const monitor = await import('../../app/api/monitor/route.ts');
       const social = await import('../../app/api/social/route.ts');
+      const health = await import('../../app/api/health/route.ts');
       const {defaultConfig} = await import('../../lib/advisor.ts');
       const d1 = createD1(sqlite);
       runtime.env.DB = d1;
@@ -80,8 +81,11 @@ export const upgradeFixtures = {
         : Response.json({pairs: pools}));
       const post = (route, path, payload) => route.POST(jsonRequest(path, {method: 'POST', body: payload}));
 
-      // Portfolio: each user loads only their own settings, open positions and events.
+      // The post-deployment health check passes on the upgraded database.
       signIn(userA);
+      assert.equal((await body(await health.GET())).schema, 'compatible');
+
+      // Portfolio: each user loads only their own settings, open positions and events.
       const a = await body(await portfolio.GET());
       assert.deepEqual(a.config, {...defaultConfig, ...configA});
       assert.deepEqual([a.positions.map(p => p.id), a.events.map(e => e.id)], [[ids.aOpen], [`${ids.aOpen}:loss_threshold`]]);

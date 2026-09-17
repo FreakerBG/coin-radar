@@ -91,6 +91,22 @@ export function installFetch(handler) {
 }
 export const offlineFetch = () => { throw new Error('Unexpected network request in an offline test.'); };
 
+// Failure records written by lib/diagnostics.ts are collected here instead of printed, so tests can
+// assert on them. Any other console output passes through unchanged.
+export const failures = [];
+for (const level of ['error', 'warn']) {
+  const write = console[level].bind(console);
+  console[level] = (...args) => {
+    try {
+      const record = args.length === 1 && typeof args[0] === 'string' ? JSON.parse(args[0]) : null;
+      if (record?.event === 'coin_radar.failure') return void failures.push(record);
+    } catch {
+      // Not a failure record.
+    }
+    write(...args);
+  };
+}
+
 // lib/market.ts keeps a module-level response cache keyed by URL. Each test gets a
 // clock far beyond earlier tests' TTLs, so cached provider data never crosses tests.
 let clockBase = Date.UTC(2026, 0, 5, 12);
