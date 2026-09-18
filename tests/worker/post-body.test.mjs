@@ -15,7 +15,9 @@ import {startBuiltWorker} from '../helpers/built-worker.mjs';
 const STREAM_ERROR = "Can't read from request stream after response has been sent";
 const RESTARTED = 'Your worker restarted mid-request';
 const DEBUG_LINE = '[wrangler-ProxyWorker:info] ';
-const WATCH = [STREAM_ERROR, RESTARTED, DEBUG_LINE];
+// Each follow-up health check the Worker really served, as its dev proxy logs it.
+const HEALTH_SERVED = '[wrangler-ProxyWorker:info] GET /api/health 200';
+const WATCH = [STREAM_ERROR, RESTARTED, DEBUG_LINE, HEALTH_SERVED];
 const REQUEST_TIMEOUT_MS = 8000;
 const signedIn = {'oai-authenticated-user-id': 'local-worker-test', 'oai-authenticated-user-email': 'worker-test@example.test'};
 const config = {bankroll: 1000, riskPct: 2, maxAllocationPct: 5, takeProfitPct: 40, stopPct: 20, trailingPct: 15, liquidityDropPct: 30, xDailyRequests: 5};
@@ -226,6 +228,7 @@ for (const [name, vars] of [['without an X secret', {}], ['with a fake local X s
       assertCleanLog(worker);
       assert.ok(followUps.requests >= 60, `${followUps.requests} requests were sent`);
       assert.equal(followUps.healthy, followUps.requests, 'every request was followed by a healthy signed-in request');
+      assert.ok(worker.count(HEALTH_SERVED) >= followUps.requests + 1, `the Worker served ${worker.count(HEALTH_SERVED)} health checks for ${followUps.requests} requests`);
       const unsupported = Object.entries(apiRoutes).flatMap(([path, methods]) => ['POST', 'PUT', 'PATCH', 'DELETE'].filter(method => !methods.includes(method)).map(method => `${method} ${path}`));
       assert.equal(unsupported.length, 25);
       assert.deepEqual(unsupported.filter(pair => !answered405.has(pair)), [], 'every unsupported method on every API route was sent a body and answered 405');
