@@ -263,7 +263,8 @@ export function scoreCandidate(s: CandidateSnapshot): Assessment {
     if (score < OPPORTUNITY_MIN_SCORE) blockers.push({id: 'score_below_threshold', category: 'momentum', message: `Score ${score} is below ${OPPORTUNITY_MIN_SCORE}.`});
     const unassessed = checks.filter(check => !check.available);
     if (unassessed.length) blockers.push({id: 'risk_inputs_incomplete', category: 'safety', message: `Risk not fully assessed: ${unassessed.map(check => check.missing).join('; ')}.`});
-    if (s.contractSafety.status !== 'verified') blockers.push({id: 'contract_safety_unverified', category: 'safety', message: 'Contract safety data is unavailable, so opportunity status fails closed.'});
+    if (s.contractSafety.status === 'unsafe') blockers.push({id: 'contract_safety_unverified', category: 'safety', message: 'Contract safety checks failed, so opportunity status fails closed.'});
+    else if (s.contractSafety.status !== 'verified') blockers.push({id: 'contract_safety_unverified', category: 'safety', message: 'Contract safety data is unavailable, so opportunity status fails closed.'});
   }
   const opportunity = state !== 'REJECTED' && blockers.length === 0;
   const risks = checks.filter(check => check.available && !check.passed).map(check => `${check.risk}.`);

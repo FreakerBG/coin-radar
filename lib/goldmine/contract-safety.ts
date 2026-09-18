@@ -18,6 +18,21 @@ import {at, type CandidateSnapshot, type ContractSafety, type ContractSafetyFact
 export const SOURCE = 'rugcheck';
 const REPORT_URL = (address: string) => `https://api.rugcheck.xyz/v1/tokens/${encodeURIComponent(address)}/report`;
 const REQUEST_TIMEOUT_MS = 8000;
+// Hard ceiling on RugCheck calls per attachContractSafety call, independent of the 429 backoff below: a
+// single Goldmine scan can surface up to 30 actionable candidates (lib/market.ts caps discovery at 30
+// tokens), which alone could exceed RugCheck's observed ~15-request unauthenticated window even if every
+// response were fast. Candidates beyond this cap simply keep their existing (unavailable) contractSafety,
+// the same predictable fail-closed outcome as hitting a 429.
+export const MAX_CHECKS_PER_SCAN = 12;
+// Wall-clock budget for the whole attachContractSafety call, measured against the real clock (not the
+// `now` parameter, which callers can fix for deterministic scoring/cache math). goldmine:scan's own lock
+// (lib/research-db.ts, acquireLock) expires 60s after it is taken, and discovery alone (lib/market.ts)
+// can already take up to ~24s in the worst case before this stage even starts; without its own ceiling, a
+// slow or degraded RugCheck could let this stage alone run past the lock's expiry (MAX_CHECKS_PER_SCAN
+// requests at REQUEST_TIMEOUT_MS each is, worst case, 96s), letting a second scan acquire the lock while
+// this one is still running and double the effective request burst against RugCheck. Once the budget is
+// spent, every remaining candidate keeps its existing (unavailable) contractSafety.
+export const SCAN_BUDGET_MS = 20000;
 // How long a fetched report is reused before asking RugCheck again. Well under its observed
 // unauthenticated rate limit (~15 requests per window) so a token that keeps reappearing across scans
 // costs one request every ten minutes, not one per scan.
@@ -47,29 +62,56 @@ function authorityRenounced(value: unknown): boolean | null {
   if (typeof value === 'string' && value.trim()) return false;
   return null;
 }
-// The market with the most reported liquidity (RugCheck can list more than one AMM pool per token).
-function primaryMarket(markets: unknown): unknown {
+// Liquidity-weighted LP lock across every reported market, not just the largest one: a token can list
+// several AMM pools (confirmed live: a mature token can report over a thousand), and a candidate with
+// one well-locked market and another, smaller-but-material unlocked one must not read as locked just
+// because we only looked at its biggest pool. Each market's locked USD prefers its own lpLockedUSD,
+// falling back to lpLockedPct of that market's own liquidity if only the percentage is reported; a
+// market with neither contributes 0 locked (never guessed as locked). Every contribution is clamped into
+// [0, that market's own liquidity] so one bad data point can't inflate the aggregate above 100%. null
+// only when no market has any usable liquidity figure at all.
+function lpLockedAggregatePct(markets: unknown): number | null {
   if (!Array.isArray(markets)) return null;
-  let best: unknown = null, bestLiquidity = -1;
+  let totalLiquidity = 0, totalLocked = 0, sawLiquidity = false;
   for (const market of markets) {
     const lp = at(market, 'lp');
     if (lp === null || typeof lp !== 'object') continue;
-    const liquidity = (numberOrNull(at(lp, 'quoteUSD')) ?? 0) + (numberOrNull(at(lp, 'baseUSD')) ?? 0);
-    if (liquidity > bestLiquidity) { bestLiquidity = liquidity; best = market; }
+    const liquidity = Math.max(0, numberOrNull(at(lp, 'quoteUSD')) ?? 0) + Math.max(0, numberOrNull(at(lp, 'baseUSD')) ?? 0);
+    if (liquidity <= 0) continue;
+    sawLiquidity = true;
+    const lockedUsd = numberOrNull(at(lp, 'lpLockedUSD'));
+    const lockedPct = pctOrNull(at(lp, 'lpLockedPct'));
+    const locked = lockedUsd !== null ? lockedUsd : lockedPct !== null ? liquidity * lockedPct / 100 : 0;
+    totalLiquidity += liquidity;
+    totalLocked += Math.min(Math.max(locked, 0), liquidity);
   }
-  return best;
+  return sawLiquidity && totalLiquidity > 0 ? Math.min(100, totalLocked / totalLiquidity * 100) : null;
 }
-// The largest single holder's share of supply, and the sum across every reported top holder.
+// The largest single holder's share of supply, and the sum across every reported top holder. Entries
+// are merged by `owner` first (confirmed live: RugCheck lists holders by token account, and the same
+// wallet can hold more than one token account for a mint), so a stake split across accounts cannot
+// evade the single-holder bar by looking like several smaller ones. Any entry with an unparseable or
+// out-of-range pct invalidates the whole result rather than being silently dropped: discarding just the
+// bad entry and scoring the rest would understate concentration and could pass a token on partial data.
 function holderConcentration(topHolders: unknown): {top: number | null; sum: number | null} {
   if (!Array.isArray(topHolders)) return {top: null, sum: null};
-  const pcts = topHolders.map(entry => pctOrNull(at(entry, 'pct'))).filter((n): n is number => n !== null);
-  if (!pcts.length) return {top: null, sum: null};
+  if (!topHolders.length) return {top: null, sum: null};
+  const byOwner = new Map<string | number, number>();
+  for (const [index, entry] of topHolders.entries()) {
+    const pct = pctOrNull(at(entry, 'pct'));
+    if (pct === null) return {top: null, sum: null};
+    const rawOwner = at(entry, 'owner');
+    const owner: string | number = typeof rawOwner === 'string' ? rawOwner : index;
+    byOwner.set(owner, (byOwner.get(owner) ?? 0) + pct);
+  }
+  const pcts = [...byOwner.values()];
   return {top: Math.max(...pcts), sum: Math.min(100, pcts.reduce((sum, n) => sum + n, 0))};
 }
 // creatorBalance is a raw token amount, in the same units as token.supply (not already a percentage).
+// A negative balance or supply is impossible and must never compute a passing (or any) percentage.
 function creatorHoldingsPct(creatorBalance: unknown, supply: unknown): number | null {
   const balance = numberOrNull(creatorBalance), total = numberOrNull(supply);
-  return balance !== null && total !== null && total > 0 ? Math.min(100, balance / total * 100) : null;
+  return balance !== null && total !== null && balance >= 0 && total > 0 ? Math.min(100, balance / total * 100) : null;
 }
 function providerRisks(risks: unknown): ContractSafetyRisk[] {
   if (!Array.isArray(risks)) return [];
@@ -87,12 +129,11 @@ export function extractFacts(raw: unknown): ContractSafetyFacts | null {
   const token = at(raw, 'token');
   if (token === null || typeof token !== 'object') return null;
   if (typeof at(raw, 'rugged') !== 'boolean') return null;
-  const market = primaryMarket(at(raw, 'markets'));
   const holders = holderConcentration(at(raw, 'topHolders'));
   return {
     mintAuthorityRenounced: authorityRenounced(at(token, 'mintAuthority')),
     freezeAuthorityRenounced: authorityRenounced(at(token, 'freezeAuthority')),
-    lpLockedPct: market ? pctOrNull(at(market, 'lp', 'lpLockedPct')) : null,
+    lpLockedPct: lpLockedAggregatePct(at(raw, 'markets')),
     totalMarketLiquidityUsd: numberOrNull(at(raw, 'totalMarketLiquidity')),
     topHolderPct: holders.top,
     topHoldersPct: holders.sum,
@@ -166,13 +207,19 @@ async function fetchReport(address: string, now: number): Promise<{raw: unknown;
 // unauthenticated limit is far below a full discovery batch). The first 429 stops every further request
 // for the rest of this call - the remaining snapshots simply keep their existing (unavailable)
 // contractSafety - instead of retrying into the same limit. There is otherwise no retry: a single
-// failed attempt is reported and left unavailable.
-export async function attachContractSafety(snapshots: CandidateSnapshot[], now = Date.now()): Promise<CandidateSnapshot[]> {
+// failed attempt is reported and left unavailable. MAX_CHECKS_PER_SCAN and SCAN_BUDGET_MS (checked
+// against `clock`, the real wall clock by default - a test can inject its own) apply the same predictable
+// cutoff for volume and duration; `now` remains the caller-controlled instant used for cache and
+// freshness math, kept separate so it stays deterministic in tests regardless of real elapsed time.
+export async function attachContractSafety(snapshots: CandidateSnapshot[], now = Date.now(), clock: () => number = Date.now): Promise<CandidateSnapshot[]> {
   if (!snapshots.length) return snapshots;
   let rateLimited = false;
+  let checked = 0;
+  const deadline = clock() + SCAN_BUDGET_MS;
   const results: CandidateSnapshot[] = [];
   for (const snapshot of snapshots) {
-    if (rateLimited) { results.push(snapshot); continue; }
+    if (rateLimited || checked >= MAX_CHECKS_PER_SCAN || clock() >= deadline) { results.push(snapshot); continue; }
+    checked++;
     try {
       const {raw, fetchedAt} = await fetchReport(snapshot.address, now);
       results.push({...snapshot, contractSafety: deriveContractSafety(raw, fetchedAt, now)});

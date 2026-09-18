@@ -5,7 +5,7 @@ import {beforeEach, describe, test} from 'node:test';
 import {addresses, failures, installFetch, offlineFetch} from './helpers/harness.mjs';
 import {NOW, pair} from './helpers/goldmine-fixtures.mjs';
 
-const {deriveContractSafety, extractFacts, attachContractSafety, withContractSafety, LP_LOCKED_MIN_PCT} = await import('../lib/goldmine/contract-safety.ts');
+const {deriveContractSafety, extractFacts, attachContractSafety, withContractSafety, LP_LOCKED_MIN_PCT, MAX_CHECKS_PER_SCAN, SCAN_BUDGET_MS} = await import('../lib/goldmine/contract-safety.ts');
 const {snapshotFromPair} = await import('../lib/goldmine/snapshot.ts');
 const {scoreCandidate} = await import('../lib/goldmine/score.ts');
 
@@ -39,6 +39,10 @@ function report(overrides = {}) {
     ...overrides,
   };
 }
+
+// A valid, distinct base58 Solana address (no 0/O/I/l) for the nth generated fixture candidate.
+const BASE58_SAFE = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+const candidateAddress = (label, n) => `${label}${BASE58_SAFE[n % BASE58_SAFE.length]}${'X'.repeat(39 - label.length)}`;
 
 describe('deriveContractSafety: our own deterministic bar over RugCheck facts', () => {
   test('a fully passing report is verified, with every fact preserved', () => {
@@ -75,6 +79,27 @@ describe('deriveContractSafety: our own deterministic bar over RugCheck facts', 
     assert.equal(exact.status, 'verified');
   });
 
+  test('LP lock is aggregated across every market, not just the largest: a well-locked primary market cannot hide a smaller unlocked one', () => {
+    const twoMarkets = report({markets: [
+      {lp: {quoteUSD: 60000, baseUSD: 60000, lpLockedPct: 100}}, // the larger, fully-locked market
+      {lp: {quoteUSD: 40000, baseUSD: 0, lpLockedPct: 0}}, // a smaller, fully-unlocked market
+    ]});
+    const safety = deriveContractSafety(twoMarkets, NOW, NOW);
+    // 120000 locked out of 160000 total = 75%, below the 80% bar - the old single-market logic would have
+    // picked the $120k market (still the largest single one) and reported 100% locked.
+    assert.equal(safety.status, 'unsafe');
+    assert.equal(safety.facts.lpLockedPct, 75);
+    assert.ok(safety.failedChecks.some(m => m.includes('Only 75% of LP is locked')));
+  });
+
+  test('LP lock: a market missing lpLockedUSD and lpLockedPct contributes zero locked, never guessed as locked', () => {
+    const safety = deriveContractSafety(report({markets: [
+      {lp: {quoteUSD: 50000, baseUSD: 50000}}, // no lock field at all
+    ]}), NOW, NOW);
+    assert.equal(safety.status, 'unsafe');
+    assert.equal(safety.facts.lpLockedPct, 0);
+  });
+
   test('rugged: true is always unsafe regardless of every other fact', () => {
     const rugged = deriveContractSafety(report({rugged: true}), NOW, NOW);
     assert.equal(rugged.status, 'unsafe');
@@ -108,6 +133,44 @@ describe('deriveContractSafety: our own deterministic bar over RugCheck facts', 
     const spreadButConcentrated = deriveContractSafety(report({topHolders: Array.from({length: 10}, () => ({pct: 6}))}), NOW, NOW);
     assert.equal(spreadButConcentrated.status, 'unsafe', 'sums to 60%, over the top-holders bar, though no single holder is dominant');
     assert.equal(spreadButConcentrated.facts.topHolderPct, 6);
+  });
+
+  test('holder concentration merges entries by owner: the same wallet split across token accounts cannot evade the single-holder bar', () => {
+    const splitWhale = deriveContractSafety(report({topHolders: [
+      {pct: 12, owner: 'WhaleOwner1111111111111111111111111111111'},
+      {pct: 11, owner: 'WhaleOwner1111111111111111111111111111111'}, // same owner, a second token account
+      {pct: 3, owner: 'SmallHolder111111111111111111111111111111'},
+    ]}), NOW, NOW);
+    // Each entry is individually under the 20% single-holder bar, but the owner's true combined stake
+    // (23%) is not, and the summed top-holders total (26%) must reflect the same merge.
+    assert.equal(splitWhale.status, 'unsafe');
+    assert.equal(splitWhale.facts.topHolderPct, 23);
+    assert.equal(splitWhale.facts.topHoldersPct, 26);
+  });
+
+  test('holder concentration: entries without an owner field are never merged with each other', () => {
+    const safety = deriveContractSafety(report({topHolders: [{pct: 8}, {pct: 5}, {pct: 3}]}), NOW, NOW);
+    assert.equal(safety.facts.topHolderPct, 8);
+    assert.equal(safety.facts.topHoldersPct, 16);
+  });
+
+  test('holder concentration: one entry with an impossible pct invalidates the whole result instead of being silently dropped', () => {
+    for (const badPct of [150, -5, Number.POSITIVE_INFINITY, Number.NaN, 'not-a-number']) {
+      // A safely-low holder plus one malformed entry: if the malformed entry were simply dropped, the
+      // remaining 5% holder would look totally safe - proving the whole fact is invalidated (unavailable,
+      // never guessed safe) rather than best-effort computed from just the parseable entries.
+      const safety = deriveContractSafety(report({topHolders: [{pct: 5}, {pct: badPct}]}), NOW, NOW);
+      assert.equal(safety.status, 'unavailable', JSON.stringify(badPct));
+      assert.equal(safety.facts, undefined, JSON.stringify(badPct));
+    }
+  });
+
+  test('creator holdings: a negative balance is impossible and never computes a passing percentage', () => {
+    const safety = deriveContractSafety(report({creatorBalance: -1}), NOW, NOW);
+    // Every other check still passes, so an impossible creator balance alone reads as unavailable
+    // (unconfirmed), not unsafe - but critically never verified, and never a passing percentage.
+    assert.equal(safety.status, 'unavailable');
+    assert.equal(safety.facts, undefined);
   });
 
   test('missing required fields (no token, no rugged) is unavailable, not unsafe', () => {
@@ -177,6 +240,32 @@ describe('attachContractSafety: network access, one candidate at a time', () => 
     assert.equal(calls.length, 1, 'the second candidate is never requested once rate-limited');
     assert.deepEqual(results.map(r => r.contractSafety.status), ['unavailable', 'unavailable']);
     assert.deepEqual(failures.map(f => f.operation), ['contract-safety-rate-limited']);
+  });
+
+  test('MAX_CHECKS_PER_SCAN bounds requests per call; candidates beyond it stay unavailable, predictably', async () => {
+    const calls = installFetch(() => Response.json(report()));
+    const many = Array.from({length: MAX_CHECKS_PER_SCAN + 2}, (_, i) => snapshot({
+      baseToken: {address: candidateAddress('Cand', i), name: 'X', symbol: 'X'},
+      pairAddress: candidateAddress('Pair', i),
+    }));
+    const results = await attachContractSafety(many, testNow);
+    assert.equal(calls.length, MAX_CHECKS_PER_SCAN);
+    assert.equal(results.filter(r => r.contractSafety.status === 'verified').length, MAX_CHECKS_PER_SCAN);
+    assert.equal(results.filter(r => r.contractSafety.status === 'unavailable').length, 2);
+  });
+
+  test('SCAN_BUDGET_MS bounds wall-clock time independent of the `now` used for cache math; candidates past the budget stay unavailable', async () => {
+    const calls = installFetch(() => Response.json(report()));
+    const two = [snapshot({baseToken: {address: addresses.tokenA, name: 'A', symbol: 'A'}, pairAddress: addresses.pairA}),
+      snapshot({baseToken: {address: addresses.tokenB, name: 'B', symbol: 'B'}, pairAddress: addresses.pairB})];
+    let ticks = 0;
+    // First two clock() reads (the deadline calc, then the first candidate's own check) are still inside
+    // the budget; every read after that is past it - simulating real time elapsing mid-scan without
+    // depending on an actual sleep.
+    const clock = () => (ticks++ < 2 ? 0 : SCAN_BUDGET_MS + 1);
+    const results = await attachContractSafety(two, testNow, clock);
+    assert.equal(calls.length, 1, 'only the first candidate is requested once the budget is spent');
+    assert.deepEqual(results.map(r => r.contractSafety.status), ['verified', 'unavailable']);
   });
 
   test('never sends a credential, an API key or any header beyond a plain Accept', async () => {
