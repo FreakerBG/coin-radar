@@ -1,11 +1,9 @@
 import {getChatGPTUser} from '@/app/chatgpt-auth';
 import {reportFailure} from '@/lib/diagnostics';
 import {db,getPositions,acquireLock,releaseLock,sameOrigin} from '@/lib/research-db';
-import {discardBody} from '@/lib/request-body';
 import {evaluatePosition} from '@/lib/advisor';
 import {fetchJson,numeric} from '@/lib/market';
-// A scan takes no payload: any body is discarded unread on every path, before the lock is taken.
-export async function POST(request:Request){const user=await getChatGPTUser();if(!user){await discardBody(request);return Response.json({error:'Sign in required.'},{status:401});}if(!sameOrigin(request)){await discardBody(request);return Response.json({error:'Same-origin request required.'},{status:403});}await discardBody(request);let lock:string|null=null;const lockId='monitor:'+user.userId;
+export async function POST(request:Request){const user=await getChatGPTUser();if(!user)return Response.json({error:'Sign in required.'},{status:401});if(!sameOrigin(request))return Response.json({error:'Same-origin request required.'},{status:403});let lock:string|null=null;const lockId='monitor:'+user.userId;
  try {lock=await acquireLock(lockId);if(!lock)return Response.json({status:'busy',newEvents:[]});const positions=await getPositions(user.userId);if(!positions.length)return Response.json({status:'idle',newEvents:[],asOf:new Date().toISOString()});
  let pools:any[]=[];let providerAvailable=true;
  try{const r=await fetchJson('https://api.dexscreener.com/latest/dex/pairs/solana/'+[...new Set(positions.map(p=>p.pair))].join(','),10000);pools=r.pairs||[];}catch(e){providerAvailable=false;reportFailure('monitor','provider',e,'warn');}

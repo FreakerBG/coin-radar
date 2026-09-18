@@ -34,7 +34,7 @@ Two tracking rules exist in this toolchain, and a malformed history makes them d
 | `npm test` | LOCAL | `test:migrations`, then every other offline test in `tests/`. |
 | `npm run test:migrations` | LOCAL | Migration structure, fresh-database and upgrade tests on temporary SQLite files. No network. |
 | `npm run test:browser` | LOCAL | Playwright smoke against the local dev server; non-local requests are aborted. |
-| `npm run test:worker` | LOCAL | Starts the built Worker with `wrangler dev --local` on a free port and a temporary local D1 (migrated with `--local`), sends POST requests over HTTP, then stops it and deletes the state. Needs a prior `npm run build`. |
+| `npm run test:worker` | LOCAL | Builds, then starts the built Worker with `wrangler dev --local` on a free port and a temporary local D1 (migrated with `--local`), sends requests with bodies over HTTP, then stops it and deletes the state. No provider or Cloudflare account is contacted. |
 | `npm run db:migrations:check` | LOCAL | Validate `drizzle/` and `db/migrations.lock.json`. Reads files only. |
 | `npm run db:generate` | LOCAL | `drizzle-kit generate`: writes a new migration from `db/schema.ts`. No database connection. |
 | `npm run build` | LOCAL | Migration check, then the deployable build in `dist/`. Does not deploy. |
@@ -223,7 +223,8 @@ Migrations earlier in the same publish may already be applied; they stay immutab
 
 ## 9. Limitations and open manual settings
 
-- **Branch protection:** GitHub `main` is unprotected, so a merge does not require green CI. Enabling required status checks (`Verify`, `Browser smoke`) and pull request review is a repository setting for the owner.
+- **Branch protection:** GitHub `main` is protected. Changes arrive only through pull requests; `Verify` and `Browser smoke` must pass on a branch that is up to date with `main`; review conversations must be resolved; the rules apply to administrators; force-pushes and branch deletion are blocked. Zero approving reviews are required, because there is no eligible independent reviewer, so a green pull request can be merged by its author.
+- **Request bodies are read to the end before every response** (`worker/entry.ts`). Returning while a body is unread makes workerd report `Can't read from request stream after response has been sent` ([cloudflare/workerd#918](https://github.com/cloudflare/workerd/issues/918), open); under `wrangler dev` that breaks Wrangler's dev proxy and the next request fails or hangs. Consequences: a client that uploads slowly delays only its own response until it finishes or disconnects, and an unauthenticated body is read (not stored) before its 401. There is no application size or time cutoff, because cancelling an unfinished body brings the failure back; request size and duration are bounded only by the hosting platform. The failure was reproduced only in local `wrangler dev`; production impact is unverified.
 - **Publishing bypasses CI:** Sites publishing builds from the publisher's checkout. The build gate enforces migration structure and immutability; the full test suite runs only when `npm run verify` or CI runs.
 - **No hosted staging environment:** validation before production is local only.
 - **No production migration status, backup, export or restore tooling** in this repository; D1 recovery-point availability is unverified.

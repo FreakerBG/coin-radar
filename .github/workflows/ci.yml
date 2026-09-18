@@ -42,9 +42,9 @@ jobs:
           node-version: 22.13.0
           cache: npm
       - run: npm ci
-      - run: npm run build
       - name: Built Worker request-body regression
         run: npm run test:worker
+        timeout-minutes: 8
       - name: Check no Worker process remains
         if: always()
         run: |

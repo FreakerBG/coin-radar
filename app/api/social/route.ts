@@ -3,7 +3,7 @@ import {getChatGPTUser} from '@/app/chatgpt-auth';
 import {reportFailure} from '@/lib/diagnostics';
 import {db,getConfig,acquireLock,releaseLock,sameOrigin} from '@/lib/research-db';
 import {socialSummary} from '@/lib/advisor';
-import {discardBody,readJsonObject} from '@/lib/request-body';
+import {readJsonObject} from '@/lib/request-body';
 import {publicSocialEvidence,socialEvidenceMessage} from '@/lib/social-cache';
 function token(){return (env as unknown as {X_BEARER_TOKEN?:string}).X_BEARER_TOKEN;}
 export async function GET(request:Request){const user=await getChatGPTUser();if(!user)return Response.json({error:'Sign in required.'},{status:401});
@@ -11,7 +11,7 @@ export async function GET(request:Request){const user=await getChatGPTUser();if(
  try{const config=await getConfig(user.userId);const usage=await db().prepare('SELECT requests FROM social_usage WHERE id = ?').bind('x:'+user.userId+':'+new Date().toISOString().slice(0,10)).first<{requests:number}>();const cache=address?await db().prepare('SELECT data, fetched_at FROM social_cache WHERE address = ?').bind(address).first<{data:string;fetched_at:number}>():null;
  return Response.json({posts:[],...(cache?{...publicSocialEvidence(JSON.parse(cache.data)),cached:true,stale:Date.now()-cache.fetched_at>900000}:{}),message:token()?(cache?socialEvidenceMessage:'Research runs only when requested. Daily request cap applies.'):'Add X_BEARER_TOKEN as a secret in Site environment settings, then publish to activate. Never put the token in chat or client code.',configured:!!token(),status:token()?'connected':'not_connected',usedToday:usage?.requests||0,dailyLimit:config.xDailyRequests},{headers:{'Cache-Control':'no-store'}});
  }catch(e){reportFailure('social','load',e);return Response.json({status:'error',posts:[],message:'Social research storage unavailable.'},{status:503});}}
-export async function POST(request:Request){const user=await getChatGPTUser();if(!user){await discardBody(request);return Response.json({error:'Sign in required.'},{status:401});}if(!sameOrigin(request)){await discardBody(request);return Response.json({error:'Same-origin request required.'},{status:403});}const key=token();if(!key){await discardBody(request);return Response.json({status:'not_connected',posts:[],message:'X API secret is not configured.'},{status:409});}
+export async function POST(request:Request){const user=await getChatGPTUser();if(!user)return Response.json({error:'Sign in required.'},{status:401});if(!sameOrigin(request))return Response.json({error:'Same-origin request required.'},{status:403});const key=token();if(!key)return Response.json({status:'not_connected',posts:[],message:'X API secret is not configured.'},{status:409});
  const b:any=await readJsonObject(request);if(!b)return Response.json({error:'Invalid JSON body.'},{status:400});let lock:string|null=null;let lockId='';
  try{const address=String(b.address||'');if(!/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(address))return Response.json({error:'Invalid Solana address.'},{status:400});
  lockId='social:'+address;lock=await acquireLock(lockId);if(!lock)return Response.json({status:'busy',posts:[],message:'This contract is already being researched. Try again shortly.'},{status:409});

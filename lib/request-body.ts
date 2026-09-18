@@ -1,37 +1,40 @@
-// Request-body lifecycle for POST handlers. Every return path must finalize the request body: a
-// response sent while the body is still unread leaves the runtime reading a request stream it has
-// already answered. Under local `wrangler dev` that is an uncaught "Can't read from request stream
-// after response has been sent" in the dev proxy, and the next request fails.
+// Request-body lifecycle. A response returned while the request body is still unread leaves the
+// runtime reading a request stream it has already answered: workerd reports an uncaught "Can't read
+// from request stream after response has been sent" (cloudflare/workerd#918). Under local
+// `wrangler dev` that happens inside Wrangler's dev proxy, and the next request fails or hangs.
+// workerd's documented workaround, also used by Miniflare's own proxy, is to consume the body
+// completely before responding. Cancelling it is not enough, and vinext cancels a body the route
+// did not read, so worker/entry.ts keeps the original body out of vinext's reach.
 
-// Upper bounds for discarding a body the handler does not use. Bytes are read and dropped, never
-// buffered; past either limit the rest of the body is cancelled.
-const DISCARD_LIMIT_BYTES = 64 * 1024;
-const DISCARD_TIMEOUT_MS = 1000;
-
-// Finalizes a body the handler will not read (early rejections, and routes that take no payload).
-// Best effort: it never throws, so it cannot replace the response the caller is about to return.
-export async function discardBody(request: Request): Promise<void> {
-  let reader: ReadableStreamDefaultReader<Uint8Array>;
+// Calls `handle` with a request whose body is a pull-through view of the original: nothing is read
+// ahead or buffered, and cancelling the view (as vinext does) leaves the original untouched. Once
+// `handle` settles, whatever the application did not read of the original is read to the end and
+// dropped, and only then is the response returned. There is deliberately no size or time cutoff,
+// because cancelling an unfinished body brings the failure back: a client that sends slowly delays
+// only its own response, until it finishes, disconnects or the platform ends the request. A body
+// that fails (for example because the client disconnected) is finished too; that never changes the
+// response.
+export async function withFinishedBody(request: Request, handle: (request: Request) => Promise<Response>): Promise<Response> {
+  if (!request.body) return handle(request);
+  const original = request.body.getReader();
+  const body = new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      const chunk = await original.read();
+      if (chunk.done) controller.close();
+      else controller.enqueue(chunk.value);
+    },
+  }, {highWaterMark: 0});
   try {
-    if (!request.body || request.bodyUsed) return;
-    reader = request.body.getReader();
-  } catch {
-    return;
-  }
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const expired = new Promise<'expired'>(resolve => { timer = setTimeout(resolve, DISCARD_TIMEOUT_MS, 'expired'); });
-  try {
-    for (let received = 0; received < DISCARD_LIMIT_BYTES;) {
-      const chunk = await Promise.race([reader.read(), expired]);
-      if (chunk === 'expired') break;
-      if (chunk.done) return;
-      received += chunk.value.byteLength;
-    }
-    reader.cancel().catch(() => {});
-  } catch {
-    // A body that fails while being discarded is finished either way.
+    // `duplex: 'half'` is the standard option for a streamed request body.
+    return await handle(new Request(request, {body, duplex: 'half'} as RequestInit));
   } finally {
-    clearTimeout(timer);
+    try {
+      while (!(await original.read()).done) {
+        // Drop the chunk.
+      }
+    } catch {
+      // An aborted or failed body is finished either way.
+    }
   }
 }
 
