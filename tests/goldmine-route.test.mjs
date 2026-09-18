@@ -233,11 +233,71 @@ describe('outcome tracking', () => {
     const a = data.signals[0];
     assert.deepEqual(a.outcomes.map(outcome => [outcome.horizon, outcome.status, outcome.returnPct]), [['15m', 'observed', 20], ['1h', 'pending', null], ['6h', 'pending', null], ['24h', 'pending', null]]);
     assert.equal(a.assessment.summary.startsWith('BREAKOUT · score 81/100.'), true);
+    assert.deepEqual(data.signals.map(signal => signal.contractSafety.status), ['unavailable', 'unavailable'], 'the dashboard can read contract safety without a second RugCheck call');
     assert.deepEqual(data.stats.filter(row => row.horizon === '15m'), [
       {state: 'BREAKOUT', horizon: '15m', pending: 0, observed: 1, unavailable: 0, missed: 0, meanReturnPct: 20, positiveShare: 1},
       {state: 'REJECTED', horizon: '15m', pending: 0, observed: 1, unavailable: 0, missed: 0, meanReturnPct: -25, positiveShare: 0},
     ]);
     assert.deepEqual(data.stats.filter(row => row.horizon === '24h').map(row => [row.state, row.pending, row.meanReturnPct]), [['BREAKOUT', 1, null], ['REJECTED', 1, null]]);
+  });
+});
+
+describe('GET contractSafety: minimal client shape, defensive against malformed or legacy stored snapshots', () => {
+  // Inserts one signal row directly, bypassing recordSignals, so the stored `snapshot` column can hold
+  // exactly the shape under test (including shapes recordSignals itself would never produce, such as
+  // corrupt JSON or a pre-03B snapshot with no contractSafety key at all).
+  function seedSignal(id, snapshotRaw) {
+    d1.sqlite.prepare('INSERT INTO goldmine_signals (id, address, pair, symbol, model_version, state, score, opportunity, detected_at, detected_price, snapshot, assessment) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(id, addresses.tokenA, addresses.pairA, 'FIX', MODEL_VERSION, 'BREAKOUT', 81, 0, clock.now(), 0.01, snapshotRaw, '{"summary":"BREAKOUT · score 81/100."}');
+  }
+
+  test('verified contractSafety exposes only {status}, nothing from facts, source or checkedAt', async () => {
+    seedSignal('sig-verified', JSON.stringify({contractSafety: {status: 'verified', source: 'rugcheck', checkedAt: clock.now(), facts: {mintAuthorityRenounced: true}}}));
+    const data = await body(await read());
+    assert.deepEqual(data.signals[0].contractSafety, {status: 'verified'});
+  });
+
+  test('unsafe contractSafety exposes {status, reason} built from our own check messages, never RugCheck facts or provider risk text', async () => {
+    seedSignal('sig-unsafe', JSON.stringify({contractSafety: {
+      status: 'unsafe', source: 'rugcheck', checkedAt: clock.now(),
+      facts: {mintAuthorityRenounced: false, providerRisks: [{name: 'Mutable metadata', level: 'danger', description: 'some RugCheck-authored text that must never reach the client verbatim as facts'}], providerScoreNormalized: 3},
+      failedChecks: ['Mint authority is still active.', 'Freeze authority is still active.'],
+    }}));
+    const data = await body(await read());
+    assert.deepEqual(data.signals[0].contractSafety, {status: 'unsafe', reason: 'Mint authority is still active. Freeze authority is still active.'});
+    const json = JSON.stringify(data);
+    assert.equal(json.includes('facts'), false, 'stored facts must never be serialized to the client');
+    assert.equal(json.includes('providerRisks'), false);
+    assert.equal(json.includes('providerScoreNormalized'), false);
+    assert.equal(json.includes('checkedAt'), false);
+    assert.equal(json.includes('rugcheck'), false, 'the provider source/name is not client-facing');
+  });
+
+  test('a high score never overrides an unsafe or unavailable status: both stay out of the opportunity set regardless of score/state columns', async () => {
+    seedSignal('sig-unsafe-high', JSON.stringify({contractSafety: {status: 'unsafe', source: 'rugcheck', checkedAt: clock.now(), facts: {}, failedChecks: ['RugCheck has recorded this contract as rugged.']}}));
+    const data = await body(await read());
+    assert.equal(data.signals[0].contractSafety.status, 'unsafe');
+    assert.equal(data.signals[0].opportunity, false, 'the stored opportunity flag, not contractSafety, decides this - and a rugged/unsafe candidate was never recorded as an opportunity');
+  });
+
+  test('unavailable contractSafety is the safe default for a snapshot missing the field entirely (a pre-03B signal)', async () => {
+    seedSignal('sig-legacy', JSON.stringify({address: addresses.tokenA})); // no contractSafety key at all
+    const data = await body(await read());
+    assert.deepEqual(data.signals[0].contractSafety, {status: 'unavailable'});
+  });
+
+  test('corrupt JSON in the stored snapshot degrades to unavailable for that row, and never crashes the whole read', async () => {
+    seedSignal('sig-corrupt', '{not valid json');
+    const response = await read();
+    assert.equal(response.status, 200);
+    const data = await body(response);
+    assert.deepEqual(data.signals[0].contractSafety, {status: 'unavailable'});
+  });
+
+  test('an unrecognized status string (future/foreign schema) is never read as verified or safe', async () => {
+    seedSignal('sig-unknown-status', JSON.stringify({contractSafety: {status: 'pending-review'}}));
+    const data = await body(await read());
+    assert.deepEqual(data.signals[0].contractSafety, {status: 'unavailable'});
   });
 });
 

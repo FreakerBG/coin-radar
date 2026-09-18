@@ -96,7 +96,7 @@ RugCheck's own score or verdict is never read. Instead its facts feed our own de
 
 ## 5. Extension points
 
-- **Contract safety dashboard:** `contractSafety.facts`, `failedChecks` and RugCheck's own `providerRisks`/`providerScoreNormalized` (section 3b) are already stored with every signal; a dashboard panel would only need to render them.
+- **Contract safety dashboard:** built (section 6, 03B). `GET /api/goldmine`'s `signals[]` now includes each signal's `contractSafety`, reduced to the client-facing `ContractSafetySummary` shape (`{status}` for verified/unavailable, `{status, reason}` for unsafe) - never the stored `facts`, `failedChecks` wording beyond that reason, or RugCheck's own `providerRisks`/`providerScoreNormalized`, which stay server-side only. A deeper view would need a new, deliberately-scoped field, not widening this one.
 - **Backtesting:** stored snapshots re-score under any model version with `scoreCandidate`; outcomes give the realized quotes.
 - **Paper trading:** a paper position can reference a signal ID and its detection price; no real funds.
 - **Alerts:** new signals and state changes are rows with stable IDs, suitable for idempotent delivery.
@@ -107,7 +107,7 @@ RugCheck's own score or verdict is never read. Instead its facts feed our own de
 | Stage | Scope | Needs approval |
 | --- | --- | --- |
 | 03A (this) | Snapshot model, Momentum Score v2, hard gates, states, signal and outcome tracking, explanations. | No |
-| 03B | Contract safety evidence (mint and freeze authority, top-holder concentration, LP status), so opportunities can exist (done, section 3b); Goldmine dashboard panel with explanations and outcome history (not yet built). | Safety provider — approved and implemented: RugCheck's public API (section 3b) |
+| 03B | Contract safety evidence (mint and freeze authority, top-holder concentration, LP status), so opportunities can exist (done, section 3b); Goldmine dashboard panel with explanations and outcome history (done, app/goldmine-panel.tsx). | Safety provider — approved and implemented: RugCheck's public API (section 3b) |
 | 03C | Scheduled scans and outcome evaluation, and retention of old signals. | Confirm Sites supports Worker cron triggers |
 | 03D | Backtesting and calibration: re-score stored snapshots, per-state and per-version outcome reports, threshold review. | No |
 | 03E | Paper trading from signals, with simulated fees and slippage. No real funds. | No |
