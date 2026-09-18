@@ -11,14 +11,14 @@ Labels used below:
 
 | Topic | Verified state |
 | --- | --- |
-| Runtime | vinext (Vite-based Next.js) compiled to a Cloudflare Worker (`vinext/server/fetch-handler`, `nodejs_compat`), hosted by OpenAI Sites. The Site is private; Sites injects `oai-authenticated-user-*` headers after Sign in with ChatGPT. |
+| Runtime | vinext (Vite-based Next.js) compiled to a Cloudflare Worker (`worker/entry.ts` wrapping `vinext/server/fetch-handler`, `nodejs_compat`), hosted by OpenAI Sites. The Site is private; Sites injects `oai-authenticated-user-*` headers after Sign in with ChatGPT. |
 | Hosted environments | One: the production Site identified by `project_id` in `.openai/hosting.json`. The generated Worker config has no `env` sections and no `preview_database_id`. No hosted staging or preview environment exists. |
 | D1 | One logical binding, `DB` (`.openai/hosting.json` `"d1": "DB"`). Sites provisions and owns the production database; its ID is not in this repository. `vite.config.ts` and `dist/server/wrangler.json` use the placeholder `site-creator-d1` / `00000000-0000-4000-8000-000000000000` for local simulation only. |
 | R2 | None (`"r2": null`). |
 | Secrets | `X_BEARER_TOKEN`, set in Sites environment settings. A publish applies the environment revision. Never commit or print it. |
 | Local preview | `npm run dev` (mock sign-in, Miniflare) and `npm start` (the built Worker via `wrangler dev --local`) share the local D1 in `.wrangler/state`, which `npm run db:migrate:local` migrates. Nothing local touches production. |
 | How migrations reach production | `npm run build` first runs the migration check (section 3), then copies `drizzle/` to `dist/.openai/drizzle`. Sites publishing applies pending migrations to production D1 **individually, recording each, before uploading the Worker** (Sites plugin 0.1.65, `persistence-and-storage.md`). A failed publish can therefore leave some or all migrations applied while the previous Worker keeps serving. |
-| Who publishes | The Site-owning Codex agent with the Sites plugin: commit, push to the Sites source repository, `npm run build`, package, save a version, deploy. GitHub is a separate remote; GitHub Actions never deploys and cannot block a publish. GitHub `main` is not branch-protected. |
+| Who publishes | The Site-owning Codex agent with the Sites plugin: commit, push to the Sites source repository, `npm run build`, package, save a version, deploy. GitHub is a separate remote; GitHub Actions never deploys and cannot block a publish. GitHub `main` is branch-protected (section 9). |
 | Rollback primitive | Sites keeps saved versions; a stored version can be deployed again by its version ID. Redeploying never reverts the D1 schema or data. |
 
 **Unverified:** the table name and transaction scope Sites uses to record production migrations, whether it rejects deploying a version whose `drizzle/` is older than what has been applied, and whether production Worker logs are available to the owner (`observability` is enabled in the generated config).
@@ -137,6 +137,7 @@ Use the production URL in a desktop browser with the Network panel open, signed 
 | Monitoring | Enable monitoring on the dashboard. | `POST /api/monitor` returns `idle`, `checked` or `provider_unavailable`. A 503 "Position monitoring failed" is a storage or lock failure. With no open positions, no provider is called. |
 | Social/X cache isolation | Open X evidence for a coin that already has cached evidence. **Do not** press "Research selected coin on X" unless a billed request is intended. | `GET /api/social?address=…` returns 200. `usedToday` and `dailyLimit` belong to the signed-in account, and posts contain only `text`, `date`, `url` and `author`. With a second authorized account, both see identical posts but their own quotas. |
 | Mobile navigation | At 320–390 px wide (device toolbar or a phone), switch Discover, Watchlist, Advisor and Alerts. | Every tab opens and the page never scrolls horizontally. |
+| Goldmine | In the signed-in tab, run `fetch('/api/goldmine', {method: 'POST'}).then(r => r.json())` in the console, then open `/api/goldmine`. | The scan returns `status` `checked` (or `provider_unavailable` during a DEX Screener outage) with scored candidates, each with components and rejections or blockers, and `opportunities` `0` while contract safety is unavailable. `GET` returns 200 with the recorded signals. This writes shared signal rows only; it makes no X request and no trade. A 503 is a storage or schema failure (`goldmine` failure records). |
 | Runtime errors | Reload the dashboard and watch the Network panel. | No unexpected 5xx. Market or news 502s with provider-unavailable messages are provider outages (section 8). If Worker logs are available, check for `coin_radar.failure` records since the deploy (section 7). |
 
 If any check fails, stop and use sections 7 and 8.
