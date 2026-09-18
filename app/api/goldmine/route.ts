@@ -9,6 +9,7 @@ import {acquireLock, db, releaseLock, sameOrigin} from '@/lib/research-db';
 import {DISCLAIMER, MODEL_VERSION, scoreCandidate, type Assessment} from '@/lib/goldmine/score';
 import {attachSocialEvidence, evaluateOutcomes, readTracking, recordSignals} from '@/lib/goldmine/signals';
 import {bestPoolSnapshots} from '@/lib/goldmine/snapshot';
+import {withContractSafety} from '@/lib/goldmine/contract-safety';
 
 const noStore = {'Cache-Control': 'no-store'};
 const LOCK_ID = 'goldmine:scan';
@@ -54,7 +55,8 @@ export async function POST(request: Request) {
     }
 
     const snapshots = await attachSocialEvidence(database, bestPoolSnapshots(discovered.pairs, now, discovered.boosted));
-    const scored = snapshots.map(snapshot => ({snapshot, assessment: scoreCandidate(snapshot)}));
+    const prescored = snapshots.map(snapshot => ({snapshot, assessment: scoreCandidate(snapshot)}));
+    const scored = await withContractSafety(prescored, now);
     const newSignals = await recordSignals(database, scored, now);
     const candidates = scored.sort((a, b) => byRank(a.assessment, b.assessment)).map(({snapshot, assessment}) => ({...assessment, snapshot}));
     return Response.json({

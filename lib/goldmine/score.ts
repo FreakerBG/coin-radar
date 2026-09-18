@@ -205,6 +205,7 @@ function safetyRisk(s: CandidateSnapshot, checks: RiskCheck[]): Component {
   let points = 0;
   const contract = s.contractSafety.status === 'verified';
   if (s.contractSafety.status === 'verified') { points += 7; evidence.push(`Contract safety verified by ${s.contractSafety.source} (+7).`); }
+  else if (s.contractSafety.status === 'unsafe') evidence.push(`Contract safety checked by ${s.contractSafety.source}: ${s.contractSafety.failedChecks.join('; ')} (+0 of 7).`);
   else evidence.push('Contract safety (mint and freeze authority, holder concentration, LP status) is unavailable (+0 of 7).');
   for (const check of checks) {
     if (check.passed) { points += check.points; evidence.push(`${check.pass} (+${check.points}).`); }
@@ -262,7 +263,8 @@ export function scoreCandidate(s: CandidateSnapshot): Assessment {
     if (score < OPPORTUNITY_MIN_SCORE) blockers.push({id: 'score_below_threshold', category: 'momentum', message: `Score ${score} is below ${OPPORTUNITY_MIN_SCORE}.`});
     const unassessed = checks.filter(check => !check.available);
     if (unassessed.length) blockers.push({id: 'risk_inputs_incomplete', category: 'safety', message: `Risk not fully assessed: ${unassessed.map(check => check.missing).join('; ')}.`});
-    if (s.contractSafety.status !== 'verified') blockers.push({id: 'contract_safety_unverified', category: 'safety', message: 'Contract safety data is unavailable, so opportunity status fails closed.'});
+    if (s.contractSafety.status === 'unsafe') blockers.push({id: 'contract_safety_unverified', category: 'safety', message: 'Contract safety checks failed, so opportunity status fails closed.'});
+    else if (s.contractSafety.status !== 'verified') blockers.push({id: 'contract_safety_unverified', category: 'safety', message: 'Contract safety data is unavailable, so opportunity status fails closed.'});
   }
   const opportunity = state !== 'REJECTED' && blockers.length === 0;
   const risks = checks.filter(check => check.available && !check.passed).map(check => `${check.risk}.`);
