@@ -172,7 +172,9 @@ export const upgradeFixtures = {
       assert.deepEqual(old.outcomes.map(outcome => [outcome.horizon, outcome.status, outcome.price, outcome.returnPct]),
         [['15m', 'observed', 2.5, 25], ['1h', 'missed', null, null], ['6h', 'unavailable', null, null]]);
       assert.equal(old.assessment.summary, 'EARLY · score 70/100. Recorded before the upgrade.');
-      assert.ok(before.stats.some(row => row.state === 'EARLY' && row.horizon === '15m' && row.observed === 1 && row.meanReturnPct === 25));
+      // Signals keep the model version that scored them; statistics never mix versions, so these v2.0.0
+      // rows are listed but not counted in the current version's statistics.
+      assert.deepEqual([old.modelVersion, before.stats], ['momentum-v2.0.0', []]);
 
       // A scan settles the due outcome of the upgraded signal and records new ones next to it. A minute
       // later, so provider responses cached by earlier fixtures' checks have expired.

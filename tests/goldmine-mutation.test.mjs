@@ -32,8 +32,15 @@ const mutants = {
   'buy share from too few transactions': ['h1Total >= MIN_FLOW_TXNS ? h1.buys! / h1Total', 'h1Total > 0 ? h1.buys! / h1Total'],
   'paid promotion counted as social momentum': ['if (s.promoted) return', 'if (false) return'],
   'stale social evidence accepted': ['> SOCIAL_MAX_AGE_MS)', '> SOCIAL_MAX_AGE_MS * 100)'],
-  'reversal-risk deduction removed': ["c.h1 !== null && c.h1 > 50, 3,", "c.h1 !== null && c.h1 > 50, 0,"],
-  'component clamp removed': ['points: Math.max(0, Math.min(max, Math.floor(points)))', 'points: Math.floor(points)'],
+  'reversal check passes a 60% hourly rise': ["check('reversal', 2, c.h1, v => v <= 50,", "check('reversal', 2, c.h1, v => v <= 500,"],
+  'unassessed risk check earns its points': ['if (check.passed) { points += check.points;', 'if (check.passed || !check.available) { points += check.points;'],
+  'contract points granted without evidence': ["else evidence.push('Contract safety (mint", "else points += 7, evidence.push('Contract safety (mint"],
+  'missing 5m or 24h change not gated': ['if (s.priceChangePct.m5 === null || s.priceChangePct.h1 === null || s.priceChangePct.h24 === null) fail(', 'if (s.priceChangePct.h1 === null) fail('],
+  'incomplete risk inputs do not block': ["if (unassessed.length) blockers.push(", "if (false) blockers.push("],
+  'valuation scored without a dilution check': ["else if (m.dilution === null) evidence.push(", "else if (false) evidence.push("],
+  // Removing the clamp in component() is an equivalent mutant since v2.1.0: every component's achievable
+  // points already equal its maximum and none can go negative. The clamp stays as defense in depth, and
+  // the oracle's range check would catch a component that exceeds it.
   'distribution checked after breakout rules': ["if (m.buyShare !== null && m.buyShare <= 0.45 && c.h1 !== null && c.h1 < 0) return 'DISTRIBUTION';", "if (m.buyShare !== null && m.buyShare <= 0.2 && c.h1 !== null && c.h1 < 0) return 'DISTRIBUTION';"],
 };
 

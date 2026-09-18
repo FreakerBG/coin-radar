@@ -1,20 +1,22 @@
 // Goldmine Momentum Score v2: a deterministic, versioned assessment of one candidate snapshot.
 //
-// - Six components add up to at most 100 points. Each lists the evidence behind its points, and a
-//   component whose inputs are missing scores nothing: missing data never raises a score.
+// - Six components add up to at most 100 points. Each lists the evidence behind its points. Points come
+//   only from inputs that are present and pass a check, so removing an input never raises a score. In
+//   particular safety points are earned per risk check, never granted up front and then deducted.
 // - Hard gates reject a candidate whose critical market data is missing or whose observable data shows
 //   danger (thin liquidity, no sells, a collapse, implausible turnover). A rejected candidate is REJECTED
-//   whatever its points.
+//   whatever its points. The 5m, 1h and 24h price changes are critical because the overheating check
+//   needs all three: a missing one could otherwise hide an OVERHEATED candidate.
 // - The market state (EARLY, BUILDING, BREAKOUT, OVERHEATED, DISTRIBUTION) describes what the snapshot
 //   shows. It is not a prediction.
-// - Opportunity status additionally requires an actionable state, a minimum score and verified contract
-//   safety. No configured provider supplies contract safety, so it fails closed: no candidate is an
+// - Opportunity status additionally requires an actionable state, a minimum score, every market risk
+//   check assessed (no missing risk input) and verified contract safety. No configured provider supplies contract safety, so it fails closed: no candidate is an
 //   opportunity until that evidence exists.
 //
 // Changing any rule or threshold changes MODEL_VERSION, so stored signals stay comparable per version.
 import type {CandidateSnapshot} from './snapshot';
 
-export const MODEL_VERSION = 'momentum-v2.0.0';
+export const MODEL_VERSION = 'momentum-v2.1.0';
 export const DISCLAIMER = 'Research signal from provider snapshots, not an executable price, a prediction or financial advice. No outcome or profit is implied.';
 
 export const STATES = ['EARLY', 'BUILDING', 'BREAKOUT', 'OVERHEATED', 'DISTRIBUTION', 'REJECTED'] as const;
@@ -152,13 +154,14 @@ function ageValuation(s: CandidateSnapshot, m: Measures): Component {
   else evidence.push(`Pool age ${age < 120 ? `${Math.floor(age)} minutes` : `${round(age / 60, 1)} hours`} (+${agePoints}).`);
   let valuationPoints = 0;
   if (m.valuation === null) evidence.push('Market cap and FDV are unavailable; valuation is not scored.');
-  else if (m.dilution !== null && m.dilution > 5) evidence.push(`FDV is ${round(m.dilution, 1)}x market cap: large unreleased supply (+0).`);
+  else if (m.dilution === null) evidence.push('Market cap or FDV is unavailable, so dilution cannot be checked; valuation is not scored (+0).');
+  else if (m.dilution > 5) evidence.push(`FDV is ${round(m.dilution, 1)}x market cap: large unreleased supply (+0).`);
   else {
     const v = m.valuation;
     valuationPoints = v < 100000 ? 2 : v < 1e6 ? 7 : v < 1e7 ? 5 : v < 5e7 ? 3 : 1;
     evidence.push(`Valuation ${usd(v)} (+${valuationPoints}).`);
   }
-  return component('age_valuation', 'Token age and valuation', 15, agePoints + valuationPoints, m.valuation === null || age === null ? 'partial' : 'scored', evidence);
+  return component('age_valuation', 'Token age and valuation', 15, agePoints + valuationPoints, m.dilution === null || age === null ? 'partial' : 'scored', evidence);
 }
 
 function socialMomentum(s: CandidateSnapshot): Component {
@@ -178,23 +181,37 @@ function socialMomentum(s: CandidateSnapshot): Component {
   return component('social_momentum', label, 10, authors + originality, 'scored', evidence);
 }
 
-// Market-observable risk only. Seven of the fifteen points are reserved for verified contract safety,
-// which no provider supplies yet, so this component tops out at eight.
-function safetyRisk(s: CandidateSnapshot, m: Measures): Component {
-  const evidence: string[] = [];
-  let points = s.contractSafety.status === 'unavailable' ? 8 : 15;
-  if (s.contractSafety.status === 'unavailable') evidence.push('Contract safety (mint and freeze authority, holder concentration, LP status) is unavailable: 7 points withheld.');
-  const deduct = (applies: boolean, by: number, message: string) => { if (applies) { points -= by; evidence.push(`${message} (-${by}).`); } };
+// Market-observable risk checks. Each earns its points only when its input is present and passes: a
+// failed check is a risk, and a missing input is unassessed and earns nothing. Seven of the fifteen
+// points are reserved for verified contract safety, which no provider supplies yet.
+export type RiskCheck = {id: string; points: number; available: boolean; passed: boolean; pass: string; risk: string; missing: string};
+export function riskChecks(s: CandidateSnapshot, m: Measures): RiskCheck[] {
   const c = s.priceChangePct;
-  deduct(c.h1 !== null && c.h1 > 50, 3, 'More than 50% rise in one hour: elevated reversal risk');
-  deduct(c.h24 !== null && c.h24 < -30, 3, 'More than 30% fall in 24 hours');
-  deduct(m.turnover !== null && m.turnover > 30, 3, '24h volume above 30x liquidity');
-  deduct(m.buyShare !== null && m.buyShare > 0.8, 3, 'One-sided buy flow');
-  deduct(m.dilution !== null && m.dilution > 5, 2, 'FDV more than 5x market cap');
-  deduct(m.valuationToLiquidity !== null && m.valuationToLiquidity > 100, 2, 'Valuation above 100x pool liquidity: thin exit depth');
-  deduct(s.ageMinutes !== null && s.ageMinutes < 60, 2, 'Pool younger than one hour');
-  if (evidence.length === (s.contractSafety.status === 'unavailable' ? 1 : 0)) evidence.push('No market-observable risk flags.');
-  return component('safety_risk', 'Safety risk', 15, points, s.contractSafety.status === 'unavailable' ? 'partial' : 'scored', evidence);
+  const check = (id: string, points: number, value: number | null, passes: (value: number) => boolean, pass: string, risk: string, missing: string): RiskCheck =>
+    ({id, points, available: value !== null, passed: value !== null && passes(value), pass, risk, missing});
+  return [
+    check('reversal', 2, c.h1, v => v <= 50, 'No extreme 1h rise', 'More than 50% rise in one hour: elevated reversal risk', '1h price change unavailable; reversal risk not assessed'),
+    check('decline', 1, c.h24, v => v >= -30, 'No severe 24h fall', 'More than 30% fall in 24 hours', '24h price change unavailable; decline not assessed'),
+    check('turnover', 1, m.turnover, v => v <= 30, '24h volume at most 30x liquidity', '24h volume above 30x liquidity', 'Turnover unavailable; volume distortion not assessed'),
+    check('flow', 1, m.buyShare, v => v <= 0.8, 'Two-sided swap flow', 'One-sided buy flow', 'Too few swaps to assess flow balance'),
+    check('dilution', 1, m.dilution, v => v <= 5, 'FDV at most 5x market cap', 'FDV more than 5x market cap', 'Market cap or FDV unavailable; dilution not assessed'),
+    check('exit_depth', 1, m.valuationToLiquidity, v => v <= 100, 'Valuation at most 100x pool liquidity', 'Valuation above 100x pool liquidity: thin exit depth', 'Valuation or liquidity unavailable; exit depth not assessed'),
+    check('maturity', 1, s.ageMinutes, v => v >= 60, 'Pool at least one hour old', 'Pool younger than one hour', 'Pool age unavailable; maturity not assessed'),
+  ];
+}
+
+function safetyRisk(s: CandidateSnapshot, checks: RiskCheck[]): Component {
+  const evidence: string[] = [];
+  let points = 0;
+  const contract = s.contractSafety.status === 'verified';
+  if (s.contractSafety.status === 'verified') { points += 7; evidence.push(`Contract safety verified by ${s.contractSafety.source} (+7).`); }
+  else evidence.push('Contract safety (mint and freeze authority, holder concentration, LP status) is unavailable (+0 of 7).');
+  for (const check of checks) {
+    if (check.passed) { points += check.points; evidence.push(`${check.pass} (+${check.points}).`); }
+    else evidence.push(`${check.available ? check.risk : check.missing} (+0).`);
+  }
+  const complete = contract && checks.every(check => check.available);
+  return component('safety_risk', 'Safety risk', 15, points, complete ? 'scored' : 'partial', evidence);
 }
 
 // Hard gates. Any failure makes the candidate REJECTED.
@@ -206,6 +223,7 @@ export function hardGates(s: CandidateSnapshot, m: Measures): Gate[] {
   if (s.ageMinutes === null) fail('missing_pool_age', 'data', 'Pool creation time is unavailable.');
   if (m.h1Total === null) fail('missing_activity', 'data', 'Last-hour buy and sell counts are unavailable.');
   if (s.volumeUsd.h24 === null) fail('missing_volume', 'data', '24h volume is unavailable.');
+  if (s.priceChangePct.m5 === null || s.priceChangePct.h1 === null || s.priceChangePct.h24 === null) fail('missing_price_change', 'data', 'The 5m, 1h or 24h price change is unavailable, so overheating cannot be ruled out.');
   if (s.ageMinutes !== null && s.ageMinutes < MIN_AGE_MINUTES) fail('insufficient_history', 'data', `Pool is younger than ${MIN_AGE_MINUTES} minutes; too little history to assess.`);
   if (s.liquidityUsd !== null && s.liquidityUsd < MIN_LIQUIDITY_USD) fail('thin_liquidity', 'safety', `Liquidity below ${usd(MIN_LIQUIDITY_USD)}: exits may be impossible without a large price impact.`);
   if (s.txns.h1.buys !== null && s.txns.h1.buys >= NO_SELLS_MIN_BUYS && s.txns.h1.sells === 0) fail('sells_absent', 'safety', 'Buys but no sells in the last hour: selling may be restricted (honeypot pattern).');
@@ -230,7 +248,8 @@ export function marketState(s: CandidateSnapshot, m: Measures): Exclude<Candidat
 
 export function scoreCandidate(s: CandidateSnapshot): Assessment {
   const m = measures(s);
-  const components = [liquidityVolume(s, m), volumeAcceleration(s, m), buyerPressure(s, m), ageValuation(s, m), socialMomentum(s), safetyRisk(s, m)];
+  const checks = riskChecks(s, m);
+  const components = [liquidityVolume(s, m), volumeAcceleration(s, m), buyerPressure(s, m), ageValuation(s, m), socialMomentum(s), safetyRisk(s, checks)];
   const score = components.reduce((sum, part) => sum + part.points, 0);
   const rejections = hardGates(s, m);
   const phase = rejections.length ? null : marketState(s, m);
@@ -241,10 +260,12 @@ export function scoreCandidate(s: CandidateSnapshot): Assessment {
   if (state !== 'REJECTED') {
     if (!ACTIONABLE.includes(state)) blockers.push({id: 'state_not_actionable', category: 'momentum', message: `${state} is a risk state, not an entry pattern.`});
     if (score < OPPORTUNITY_MIN_SCORE) blockers.push({id: 'score_below_threshold', category: 'momentum', message: `Score ${score} is below ${OPPORTUNITY_MIN_SCORE}.`});
+    const unassessed = checks.filter(check => !check.available);
+    if (unassessed.length) blockers.push({id: 'risk_inputs_incomplete', category: 'safety', message: `Risk not fully assessed: ${unassessed.map(check => check.missing).join('; ')}.`});
     if (s.contractSafety.status !== 'verified') blockers.push({id: 'contract_safety_unverified', category: 'safety', message: 'Contract safety data is unavailable, so opportunity status fails closed.'});
   }
   const opportunity = state !== 'REJECTED' && blockers.length === 0;
-  const risks = components.find(part => part.id === 'safety_risk')!.evidence.filter(line => /\(-\d+\)\.$/.test(line));
+  const risks = checks.filter(check => check.available && !check.passed).map(check => `${check.risk}.`);
   const reason = state === 'REJECTED' ? rejections.map(gate => gate.message).join(' ') : opportunity ? 'Passes every gate.' : `Not an opportunity: ${blockers.map(gate => gate.message).join(' ')}`;
 
   return {

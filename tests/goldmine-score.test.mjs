@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import {describe, mock, test} from 'node:test';
 import {addresses} from './helpers/harness.mjs';
-import {NOW, cases, checkScoringModel, freshSocial, gateCases, pair, verified} from './helpers/goldmine-fixtures.mjs';
+import {NOW, cases, checkScoringModel, freshSocial, gateCases, pair, verified, without} from './helpers/goldmine-fixtures.mjs';
 
 const snapshots = await import('../lib/goldmine/snapshot.ts');
 const model = await import('../lib/goldmine/score.ts');
@@ -76,7 +76,7 @@ describe('snapshot normalization', () => {
 
 describe('Momentum Score v2', () => {
   test('is versioned and exposes the six states', () => {
-    assert.equal(MODEL_VERSION, 'momentum-v2.0.0');
+    assert.equal(MODEL_VERSION, 'momentum-v2.1.0');
     assert.deepEqual([...STATES], ['EARLY', 'BUILDING', 'BREAKOUT', 'OVERHEATED', 'DISTRIBUTION', 'REJECTED']);
     assert.equal(scoreCandidate(snapshot()).modelVersion, MODEL_VERSION);
   });
@@ -117,9 +117,36 @@ describe('Momentum Score v2', () => {
     assert.ok(buyers.evidence.includes('Counts are swap transactions, not unique wallets.'));
   });
 
+  test('removing a risky input never unlocks a candidate (review regression)', () => {
+    const scored = (overrides, removed) => scoreCandidate({...snapshotFromPair(removed.reduce(without, pair(overrides)), NOW), ...verified});
+    // In v2.0.0 these became BREAKOUT opportunities once the 5m or 24h change disappeared.
+    for (const [overrides, path] of [[{priceChange: {m5: 25}}, ['priceChange', 'm5']], [{priceChange: {h24: 400}}, ['priceChange', 'h24']]]) {
+      assert.equal(scored(overrides, []).state, 'OVERHEATED');
+      const after = scored(overrides, [path]);
+      assert.deepEqual([after.state, after.opportunity, after.rejections.map(gate => gate.id)], ['REJECTED', false, ['missing_price_change']]);
+    }
+    // In v2.0.0 dropping FDV restored 7 points of valuation and safety to a diluted token.
+    const diluted = {marketCap: 1000000, fdv: 6000000};
+    for (const path of [['fdv'], ['marketCap']]) {
+      const [before, after] = [scored(diluted, []), scored(diluted, [path])];
+      assert.ok(after.score <= before.score, `${path}: ${before.score} -> ${after.score}`);
+      assert.equal(after.opportunity, false);
+      assert.ok(after.blockers.some(gate => gate.id === 'risk_inputs_incomplete'));
+    }
+    // A decline that goes unreported cannot earn its safety point back.
+    assert.equal(scored({priceChange: {h24: -35}}, [['priceChange', 'h24']]).state, 'REJECTED');
+  });
+
+  test('safety points come only from passed checks', () => {
+    const safety = (overrides, extra) => scoreCandidate(snapshot(overrides, extra)).components.find(part => part.id === 'safety_risk');
+    assert.deepEqual([safety({}).points, safety({}, verified).points, safety(cases.allRisks).points, safety(cases.allRisks, verified).points], [8, 15, 0, 7]);
+    assert.ok(safety({fdv: undefined}).evidence.includes('Market cap or FDV unavailable; dilution not assessed (+0).'));
+    assert.equal(safety({fdv: undefined}, verified).status, 'partial');
+  });
+
   test('lists observed risks from the safety component', () => {
     assert.deepEqual(scoreCandidate(snapshot()).risks, []);
-    assert.deepEqual(scoreCandidate(snapshot(cases.overheated)).risks, ['More than 50% rise in one hour: elevated reversal risk (-3).']);
+    assert.deepEqual(scoreCandidate(snapshot(cases.overheated)).risks, ['More than 50% rise in one hour: elevated reversal risk.']);
     assert.equal(scoreCandidate(snapshot(cases.allRisks)).risks.length, 7);
   });
 

@@ -1,6 +1,7 @@
 // Goldmine scoring fixtures and the scoring oracle. The oracle states the model's contract (exact points
 // for reference candidates, every hard gate, state rules, fail-closed opportunity status, clamping and
-// "missing data never raises a score"). tests/goldmine-score.test.mjs runs it against lib/goldmine/score.ts,
+// "missing data never helps": removing inputs never raises a score, makes a state actionable or creates
+// an opportunity). tests/goldmine-score.test.mjs runs it against lib/goldmine/score.ts,
 // and tests/goldmine-mutation.test.mjs requires it to reject every deliberately broken copy of that file.
 import assert from 'node:assert/strict';
 import {addresses} from './harness.mjs';
@@ -43,7 +44,7 @@ export const cases = {
   lowActivity: {volume: {h1: 1500000}, txns: {h1: {buys: 8, sells: 2}}},
   noValuation: {marketCap: undefined, fdv: undefined},
   noLongVolume: {volume: {h6: undefined}},
-  // Every market-observable risk at once: deductions far exceed the eight available points.
+  // Every market-observable risk check fails at once: no safety points.
   allRisks: {
     priceChange: {h1: 60, h24: -35}, volume: {h24: 6000000}, txns: {h1: {buys: 180, sells: 20}},
     marketCap: 20000000, fdv: 150000000, pairCreatedAt: NOW - 30 * MINUTE,
@@ -60,6 +61,7 @@ export const gateCases = {
   insufficient_history: {pairCreatedAt: NOW - 10 * MINUTE},
   thin_liquidity: {liquidity: {usd: 20000}},
   sells_absent: {txns: {h1: {buys: 40, sells: 0}}},
+  missing_price_change: {priceChange: {m5: undefined}},
   price_collapse: {priceChange: {h1: -45}},
   extreme_turnover: {volume: {h24: 150000 * 150}},
 };
@@ -102,7 +104,7 @@ export function checkScoringModel({scoreCandidate}, {snapshotFromPair}) {
   const building = score(cases.building, verified);
   assert.deepEqual([building.score, building.state, building.opportunity, gateIds(building.blockers)], [59, 'BUILDING', false, ['score_below_threshold']]);
   const overheated = score(cases.overheated, verified);
-  assert.deepEqual([overheated.state, overheated.opportunity, gateIds(overheated.blockers), points(overheated, 'safety_risk')], ['OVERHEATED', false, ['state_not_actionable'], 12]);
+  assert.deepEqual([overheated.state, overheated.opportunity, gateIds(overheated.blockers), points(overheated, 'safety_risk')], ['OVERHEATED', false, ['state_not_actionable'], 13]);
   assert.equal(score(cases.distribution, verified).state, 'DISTRIBUTION');
   const quiet = score(cases.noMomentum, verified);
   assert.deepEqual([quiet.state, gateIds(quiet.rejections), quiet.opportunity], ['REJECTED', ['no_qualifying_momentum'], false]);
@@ -141,10 +143,45 @@ export function checkScoringModel({scoreCandidate}, {snapshotFromPair}) {
   }
   assert.equal(points(score(cases.allRisks), 'safety_risk'), 0);
 
-  // Missing data never raises the score.
-  const reference = scoreCandidate(snapshot(cases.breakout, verified)).score;
-  for (const path of removableFields) {
-    const reduced = scoreCandidate({...snapshotFromPair(without(pair(), path), NOW), ...verified}).score;
-    assert.ok(reduced <= reference, `removing ${path.join('.')} raised the score from ${reference} to ${reduced}`);
+  // Every risk check must be assessed before a candidate can be an opportunity.
+  const unassessed = score({fdv: undefined}, verified);
+  assert.deepEqual([unassessed.state, unassessed.opportunity, gateIds(unassessed.blockers)], ['BREAKOUT', false, ['risk_inputs_incomplete']]);
+  assert.equal(points(unassessed, 'safety_risk'), 14, 'the unassessed dilution check earns nothing');
+
+  // Missing data never helps: removing any one or two inputs from any reference or risky candidate never
+  // raises the score, never turns a risk or rejected state into an entry pattern and never creates an
+  // opportunity, with or without verified contract safety.
+  for (const [name, overrides] of Object.entries({...cases, ...riskyCases, ...gateCases})) {
+    for (const extra of [{}, verified]) {
+      const raw = pair(overrides);
+      const before = scoreCandidate({...snapshotFromPair(raw, NOW), ...extra});
+      for (const paths of removalSets(raw)) {
+        const after = scoreCandidate({...snapshotFromPair(paths.reduce(without, raw), NOW), ...extra});
+        const label = `${name}${extra.contractSafety ? ' (verified)' : ''} without ${paths.map(path => path.join('.')).join(' and ')}`;
+        assert.ok(after.score <= before.score, `${label}: score rose from ${before.score} to ${after.score}`);
+        assert.ok(!ACTIONABLE_STATES.includes(after.state) || ACTIONABLE_STATES.includes(before.state), `${label}: ${before.state} became ${after.state}`);
+        assert.ok(!after.opportunity || before.opportunity, `${label}: became an opportunity`);
+      }
+    }
   }
+}
+
+const ACTIONABLE_STATES = ['EARLY', 'BUILDING', 'BREAKOUT'];
+
+// Candidates whose risk shows only in inputs that can go missing.
+export const riskyCases = {
+  overheatedDay: {priceChange: {h24: 400}},
+  overheatedMinutes: {priceChange: {m5: 25}},
+  decline: {priceChange: {h24: -35}},
+  diluted: {marketCap: 1000000, fdv: 6000000},
+  oneSided: {txns: {h1: {buys: 175, sells: 5}}},
+  heavyTurnover: {volume: {h24: 150000 * 40}},
+  thinExit: {marketCap: 20000000, fdv: 20000000},
+  young: {pairCreatedAt: NOW - 30 * MINUTE},
+};
+
+// Every single removable input, and every pair of them.
+function removalSets(raw) {
+  const present = removableFields.filter(path => path.reduce((node, key) => node?.[key], raw) !== undefined);
+  return [...present.map(path => [path]), ...present.flatMap((first, index) => present.slice(index + 1).map(second => [first, second]))];
 }
