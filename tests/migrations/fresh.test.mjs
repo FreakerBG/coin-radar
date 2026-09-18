@@ -2,6 +2,7 @@
 // against what the application requires, and exercised through the real routes.
 import assert from 'node:assert/strict';
 import {existsSync} from 'node:fs';
+import {DatabaseSync} from 'node:sqlite';
 import {describe, test} from 'node:test';
 import {readMigrations, splitStatements} from '../../scripts/migrations.mjs';
 import {addresses, body, createD1, installFetch, jsonRequest, runtime, signIn, startClock} from '../helpers/harness.mjs';
@@ -51,6 +52,17 @@ describe('a fresh database built from every migration', () => {
     assert.deepEqual(statementProblems(sqlite, statements), []);
   });
 
+  test('lib/schema-requirements.ts names every table and column the application SQL uses', () => {
+    // A database with only the required tables, columns and keys: any statement that needs more
+    // would pass against the migrations while GET /api/health never probes it.
+    const sqlite = new DatabaseSync(':memory:');
+    for (const [table, spec] of Object.entries(requiredTables)) {
+      sqlite.exec(`CREATE TABLE ${table} (${Object.entries(spec.columns).map(([name, type]) => `${name} ${type}`).join(', ')}, UNIQUE (${spec.key.join(', ')}))`);
+    }
+    assert.deepEqual(statementProblems(sqlite), []);
+    sqlite.close();
+  });
+
   test('matches the db/schema.ts model that npm run db:generate diffs against', async t => {
     const {sqlite} = migratedDatabase(t);
     assert.deepEqual(await drizzleModelProblems(sqlite), []);
@@ -67,11 +79,13 @@ describe('a fresh database built from every migration', () => {
     const portfolio = await import('../../app/api/portfolio/route.ts');
     const monitor = await import('../../app/api/monitor/route.ts');
     const social = await import('../../app/api/social/route.ts');
+    const health = await import('../../app/api/health/route.ts');
     const post = (route, path, payload) => route.POST(jsonRequest(path, {method: 'POST', body: payload}));
     const config = {bankroll: 1000, riskPct: 2, maxAllocationPct: 5, takeProfitPct: 40, stopPct: 20, trailingPct: 15, liquidityDropPct: 30, xDailyRequests: 3};
     const id = '44444444-4444-4444-8444-444444444444';
 
     signIn('user-a');
+    assert.equal((await body(await health.GET())).schema, 'compatible');
     assert.deepEqual(await body(await post(portfolio, '/api/portfolio', {action: 'config', config})), {ok: true});
     const position = {id, address: addresses.tokenA, pair: addresses.pairA, symbol: 'FIX', entryPrice: 1, amount: 100, entryLiquidity: 100000};
     assert.deepEqual(await body(await post(portfolio, '/api/portfolio', {action: 'position', position})), {ok: true});
@@ -138,5 +152,12 @@ describe('failures are reported clearly', () => {
     const model = await drizzleModelProblems(sqlite);
     assert.ok(model.includes('db/schema.ts defines table research_events but no migration creates it (run npm run db:generate)'), model.join('\n'));
     assert.ok(model.includes('column social_cache.user_id is created by migrations but missing from db/schema.ts'), model.join('\n'));
+
+    // The runtime health check sees the missing tables, though not the constraint problems above.
+    const {GET} = await import('../../app/api/health/route.ts');
+    runtime.env.DB = createD1(sqlite);
+    signIn('user-a');
+    const response = await GET();
+    assert.deepEqual([response.status, await body(response)], [503, {status: 'degraded', storage: 'ok', schema: 'incompatible'}]);
   });
 });

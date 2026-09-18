@@ -129,13 +129,14 @@ Use the production URL in a desktop browser with the Network panel open, signed 
 | Area | Check | Pass |
 | --- | --- | --- |
 | Authentication | In a private window, open the Site. Then sign in normally. | Signed out, the Site demands sign-in before content loads. Signed in, the dashboard renders. |
+| Storage and schema | In the signed-in tab, open `/api/health`. | 200 with `"status":"ok"`, `"storage":"ok"` and `"schema":"compatible"`. A 503 with `"schema":"incompatible"` means the deployed code needs a table or column production lacks: stop (section 8). A 503 with `"storage":"unavailable"` is a D1 binding or D1 failure. The check is read-only and covers tables and columns, not constraints. |
 | Portfolio load | Open the Advisor tab. | `GET /api/portfolio` returns 200 with settings, open positions and events as before the deploy. A 503 "Research storage unavailable" is a storage or schema failure. |
 | Portfolio save | Save the risk settings without changing them, then reload. | `POST /api/portfolio` returns `{"ok":true}` and the reloaded values are identical. This is a harmless write (it increments `revision`). Record or close positions only if a closed test record in the history is acceptable. |
 | Advisor and research | Select a coin in Discover and open Advisor. | `GET /api/advisor` returns 200. This makes one free DEX Screener read. A 503 while `/api/portfolio` returns 200 points at the provider, not the schema. |
 | Monitoring | Enable monitoring on the dashboard. | `POST /api/monitor` returns `idle`, `checked` or `provider_unavailable`. A 503 "Position monitoring failed" is a storage or lock failure. With no open positions, no provider is called. |
 | Social/X cache isolation | Open X evidence for a coin that already has cached evidence. **Do not** press "Research selected coin on X" unless a billed request is intended. | `GET /api/social?address=…` returns 200. `usedToday` and `dailyLimit` belong to the signed-in account, and posts contain only `text`, `date`, `url` and `author`. With a second authorized account, both see identical posts but their own quotas. |
 | Mobile navigation | At 320–390 px wide (device toolbar or a phone), switch Discover, Watchlist, Advisor and Alerts. | Every tab opens and the page never scrolls horizontally. |
-| Runtime errors | Reload the dashboard and watch the Network panel. | No unexpected 5xx. Market or news 502s with provider-unavailable messages are provider outages (section 8). The routes do not log server-side diagnostics (section 9), so rely on these status codes and messages. |
+| Runtime errors | Reload the dashboard and watch the Network panel. | No unexpected 5xx. Market or news 502s with provider-unavailable messages are provider outages (section 8). If Worker logs are available, check for `coin_radar.failure` records since the deploy (section 7). |
 
 If any check fails, stop and use sections 7 and 8.
 
@@ -162,13 +163,26 @@ Do not retry the same archive repeatedly, publish other changes on top, or edit 
 
 ### Preserve evidence
 
-Record, without secrets or tokens: the commit SHA, Sites version and deployment IDs, the complete publish or deployment error text, timestamps, the tags recorded in `db/migrations.lock.json` and in the deployed version's `dist/.openai/drizzle/meta/_journal.json`, the failing requests (method, path, status, response body; the app's error bodies contain no credentials), CI run links and the smoke-check results.
+Record, without secrets or tokens: the commit SHA, Sites version and deployment IDs, the complete publish or deployment error text, timestamps, the tags recorded in `db/migrations.lock.json` and in the deployed version's `dist/.openai/drizzle/meta/_journal.json`, the failing requests (method, path, status, response body; the app's error bodies contain no credentials), the `/api/health` response, `coin_radar.failure` log records for the incident window if Worker logs are available, CI run links and the smoke-check results.
+
+### Read failure records
+
+Every route failure writes one JSON line to the Worker log. This record came from `/api/health` against a local preview database with a column removed:
+
+```json
+{"event":"coin_radar.failure","level":"error","route":"health","operation":"probe:research_locks","error":{"name":"Error","message":"D1_ERROR: no such column: expires at offset 18: SQLITE_ERROR","cause":{"name":"Error","message":"no such column: expires at offset 18: SQLITE_ERROR"}}}
+```
+
+- `level: "error"` is a storage, schema or unexpected failure. `level: "warn"` is an upstream provider failure (`market`, `news` and `monitor` with `provider`; `social` with `x-search`) that the app already handles.
+- Two operations handle storage and provider failures in one place and always log `error`: `advisor` `evidence` (D1 reads and DEX Screener) and `social` `research` (D1, and X network failures, timeouts or malformed responses). Tell them apart by the error: `Provider returned <status>`, `X returned errors without data` or a timeout/network error name is the provider; `D1_ERROR` is storage.
+- `route` and `operation` locate the code path. `health` records use `probe:<table>` and name the failing table.
+- Messages are truncated and redacted: the configured X credential, bearer tokens and email addresses are removed, and records never include request bodies, user identifiers or SQL parameters.
 
 ### Identify the affected migration
 
 1. The publish error usually names the failing migration.
 2. Otherwise, list the journal tags added since the last known-good commit: `git diff <last> <sha> -- drizzle/meta/_journal.json`. Only those can have run during this publish.
-3. Map the failing symptom to a table using `requiredTables` in `tests/migrations/schema-contract.mjs`, which lists the routes that depend on each table.
+3. Map the failing symptom to a table: `health` records name it directly, and `requiredTables` in `lib/schema-requirements.ts` lists the routes that depend on each table.
 
 ### A migration failed during publish
 
@@ -201,10 +215,10 @@ Migrations earlier in the same publish may already be applied; they stay immutab
 | --- | --- | --- | --- | --- |
 | Migration fails before the Worker upload | Stop publishing and preserve evidence. The previous Worker keeps serving, possibly on a partly migrated schema. Identify the failing migration and which earlier ones were applied. | Not needed: the old version is still live. Run the section 6 checks to confirm it works on the current schema. | No, if the applied migrations were additive. Yes, if an applied migration rewrote data. | The failing migration is confirmed unapplied; it is corrected under section 7; `npm run verify` and CI pass; section 6 passes after the next publish. |
 | Migrations succeed, Worker deploy fails | Preserve the deployment status. Old code is running on the new schema. Resolve the upload cause and redeploy the same saved version; applied migrations do not run again. | Not applicable: the old version is live. The policy requires it to work on the new schema; confirm with section 6. | No. | `get_deployment_status` reports `succeeded`; section 6 passes. |
-| Deploy succeeds, smoke checks fail | Classify the failure: storage (portfolio 503), provider (advisor, market or news 502/503 while portfolio returns 200) or UI. For a code defect, redeploy the known-good version. | Yes after additive migrations. No if a migration removed or renamed something that version uses; roll forward instead. | Only if new code or a migration damaged data. | Section 6 passes on the running version; the defect is reproduced by a test and fixed; roll forward through section 4. |
-| Partial or incompatible schema state | Stop all publishes. Do not edit migrations or the lock. Preserve evidence and escalate to the platform to read production migration records and schema. | Only to a version confirmed compatible with the actual schema. | Possibly, with platform support. | The applied migrations are known and reconciled with `db/migrations.lock.json`; a corrective forward migration passes tests with a fixture that reproduces the real state. |
+| Deploy succeeds, smoke checks fail | Classify the failure with `/api/health` and failure records: schema (`schema: incompatible`), storage (`storage: unavailable`, or `error` records), provider (health 200, 502/503 from advisor, market or news, and `warn` records or advisor `evidence` records naming the provider; section 7) or UI. For a code defect, redeploy the known-good version. | Yes after additive migrations. No if a migration removed or renamed something that version uses; roll forward instead. | Only if new code or a migration damaged data. | Section 6 passes on the running version; the defect is reproduced by a test and fixed; roll forward through section 4. |
+| Partial or incompatible schema state | Stop all publishes. Do not edit migrations or the lock. `/api/health` reports `schema: incompatible` and its `probe:<table>` records name the tables. Preserve evidence and escalate to the platform to read production migration records and schema. | Only to a version confirmed compatible with the actual schema. | Possibly, with platform support. | The applied migrations are known and reconciled with `db/migrations.lock.json`; a corrective forward migration passes tests with a fixture that reproduces the real state. |
 | Corrupted or missing data | Preserve evidence and bound the time window. If the current code is causing it, redeploy the known-good version to stop further damage. Pause optional writes: disable monitoring and avoid X research and settings changes. | Yes, when new code is the cause. | Yes: a platform point-in-time restore (**unverified**) or a derivable corrective migration. | Per-account spot checks match expectations; section 6 passes; lost writes are documented. |
-| Provider or API outage unrelated to schema (DEX Screener, CoinDesk, X) | Do not roll back or migrate. Confirm `/api/portfolio` returns 200 while provider routes return their unavailable messages and monitoring reports `provider_unavailable`. | Not needed. | No. | The provider recovers and section 6 passes. |
+| Provider or API outage unrelated to schema (DEX Screener, CoinDesk, X) | Do not roll back or migrate. Confirm `/api/health` and `/api/portfolio` return 200 while provider routes return their unavailable messages, monitoring reports `provider_unavailable`, and failure records are `warn` level, except advisor `evidence` and social `research` records, which are `error` with a provider message (section 7). | Not needed. | No. | The provider recovers and section 6 passes. |
 
 ## 9. Limitations and open manual settings
 
@@ -214,4 +228,4 @@ Migrations earlier in the same publish may already be applied; they stay immutab
 - **No production migration status, backup, export or restore tooling** in this repository; D1 recovery-point availability is unverified.
 - **Undocumented platform internals:** the Sites migration record table, per-migration transaction scope, and version-rollback behavior after schema changes.
 - **Local engine differences:** the tests use `node:sqlite` (SQLite bundled with Node), not D1. `npm run db:migrate:local` runs the migrations in Miniflare's local D1, but neither engine proves production D1 behavior for `PRAGMA foreign_keys` during table rebuilds.
-- **No server-side diagnostics:** route handlers return fail-closed messages but do not log errors, so production failures are diagnosed from status codes and response bodies.
+- **Diagnostics depend on log access:** routes write redacted `coin_radar.failure` records, but whether the Site owner can read production Worker logs through Sites is unverified. `/api/health` works without log access.
