@@ -34,6 +34,7 @@ Two tracking rules exist in this toolchain, and a malformed history makes them d
 | `npm test` | LOCAL | `test:migrations`, then every other offline test in `tests/`. |
 | `npm run test:migrations` | LOCAL | Migration structure, fresh-database and upgrade tests on temporary SQLite files. No network. |
 | `npm run test:browser` | LOCAL | Playwright smoke against the local dev server; non-local requests are aborted. |
+| `npm run test:worker` | LOCAL | Starts the built Worker with `wrangler dev --local` on a free port and a temporary local D1 (migrated with `--local`), sends POST requests over HTTP, then stops it and deletes the state. Needs a prior `npm run build`. |
 | `npm run db:migrations:check` | LOCAL | Validate `drizzle/` and `db/migrations.lock.json`. Reads files only. |
 | `npm run db:generate` | LOCAL | `drizzle-kit generate`: writes a new migration from `db/schema.ts`. No database connection. |
 | `npm run build` | LOCAL | Migration check, then the deployable build in `dist/`. Does not deploy. |

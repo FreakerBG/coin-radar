@@ -58,6 +58,7 @@ Node 22.13 or newer. Run `npm ci` first.
 | `npm run test:research` | Advisor and market logic only. Also `node --experimental-strip-types scripts/check-research.mjs`. |
 | `npm run test:social-cache` | X cache isolation only. Also `node --experimental-strip-types --test scripts/check-social-cache.mjs`. |
 | `npm run test:browser` | Playwright smoke tests (not part of `verify`). Needs Chromium: `npx playwright install chromium`. |
+| `npm run test:worker` | Built-Worker HTTP regression (not part of `verify`). Run `npm run build` first. |
 
 Test groups:
 
@@ -66,12 +67,15 @@ Test groups:
 - `social-cache.test.mjs`: two users sharing one cache row, legacy row projection, per-request quota and connection state, fresh/stale/zero-cap paths, removed credential, atomic quota, provider failure and malformed responses, contract lock release, auth and same-origin guards.
 - `portfolio-route.test.mjs`, `advisor-route.test.mjs`, `monitor-route.test.mjs`, `research-db.test.mjs`: auth, same-origin, validation, per-user isolation, idempotent recording, the 30-position limit, zero API allocation, social exclusion, per-user monitor locks, durable event deduplication, outages and lock release.
 - `health-route.test.mjs`: sign-in guard, one read-only probe per required table, missing binding, a binding that throws while preparing, missing table or column reported only in failure records, schema errors wrapped as a cause, storage errors taking precedence.
+- `post-body.test.mjs`: every production POST route finalizes its request body on every path (401, 403, the monitor's unused body, social's missing-secret 409); malformed JSON is a 400 with no storage, lock, X quota, provider call or failure record; body cleanup is bounded (64 KiB, 1 s) and cannot change a response.
 - `diagnostics.test.mjs`: redaction of credentials, bearer tokens in any case and emails; record format and levels; reporting never throws; failure records from portfolio, advisor, monitor (including lock release), social, market and news without response changes; validation errors are not failures.
 - `migrations/structure.test.mjs`: journal, file and snapshot ordering, duplicate and missing migrations, the immutability lock, the build's migration check and the migration CLI.
 - `migrations/fresh.test.mjs`: every migration applied once, in order, to a new temporary database file; the schema contract the routes rely on (`migrations/schema-contract.mjs`); every application SQL statement compiled against the result and against the tables and columns `/api/health` probes (`lib/schema-requirements.ts`); parity with `db/schema.ts`; a real read/write round trip.
 - `migrations/upgrade.test.mjs`: populated databases (`migrations/upgrade-fixtures.mjs`, including pre-Stage-02 shared X cache rows) upgraded from every historical version with no data lost or changed, then served by the real portfolio, monitor and social routes; self-tests proving destructive or incompatible migrations are reported.
 
 Route tests run the real route handlers and `lib/research-db.ts` against an in-memory SQLite database built by applying every migration listed in `drizzle/meta/_journal.json`, through a D1-shaped adapter. Only runtime boundaries are replaced: Cloudflare `env`, Sites authentication headers and `fetch`. DEX Screener, CoinDesk and X responses are fixtures. No test makes a network request, uses real credentials or touches production D1; no live X request is made.
+
+The built-Worker regression (`tests/worker/`) starts `dist/` the way `npm start` does, on a free local port with a temporary migrated local D1 and fake sign-in headers. It sends small POST bodies to `/api/portfolio`, `/api/monitor` and `/api/social` over HTTP, checks each response, sends a signed-in health check after each, and fails if the Worker stops or its debug log shows `Can't read from request stream after response has been sent`. The requests end before any provider call. It stops only the process tree it started, confirms none of it survives and removes its temporary state. CI runs it in the `Browser smoke` job.
 
 Browser smoke (`e2e/`) starts the local dev server (mock Sites sign-in, local Miniflare) and fulfils every `/api/*` call in the browser from fixtures, aborting any non-local request. It covers initial render, provider outage, tab switching, device-local watchlist/alert settings, signed-out and unavailable Advisor account states, and horizontal overflow at 320, 360 and 390 px. It does not cover authenticated D1 flows, real providers or production hosting.
 

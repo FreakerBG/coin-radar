@@ -42,6 +42,16 @@ jobs:
           node-version: 22.13.0
           cache: npm
       - run: npm ci
+      - run: npm run build
+      - name: Built Worker request-body regression
+        run: npm run test:worker
+      - name: Check no Worker process remains
+        if: always()
+        run: |
+          if pgrep -a workerd || pgrep -af 'wrangler\.js'; then
+            echo "A Worker process outlived the request-body regression."
+            exit 1
+          fi
       - run: npx playwright install --with-deps chromium
       - run: npm run test:browser
         env:
