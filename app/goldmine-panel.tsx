@@ -3,7 +3,7 @@ import {useCallback,useEffect,useRef,useState} from 'react';
 import {Gem,RefreshCw,ShieldCheck,ShieldAlert,ArrowUpRight,Radio} from 'lucide-react';
 import {toast} from 'sonner';
 import {isStale,opportunitiesOf,scanState,type PostedCandidate} from '@/lib/goldmine/dashboard-view';
-import type {ContractSafety} from '@/lib/goldmine/snapshot';
+import type {ContractSafetySummary} from '@/lib/goldmine/snapshot';
 
 type ScanResponse = {
   status: 'checked' | 'busy' | 'provider_unavailable';
@@ -18,7 +18,7 @@ type ScanResponse = {
 };
 type TrackedSignal = {
   id: string; address: string; pair: string; symbol: string; state: string; score: number; opportunity: boolean;
-  detectedAt: string; detectedPrice: number; contractSafety: ContractSafety;
+  detectedAt: string; detectedPrice: number; contractSafety: ContractSafetySummary;
   assessment: {summary: string};
   outcomes: {horizon: string; status: string; returnPct: number | null}[];
 };
@@ -28,7 +28,9 @@ const money = (n: number | null) => n === null ? '—' : new Intl.NumberFormat('
 const smallAddress = (a: string) => a.slice(0, 5) + '…' + a.slice(-5);
 const safetyEvidence = (candidate: PostedCandidate) => candidate.components.find(c => c.id === 'safety_risk')?.evidence[0] ?? '';
 
-function SafetyBadge({contractSafety}: {contractSafety: ContractSafety}) {
+// Accepts either the full POST-response ContractSafety or the reduced GET-tracking ContractSafetySummary:
+// both carry `status`, which is all this badge ever reads.
+function SafetyBadge({contractSafety}: {contractSafety: {status: 'unavailable' | 'unsafe' | 'verified'}}) {
   if (contractSafety.status === 'verified') return <span className="pill" style={{borderColor: '#3f5a3a', color: '#b7ee82'}}><ShieldCheck size={13} /> RugCheck verified</span>;
   if (contractSafety.status === 'unsafe') return <span className="pill" style={{borderColor: '#4a3727', color: '#edc59b'}}><ShieldAlert size={13} /> Failed safety check</span>;
   return <span className="pill"><ShieldAlert size={13} /> Safety unchecked</span>;

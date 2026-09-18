@@ -96,7 +96,7 @@ RugCheck's own score or verdict is never read. Instead its facts feed our own de
 
 ## 5. Extension points
 
-- **Contract safety dashboard:** built (section 6, 03B). `GET /api/goldmine`'s `signals[]` now includes each signal's `contractSafety` (read from its stored snapshot, never re-fetched from RugCheck); `facts`, `failedChecks` and RugCheck's own `providerRisks`/`providerScoreNormalized` are available the same way for a deeper view than the panel currently renders.
+- **Contract safety dashboard:** built (section 6, 03B). `GET /api/goldmine`'s `signals[]` now includes each signal's `contractSafety`, reduced to the client-facing `ContractSafetySummary` shape (`{status}` for verified/unavailable, `{status, reason}` for unsafe) - never the stored `facts`, `failedChecks` wording beyond that reason, or RugCheck's own `providerRisks`/`providerScoreNormalized`, which stay server-side only. A deeper view would need a new, deliberately-scoped field, not widening this one.
 - **Backtesting:** stored snapshots re-score under any model version with `scoreCandidate`; outcomes give the realized quotes.
 - **Paper trading:** a paper position can reference a signal ID and its detection price; no real funds.
 - **Alerts:** new signals and state changes are rows with stable IDs, suitable for idempotent delivery.

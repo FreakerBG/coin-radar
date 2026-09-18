@@ -6,7 +6,7 @@
 import {reportFailure} from '../diagnostics';
 import {fetchJson} from '../market';
 import {MODEL_VERSION, type Assessment} from './score';
-import {at, socialEvidence, type CandidateSnapshot} from './snapshot';
+import {at, contractSafetySummary, socialEvidence, type CandidateSnapshot} from './snapshot';
 
 const MINUTE = 60000, HOUR = 60 * MINUTE;
 export const HORIZONS = [
@@ -122,6 +122,14 @@ export async function evaluateOutcomes(database: D1Database, now: number): Promi
 
 const percent = (value: number | null) => value === null ? null : Number((value * 100).toFixed(2));
 
+// A stored snapshot is always written as JSON.stringify of a real CandidateSnapshot (recordSignals), but
+// a row can still predate a field (an older model version's snapshot shape) or, in principle, contain
+// corrupt JSON. Either must degrade to "no evidence", never crash the whole tracking read for every
+// other signal.
+function parseSnapshot(raw: string): unknown {
+  try { return JSON.parse(raw); } catch { return null; }
+}
+
 // Recent signals with their outcomes, and per-state outcome counts for the current model version.
 export async function readTracking(database: D1Database) {
   const signals = (await database.prepare('SELECT id, address, pair, symbol, model_version, state, score, opportunity, detected_at, detected_price, snapshot, assessment FROM goldmine_signals ORDER BY detected_at DESC, id LIMIT 50')
@@ -158,8 +166,11 @@ export async function readTracking(database: D1Database) {
       detectedAt: new Date(signal.detected_at).toISOString(),
       detectedPrice: signal.detected_price,
       // From the snapshot recorded at detection time, never recomputed: a dashboard can show exactly
-      // what safety evidence backed this signal without querying RugCheck again.
-      contractSafety: (JSON.parse(signal.snapshot) as CandidateSnapshot).contractSafety,
+      // what safety evidence backed this signal without querying RugCheck again. Reduced to the minimal
+      // client-facing shape (lib/goldmine/snapshot.ts contractSafetySummary) - never the stored facts,
+      // provider score or provider risk text - and defensively parsed so a malformed or legacy-shaped
+      // stored snapshot can never crash this read or be read as safe.
+      contractSafety: contractSafetySummary(at(parseSnapshot(signal.snapshot), 'contractSafety')),
       assessment: JSON.parse(signal.assessment) as Assessment,
       outcomes: outcomes.filter(outcome => outcome.signal_id === signal.id).sort(byHorizon).map(outcome => ({
         horizon: outcome.horizon,

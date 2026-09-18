@@ -161,6 +161,61 @@ test('Goldmine: signal history unavailable shows a retryable error, not an empty
   await expect(page.getByRole('heading', {name: 'No opportunities recorded yet'})).toHaveCount(0);
 });
 
+test('Goldmine: the scan button is disabled while a scan is in flight, so rapid clicks send only one request', async ({page}) => {
+  let postCount = 0;
+  await mockApis(page);
+  await page.route('**/api/goldmine', async route => {
+    if (route.request().method() !== 'POST') return route.fulfill({status: 200, json: goldmineTracking()});
+    postCount++;
+    await new Promise(resolve => setTimeout(resolve, 400));
+    return route.fulfill({status: 200, json: goldmineChecked({candidates: [goldmineCandidate()], opportunities: 1})});
+  });
+  await openDashboard(page);
+  await tab(page, 'Goldmine').click();
+  const scanButton = page.getByRole('button', {name: /Scan now|Scanning/});
+  await scanButton.click();
+  await expect(scanButton).toBeDisabled();
+  // Two more clicks while disabled must not queue additional requests.
+  await scanButton.click({force: true});
+  await scanButton.click({force: true});
+  await expect(page.getByText('1 verified opportunity found.')).toBeVisible();
+  expect(postCount).toBe(1);
+});
+
+test('Goldmine: a slower, earlier history fetch never overwrites a faster, later one (stale-response race)', async ({page}) => {
+  await mockApis(page, {goldmine: {status: 503, json: {error: 'Signal storage unavailable.'}}});
+  await openDashboard(page);
+  await tab(page, 'Goldmine').click();
+  await expect(page.getByRole('alert').filter({hasText: 'Signal storage unavailable.'})).toBeVisible();
+
+  const oldSignal = {
+    id: 'sig-old', address: coin.address, pair: coin.pair, symbol: 'OLDD', state: 'BREAKOUT', score: 81, opportunity: true,
+    detectedAt: '2026-01-01T00:00:00.000Z', detectedPrice: coin.price, contractSafety: {status: 'verified'},
+    assessment: {summary: 'stale response'}, outcomes: [],
+  };
+  const newSignal = {
+    id: 'sig-new', address: coin.address, pair: coin.pair, symbol: 'NEWW', state: 'BREAKOUT', score: 81, opportunity: true,
+    detectedAt: '2026-01-01T00:00:00.000Z', detectedPrice: coin.price, contractSafety: {status: 'verified'},
+    assessment: {summary: 'fresh response'}, outcomes: [],
+  };
+  let call = 0;
+  await page.route('**/api/goldmine', async route => {
+    if (route.request().method() === 'POST') return route.fulfill({status: 200, json: goldmineChecked()});
+    call++;
+    if (call === 1) { await new Promise(resolve => setTimeout(resolve, 500)); return route.fulfill({status: 200, json: goldmineTracking({signals: [oldSignal]})}); }
+    return route.fulfill({status: 200, json: goldmineTracking({signals: [newSignal]})});
+  });
+  const retry = page.getByRole('button', {name: 'Retry'});
+  await retry.click(); // request A: slow, resolves last
+  await retry.click(); // request B: fast, resolves first - and is the newer request
+
+  await expect(page.getByText('NEWW')).toBeVisible();
+  // Give request A time to resolve after B; its late arrival must never replace the newer result.
+  await page.waitForTimeout(700);
+  await expect(page.getByText('OLDD')).toHaveCount(0);
+  await expect(page.getByText('NEWW')).toBeVisible();
+});
+
 test('watchlist and alert settings persist on this device', async ({page}) => {
   await mockApis(page);
   await openDashboard(page);

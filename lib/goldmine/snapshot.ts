@@ -41,6 +41,33 @@ export type ContractSafety =
   | {status: 'unsafe'; source: string; checkedAt: number; facts: ContractSafetyFacts; failedChecks: string[]}
   | {status: 'verified'; source: string; checkedAt: number; facts: ContractSafetyFacts};
 
+// The client-facing reduction of ContractSafety: only what a UI needs to render a badge and, for
+// 'unsafe', a concise reason. Never the stored object itself - no facts, no RugCheck's own
+// providerScoreNormalized/providerRisks, no checkedAt/source provenance. `reason` is built only from our
+// own deterministic check messages (lib/goldmine/contract-safety.ts safetyChecks), never from provider
+// text, so it is always safe to render as plain text.
+export type ContractSafetySummary =
+  | {status: 'unavailable'}
+  | {status: 'unsafe'; reason: string}
+  | {status: 'verified'};
+
+// Reduces a stored (or possibly missing/malformed/legacy) contractSafety value to the client-facing
+// summary. Anything that is not recognizably 'verified' or 'unsafe' - including undefined (a snapshot
+// recorded before contract safety existed) and any other malformed shape - is 'unavailable'. Missing
+// contract safety must never be read as safe.
+export function contractSafetySummary(value: unknown): ContractSafetySummary {
+  const status = value !== null && typeof value === 'object' ? (value as {status?: unknown}).status : undefined;
+  if (status === 'verified') return {status: 'verified'};
+  if (status === 'unsafe') {
+    const failedChecks = (value as {failedChecks?: unknown}).failedChecks;
+    const reason = Array.isArray(failedChecks) && failedChecks.length && failedChecks.every(item => typeof item === 'string')
+      ? failedChecks.join(' ')
+      : 'Contract safety checks failed.';
+    return {status: 'unsafe', reason};
+  }
+  return {status: 'unavailable'};
+}
+
 export type CandidateSnapshot = {
   schema: typeof SNAPSHOT_SCHEMA;
   source: 'dexscreener';
