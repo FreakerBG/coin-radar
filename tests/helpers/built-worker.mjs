@@ -93,6 +93,15 @@ export async function startBuiltWorker({vars = {}} = {}) {
   let known = [];
   let log = '';
   const emergencyStop = () => { if (child) killTree(child.pid, known); };
+  async function remaining() {
+    let survivors = [];
+    for (let attempt = 0; attempt < 50; attempt++) {
+      survivors = treeProcesses(child.pid, known);
+      if (!survivors.length) break;
+      await sleep(200);
+    }
+    return survivors;
+  }
 
   const worker = {
     port: 0,
@@ -100,21 +109,26 @@ export async function startBuiltWorker({vars = {}} = {}) {
     tempRoot,
     get log() { return log; },
     get alive() { return child !== null && child.exitCode === null && child.signalCode === null; },
-    // Stops the tree, confirms that no process in it survived and removes the temporary state.
+    // Stops the tree and reports any process that survived it; survivors are then killed again so
+    // they cannot leak. Removes the temporary state.
     async stop() {
-      process.off('exit', emergencyStop);
       let survivors = [];
       if (child) {
         known = treeProcesses(child.pid, known);
         killTree(child.pid, known);
-        for (let attempt = 0; attempt < 50; attempt++) {
-          survivors = treeProcesses(child.pid, known);
-          if (!survivors.length) break;
-          await sleep(200);
+        survivors = await remaining();
+        if (survivors.length) {
+          killTree(child.pid, survivors);
+          await remaining();
         }
       }
-      rmSync(tempRoot, {recursive: true, force: true, maxRetries: 10, retryDelay: 200});
-      return {survivors: [...new Set(survivors)], tempRemoved: !existsSync(tempRoot)};
+      process.off('exit', emergencyStop);
+      try {
+        rmSync(tempRoot, {recursive: true, force: true, maxRetries: 10, retryDelay: 200});
+      } catch {
+        // Reported through tempRemoved.
+      }
+      return {survivors, tempRemoved: !existsSync(tempRoot)};
     },
   };
 

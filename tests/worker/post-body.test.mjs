@@ -22,8 +22,11 @@ async function send(worker, method, path, {headers = {}, body} = {}) {
   return {status: response.status, json};
 }
 
-// Each POST is followed by a signed-in health check on the same kept-alive connection pool.
+// Each POST is followed by a signed-in health check on the same kept-alive connection pool. The
+// counts let the last test confirm that every POST really had a healthy follow-up.
+const followUps = {posts: 0, healthy: 0};
 async function postThenHealth(worker, {path, auth = true, origin = 'same', contentType = 'application/json', body}, expected) {
+  followUps.posts++;
   const headers = {'content-type': contentType, ...(auth ? signedIn : {})};
   if (origin === 'same') headers.origin = worker.origin;
   else if (origin) headers.origin = origin;
@@ -38,12 +41,24 @@ async function postThenHealth(worker, {path, auth = true, origin = 'same', conte
   assert.equal(health.status, 200, `follow-up health after POST ${path}: ${JSON.stringify(health.json)}`);
   assert.deepEqual([health.json.status, health.json.storage, health.json.schema], ['ok', 'ok', 'compatible']);
   assert.equal(worker.alive, true, `the Worker is still running after POST ${path}`);
+  if (health.status === 200 && health.json.status === 'ok' && worker.alive) followUps.healthy++;
 }
 
+// The error is printed only at debug level, and in Wrangler's dev proxy; a log without the proxy's
+// debug output could not show it.
 function assertCleanLog(worker) {
+  assert.ok(worker.log.includes('[wrangler-ProxyWorker:info] GET /api/health 200'), 'the Worker log is captured at debug level');
   assert.equal(worker.log.includes(STREAM_ERROR), false, `the Worker log contains the uncaught stream error:\n${worker.log.split('\n').filter(line => line.includes(STREAM_ERROR)).slice(0, 5).join('\n')}`);
   assert.equal(worker.log.includes(RESTARTED), false, 'Wrangler reported a restarted Worker');
 }
+
+test('the log check recognizes the uncaught stream error', () => {
+  const debugLine = '[wrangler-ProxyWorker:info] GET /api/health 200 OK (5ms)\n';
+  assert.doesNotThrow(() => assertCleanLog({log: debugLine}));
+  assert.throws(() => assertCleanLog({log: debugLine + 'uncaught exception; source = Uncaught (async); stack = TypeError: ' + STREAM_ERROR + '.'}), /uncaught stream error/);
+  assert.throws(() => assertCleanLog({log: debugLine + RESTARTED}), /restarted/);
+  assert.throws(() => assertCleanLog({log: '[wrangler:info] GET /api/health 200 OK (5ms)'}), /debug level/);
+});
 
 const signInRequired = {status: 401, json: {error: 'Sign in required.'}};
 const sameOriginRequired = {status: 403, json: {error: 'Same-origin request required.'}};
@@ -53,7 +68,10 @@ const idleScan = {status: 200, json: data => assert.deepEqual([data.status, data
 for (const [name, vars] of [['without an X secret', {}], ['with a fake local X secret', {X_BEARER_TOKEN: 'fake-local-x-credential'}]]) {
   describe(`built Worker ${name}`, () => {
     let worker;
-    before(async () => { worker = await startBuiltWorker({vars}); });
+    before(async () => {
+      Object.assign(followUps, {posts: 0, healthy: 0});
+      worker = await startBuiltWorker({vars});
+    });
     after(async () => {
       if (!worker) return;
       const {survivors, tempRemoved} = await worker.stop();
@@ -101,6 +119,8 @@ for (const [name, vars] of [['without an X secret', {}], ['with a fake local X s
       assert.equal(health.status, 200);
       assert.equal(worker.alive, true);
       assertCleanLog(worker);
+      assert.ok(followUps.posts >= 17, `${followUps.posts} POST requests were sent`);
+      assert.equal(followUps.healthy, followUps.posts, 'every POST was followed by a healthy signed-in request');
     });
   });
 }
