@@ -38,6 +38,7 @@ describe('failure records', () => {
     const redacted = redact(`Bearer abc.def-ghi failed for ${EMAIL} using ${CREDENTIAL} ${'x'.repeat(400)}`);
     assert.match(redacted, /^Bearer \[redacted\] failed for \[email\] using \[redacted\] x+$/);
     assert.equal(redacted.length, 300);
+    assert.equal(redact('BEARER abc, bearer def; Authorization: Bearer ghi'), 'Bearer [redacted] Bearer [redacted] Authorization: Bearer [redacted]');
   });
 
   test('one JSON line per failure, at the requested level, including a redacted cause', () => {
@@ -47,6 +48,13 @@ describe('failure records', () => {
       {event: 'coin_radar.failure', level: 'error', route: 'route-x', operation: 'operation-y', error: {name: 'Error', message: 'outer', cause: {name: 'TypeError', message: 'inner [redacted]'}}},
       {event: 'coin_radar.failure', level: 'warn', route: 'route-x', operation: 'provider', error: {name: 'string', message: 'plain value'}},
     ]);
+  });
+
+  test('reporting never throws, even for a value that cannot be described', () => {
+    const unreadable = new Error('hidden');
+    Object.defineProperty(unreadable, 'message', {get() { throw new Error('message getter failed'); }});
+    for (const value of [Object.create(null), unreadable]) assert.doesNotThrow(() => reportFailure('route-x', 'operation-y', value));
+    assert.deepEqual(failures.map(failure => [failure.route, failure.operation, failure.error.name]), [['route-x', 'operation-y', 'unknown'], ['route-x', 'operation-y', 'unknown']]);
   });
 });
 

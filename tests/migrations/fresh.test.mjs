@@ -2,6 +2,7 @@
 // against what the application requires, and exercised through the real routes.
 import assert from 'node:assert/strict';
 import {existsSync} from 'node:fs';
+import {DatabaseSync} from 'node:sqlite';
 import {describe, test} from 'node:test';
 import {readMigrations, splitStatements} from '../../scripts/migrations.mjs';
 import {addresses, body, createD1, installFetch, jsonRequest, runtime, signIn, startClock} from '../helpers/harness.mjs';
@@ -49,6 +50,17 @@ describe('a fresh database built from every migration', () => {
       assert.ok(statements.some(({sql}) => new RegExp(`\\b${table}\\b`).test(sql)), `no application statement uses ${table}`);
     }
     assert.deepEqual(statementProblems(sqlite, statements), []);
+  });
+
+  test('lib/schema-requirements.ts names every table and column the application SQL uses', () => {
+    // A database with only the required tables, columns and keys: any statement that needs more
+    // would pass against the migrations while GET /api/health never probes it.
+    const sqlite = new DatabaseSync(':memory:');
+    for (const [table, spec] of Object.entries(requiredTables)) {
+      sqlite.exec(`CREATE TABLE ${table} (${Object.entries(spec.columns).map(([name, type]) => `${name} ${type}`).join(', ')}, UNIQUE (${spec.key.join(', ')}))`);
+    }
+    assert.deepEqual(statementProblems(sqlite), []);
+    sqlite.close();
   });
 
   test('matches the db/schema.ts model that npm run db:generate diffs against', async t => {

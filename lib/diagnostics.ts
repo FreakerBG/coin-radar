@@ -17,12 +17,24 @@ export function redact(text: string): string {
 
 function describe(error: unknown): {name: string; message: string; cause?: {name: string; message: string}} {
   if (!(error instanceof Error)) return {name: typeof error, message: redact(String(error))};
-  const cause = error.cause instanceof Error ? {name: error.cause.name, message: redact(error.cause.message)} : undefined;
-  return {name: error.name, message: redact(error.message), ...(cause ? {cause} : {})};
+  const cause = error.cause instanceof Error ? {name: redact(error.cause.name), message: redact(error.cause.message)} : undefined;
+  return {name: redact(error.name), message: redact(error.message), ...(cause ? {cause} : {})};
 }
 
+// Called from catch and finally blocks, so it must never throw: a value that cannot be described
+// (a throwing getter or toString) is recorded as unknown, and a failing console is ignored.
 export function reportFailure(route: string, operation: string, error: unknown, level: FailureLevel = 'error') {
-  const record = JSON.stringify({event: 'coin_radar.failure', level, route, operation, error: describe(error)});
-  if (level === 'warn') console.warn(record);
-  else console.error(record);
+  try {
+    let described;
+    try {
+      described = describe(error);
+    } catch {
+      described = {name: 'unknown', message: 'The failure could not be described.'};
+    }
+    const record = JSON.stringify({event: 'coin_radar.failure', level, route, operation, error: described});
+    if (level === 'warn') console.warn(record);
+    else console.error(record);
+  } catch {
+    // Reporting is best effort; the caller's response must not change.
+  }
 }

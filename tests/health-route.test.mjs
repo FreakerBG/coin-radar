@@ -20,8 +20,26 @@ beforeEach(() => {
 
 test('requires sign-in before touching storage', async () => {
   signOut();
-  assert.equal((await GET()).status, 401);
+  const response = await GET();
+  assert.deepEqual([response.status, response.headers.get('Cache-Control')], [401, 'no-store']);
   assert.deepEqual([d1.queries, failures], [[], []]);
+});
+
+test('a binding that throws while preparing a probe reports storage unavailable', async () => {
+  runtime.env.DB = {prepare() { throw new Error('D1 binding rejected the statement'); }};
+  const response = await GET();
+  assert.deepEqual([response.status, response.headers.get('Cache-Control'), await body(response)], [503, 'no-store', {status: 'degraded', storage: 'unavailable'}]);
+  assert.equal(failures.length, tableCount);
+});
+
+test('a schema error wrapped as a cause is a schema error; any other rejection is a storage error', async () => {
+  d1.beforeQuery = sql => { if (sql.includes('FROM social_usage')) throw new Error('D1_ERROR', {cause: new Error('no such table: social_usage: SQLITE_ERROR')}); };
+  const wrapped = await GET();
+  assert.deepEqual([wrapped.status, await body(wrapped)], [503, {status: 'degraded', storage: 'ok', schema: 'incompatible'}]);
+
+  d1.beforeQuery = sql => { if (sql.includes('FROM social_usage')) throw 'no such table: social_usage'; };
+  const thrownValue = await GET();
+  assert.deepEqual([thrownValue.status, await body(thrownValue)], [503, {status: 'degraded', storage: 'unavailable'}]);
 });
 
 test('a migrated database is compatible, checked with one read-only probe per required table', async () => {

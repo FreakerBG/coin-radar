@@ -16,7 +16,7 @@ function isSchemaError(error: unknown) {
 // coarse; which table failed, and why, is reported to Workers logs.
 export async function GET() {
   const user = await getChatGPTUser();
-  if (!user) return Response.json({error: 'Sign in required.'}, {status: 401});
+  if (!user) return Response.json({error: 'Sign in required.'}, {status: 401, headers: noStore});
   let database: D1Database;
   try {
     database = db();
@@ -26,7 +26,8 @@ export async function GET() {
   }
 
   const probes = schemaProbes();
-  const results = await Promise.allSettled(probes.map(probe => database.prepare(probe.sql).all()));
+  // async, so a binding that throws synchronously while preparing is a rejected probe too.
+  const results = await Promise.allSettled(probes.map(async probe => database.prepare(probe.sql).all()));
   const failures = results.flatMap((result, index) => result.status === 'rejected' ? [{table: probes[index].table, error: result.reason}] : []);
   for (const {table, error} of failures) reportFailure('health', `probe:${table}`, error);
 
