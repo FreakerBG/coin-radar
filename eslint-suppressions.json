@@ -6,7 +6,7 @@
   },
   "app/api/market/route.ts": {
     "@typescript-eslint/no-explicit-any": {
-      "count": 5
+      "count": 1
     }
   },
   "app/api/monitor/route.ts": {

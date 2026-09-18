@@ -21,6 +21,22 @@ export async function fetchJson(url:string,ttl=60000,headers?:Record<string,stri
  if(!r.ok)throw new Error(`Provider returned ${r.status}`);const value=await r.json();
  if(cache.size>100)cache.clear();cache.set(url,{value,expires:Date.now()+ttl});return value;
 }
+// Discovery shared by GET /api/market (no query) and POST /api/goldmine: the latest DEX Screener token
+// profiles and top boosts, up to 30 Solana tokens, and every pool the provider returns for them.
+type Listing={chainId?:unknown;tokenAddress?:unknown};
+export async function discoverSolanaPairs():Promise<{pairs:unknown[];boosted:Set<string>;warnings:string[]}>{
+ const warnings:string[]=[];
+ const sources=await Promise.allSettled([fetchJson('https://api.dexscreener.com/token-profiles/latest/v1'),fetchJson('https://api.dexscreener.com/token-boosts/top/v1')]);
+ const listings=(source:PromiseSettledResult<unknown>):Listing[]=>source.status==='fulfilled'&&Array.isArray(source.value)?source.value:[];
+ const profiles=listings(sources[0]),boosts=listings(sources[1]);
+ if(sources.some(s=>s.status==='rejected'))warnings.push('One discovery feed is unavailable. Coverage is reduced.');
+ const boosted=new Set(boosts.filter(p=>p?.chainId==='solana').map(p=>String(p.tokenAddress)));
+ const addrs=[...new Set([...profiles,...boosts].filter(p=>p?.chainId==='solana'&&typeof p.tokenAddress==='string'&&/^[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(p.tokenAddress)).map(p=>p.tokenAddress as string))].slice(0,30);
+ if(!addrs.length)throw new Error('Discovery feeds returned no Solana tokens.');
+ const pairs=await fetchJson('https://api.dexscreener.com/tokens/v1/solana/'+addrs.join(','));
+ if(!Array.isArray(pairs))throw new Error('Unexpected provider response');
+ return {pairs,boosted,warnings};
+}
 export function normalize(p:any,boosted=false):Coin|null{
  const address=p.baseToken?.address;if(p.chainId!=='solana'||!address||!p.pairAddress)return null;
  const c={address,name:String(p.baseToken.name||'Unknown'),symbol:String(p.baseToken.symbol||'?'),price:numeric(Number(p.priceUsd))&&Number(p.priceUsd)>0?Number(p.priceUsd):null,change5m:numeric(p.priceChange?.m5),change1h:numeric(p.priceChange?.h1),change24h:numeric(p.priceChange?.h24),liquidity:numeric(p.liquidity?.usd),volume:numeric(p.volume?.h24),marketCap:numeric(p.marketCap),buys:numeric(p.txns?.h1?.buys),sells:numeric(p.txns?.h1?.sells),ageHours:p.pairCreatedAt?Math.max(0,(Date.now()-p.pairCreatedAt)/3600000):null,pair:String(p.pairAddress),boosted:boosted||Number(p.boosts?.active)>0,links:[...(p.info?.websites||[]).map((x:any)=>({label:'Project website · unverified',url:safeUrl(x.url)})),...(p.info?.socials||[]).map((x:any)=>({label:`${x.type||'Social'} · project supplied`,url:safeUrl(x.url)}))].filter((x:any)=>x.url)};
