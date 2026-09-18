@@ -18,11 +18,18 @@ export const HORIZONS = [
 // A token can be recorded again in the same state once per bucket, so a pattern that persists does not
 // create a signal per scan.
 export const SIGNAL_BUCKET_MS = 6 * HOUR;
-// DEX Screener's pairs endpoint accepts up to 30 pair addresses.
-export const MAX_OUTCOME_PAIRS = 30;
+// DEX Screener's pairs endpoint accepts up to 30 pair addresses per request. A scan sends at most
+// MAX_OUTCOME_BATCHES requests (150 pairs), in parallel so it stays well inside the 60-second scan lock.
+export const MAX_PAIRS_PER_REQUEST = 30;
+export const MAX_OUTCOME_BATCHES = 5;
+// Signals written per INSERT. A signal with its snapshot and assessment is about 4 KB of JSON, so ten keep
+// each bound value far below D1's 100 KB statement and 2 MB value limits.
+export const SIGNALS_PER_INSERT = 10;
 
 export type Scored = {snapshot: CandidateSnapshot; assessment: Assessment};
-export type OutcomeRun = {provider: 'not_needed' | 'ok' | 'unavailable'; observed: number; unavailable: number; missed: number};
+// provider: 'partial' when some batches failed. deferred: due pool/token pairs left for a later scan
+// because this scan reached its request cap; their windows stay open until their deadlines.
+export type OutcomeRun = {provider: 'not_needed' | 'ok' | 'partial' | 'unavailable'; observed: number; unavailable: number; missed: number; deferred: number};
 
 export const signalId = (assessment: Assessment, detectedAt: number) =>
   `${assessment.modelVersion}:${assessment.address}:${assessment.state}:${Math.floor(detectedAt / SIGNAL_BUCKET_MS)}`;
@@ -57,44 +64,59 @@ export async function recordSignals(database: D1Database, scored: Scored[], dete
     snapshot: JSON.stringify(snapshot),
     assessment: JSON.stringify(assessment),
   }));
-  if (!rows.length) return 0;
-  const inserted = await database.prepare("INSERT OR IGNORE INTO goldmine_signals (id, address, pair, symbol, model_version, state, score, opportunity, detected_at, detected_price, snapshot, assessment) SELECT json_extract(value, '$.id'), json_extract(value, '$.address'), json_extract(value, '$.pair'), json_extract(value, '$.symbol'), json_extract(value, '$.modelVersion'), json_extract(value, '$.state'), json_extract(value, '$.score'), json_extract(value, '$.opportunity'), json_extract(value, '$.detectedAt'), json_extract(value, '$.detectedPrice'), json_extract(value, '$.snapshot'), json_extract(value, '$.assessment') FROM json_each(?)")
-    .bind(JSON.stringify(rows)).run();
-  const horizons = Object.fromEntries(HORIZONS.map(({id, after, window}) => [id, {after, window}]));
-  await database.prepare("INSERT OR IGNORE INTO goldmine_outcomes (signal_id, horizon, due_at, deadline_at) SELECT s.id, h.key, s.detected_at + json_extract(h.value, '$.after'), s.detected_at + json_extract(h.value, '$.after') + json_extract(h.value, '$.window') FROM goldmine_signals s JOIN json_each(?) h WHERE s.id IN (SELECT value FROM json_each(?))")
-    .bind(JSON.stringify(horizons), JSON.stringify(rows.map(row => row.id))).run();
-  return inserted.meta.changes ?? 0;
+  let inserted = 0;
+  const horizons = JSON.stringify(Object.fromEntries(HORIZONS.map(({id, after, window}) => [id, {after, window}])));
+  for (let index = 0; index < rows.length; index += SIGNALS_PER_INSERT) {
+    const chunk = rows.slice(index, index + SIGNALS_PER_INSERT);
+    const result = await database.prepare("INSERT OR IGNORE INTO goldmine_signals (id, address, pair, symbol, model_version, state, score, opportunity, detected_at, detected_price, snapshot, assessment) SELECT json_extract(value, '$.id'), json_extract(value, '$.address'), json_extract(value, '$.pair'), json_extract(value, '$.symbol'), json_extract(value, '$.modelVersion'), json_extract(value, '$.state'), json_extract(value, '$.score'), json_extract(value, '$.opportunity'), json_extract(value, '$.detectedAt'), json_extract(value, '$.detectedPrice'), json_extract(value, '$.snapshot'), json_extract(value, '$.assessment') FROM json_each(?)")
+      .bind(JSON.stringify(chunk)).run();
+    inserted += result.meta.changes ?? 0;
+    await database.prepare("INSERT OR IGNORE INTO goldmine_outcomes (signal_id, horizon, due_at, deadline_at) SELECT s.id, h.key, s.detected_at + json_extract(h.value, '$.after'), s.detected_at + json_extract(h.value, '$.after') + json_extract(h.value, '$.window') FROM goldmine_signals s JOIN json_each(?) h WHERE s.id IN (SELECT value FROM json_each(?))")
+      .bind(horizons, JSON.stringify(chunk.map(row => row.id))).run();
+  }
+  return inserted;
 }
 
-// Settles due outcomes. Pending outcomes whose window has closed become missed. For the rest, the recorded
-// pool is read once: a valid price is observed; a successful response without the pool or its price is
-// unavailable (possibly delisted). A provider failure leaves them pending for the next scan.
+// Settles due outcomes. Pending outcomes whose window has closed become missed. The rest are grouped by
+// recorded pool, ordered by the earliest closing window (then pool and token, so batches are
+// deterministic), and read in batches of at most 30 pools. For each pool a valid price is observed; a
+// successful response without the pool or its price is unavailable (possibly delisted). A failed batch
+// leaves only its own outcomes pending for the next scan; other batches settle normally.
 export async function evaluateOutcomes(database: D1Database, now: number): Promise<OutcomeRun> {
   const missed = (await database.prepare("UPDATE goldmine_outcomes SET status = 'missed' WHERE status = 'pending' AND deadline_at < ?").bind(now).run()).meta.changes ?? 0;
-  const due = (await database.prepare("SELECT s.pair AS pair, s.address AS address FROM goldmine_outcomes o JOIN goldmine_signals s ON s.id = o.signal_id WHERE o.status = 'pending' AND o.due_at <= ? GROUP BY s.pair, s.address ORDER BY MIN(o.due_at), s.pair LIMIT 30")
-    .bind(now).all<{pair: string; address: string}>()).results;
-  const run: OutcomeRun = {provider: 'not_needed', observed: 0, unavailable: 0, missed};
+  const due = (await database.prepare("SELECT s.pair AS pair, s.address AS address, MIN(o.deadline_at) AS deadline FROM goldmine_outcomes o JOIN goldmine_signals s ON s.id = o.signal_id WHERE o.status = 'pending' AND o.due_at <= ? GROUP BY s.pair, s.address ORDER BY deadline, s.pair, s.address")
+    .bind(now).all<{pair: string; address: string; deadline: number}>()).results;
+  const run: OutcomeRun = {provider: 'not_needed', observed: 0, unavailable: 0, missed, deferred: 0};
   if (!due.length) return run;
 
-  let pools: unknown[];
-  try {
-    const response = await fetchJson('https://api.dexscreener.com/latest/dex/pairs/solana/' + [...new Set(due.map(row => row.pair))].slice(0, MAX_OUTCOME_PAIRS).join(','), 10000);
-    const listed = at(response, 'pairs');
-    pools = Array.isArray(listed) ? listed : [];
-  } catch (error) {
-    reportFailure('goldmine', 'outcome-provider', error, 'warn');
-    return {...run, provider: 'unavailable'};
+  const pairs = [...new Set(due.map(row => row.pair))];
+  const batches: string[][] = [];
+  for (let index = 0; index < pairs.length && batches.length < MAX_OUTCOME_BATCHES; index += MAX_PAIRS_PER_REQUEST) batches.push(pairs.slice(index, index + MAX_PAIRS_PER_REQUEST));
+  const requested = new Set(batches.flat());
+  run.deferred = due.filter(row => !requested.has(row.pair)).length;
+
+  const responses = await Promise.allSettled(batches.map(batch => fetchJson('https://api.dexscreener.com/latest/dex/pairs/solana/' + batch.join(','), 10000)));
+  let failed = 0;
+  for (const [index, response] of responses.entries()) {
+    if (response.status === 'rejected') {
+      failed++;
+      reportFailure('goldmine', 'outcome-provider', response.reason, 'warn');
+      continue;
+    }
+    const listed = at(response.value, 'pairs');
+    const pools = Array.isArray(listed) ? listed : [];
+    const batch = new Set(batches[index]);
+    for (const {pair, address} of due.filter(row => batch.has(row.pair))) {
+      const pool = pools.find(p => at(p, 'chainId') === 'solana' && at(p, 'pairAddress') === pair && at(p, 'baseToken', 'address') === address);
+      const price = Number(at(pool, 'priceUsd') ?? NaN);
+      const liquidity = Number(at(pool, 'liquidity', 'usd') ?? NaN);
+      const valid = Number.isFinite(price) && price > 0;
+      const result = await database.prepare("UPDATE goldmine_outcomes SET status = ?, observed_at = ?, price = ?, liquidity = ? WHERE status = 'pending' AND due_at <= ? AND deadline_at >= ? AND signal_id IN (SELECT id FROM goldmine_signals WHERE pair = ? AND address = ?)")
+        .bind(valid ? 'observed' : 'unavailable', now, valid ? price : null, valid && Number.isFinite(liquidity) && liquidity >= 0 ? liquidity : null, now, now, pair, address).run();
+      run[valid ? 'observed' : 'unavailable'] += result.meta.changes ?? 0;
+    }
   }
-  run.provider = 'ok';
-  for (const {pair, address} of due) {
-    const pool = pools.find(p => at(p, 'chainId') === 'solana' && at(p, 'pairAddress') === pair && at(p, 'baseToken', 'address') === address);
-    const price = Number(at(pool, 'priceUsd') ?? NaN);
-    const liquidity = Number(at(pool, 'liquidity', 'usd') ?? NaN);
-    const valid = Number.isFinite(price) && price > 0;
-    const result = await database.prepare("UPDATE goldmine_outcomes SET status = ?, observed_at = ?, price = ?, liquidity = ? WHERE status = 'pending' AND due_at <= ? AND deadline_at >= ? AND signal_id IN (SELECT id FROM goldmine_signals WHERE pair = ? AND address = ?)")
-      .bind(valid ? 'observed' : 'unavailable', now, valid ? price : null, valid && Number.isFinite(liquidity) && liquidity >= 0 ? liquidity : null, now, now, pair, address).run();
-    run[valid ? 'observed' : 'unavailable'] += result.meta.changes ?? 0;
-  }
+  run.provider = failed === 0 ? 'ok' : failed === batches.length ? 'unavailable' : 'partial';
   return run;
 }
 

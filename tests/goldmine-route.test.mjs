@@ -74,7 +74,7 @@ describe('scanning', () => {
     const response = await scan();
     assert.equal(response.headers.get('cache-control'), 'no-store');
     const data = await body(response);
-    assert.deepEqual([data.status, data.modelVersion, data.opportunities, data.tracking], ['checked', MODEL_VERSION, 0, {newSignals: 2, outcomes: {provider: 'not_needed', observed: 0, unavailable: 0, missed: 0}}]);
+    assert.deepEqual([data.status, data.modelVersion, data.opportunities, data.tracking], ['checked', MODEL_VERSION, 0, {newSignals: 2, outcomes: {provider: 'not_needed', observed: 0, unavailable: 0, missed: 0, deferred: 0}}]);
     assert.deepEqual(data.candidates.map(c => [c.address, c.state, c.score, c.opportunity]), [[addresses.tokenA, 'BREAKOUT', 81, false], [addresses.tokenB, 'REJECTED', data.candidates[1].score, false]]);
     const [a, b] = data.candidates;
     assert.deepEqual(a.blockers.map(gate => gate.id), ['contract_safety_unverified']);
@@ -133,6 +133,21 @@ describe('scanning', () => {
     assert.deepEqual(failures, []);
   });
 
+  test('a full discovery set is written in bounded chunks of at most 10 signals', async () => {
+    const BASE58 = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+    const tokens = Array.from({length: 25}, (_, index) => 'Mint' + BASE58[index] + 'C'.repeat(39));
+    feeds.profiles = () => Response.json(tokens.map(tokenAddress => ({chainId: 'solana', tokenAddress})));
+    feeds.boosts = () => Response.json([]);
+    feeds.pairs = () => Response.json(tokens.map((token, index) => pair({pairAddress: 'Pair' + BASE58[index] + 'C'.repeat(39), baseToken: {address: token}, pairCreatedAt: Date.now() - 48 * HOUR})));
+    const inserts = [];
+    d1.beforeQuery = (sql, params) => { if (sql.startsWith('INSERT OR IGNORE INTO goldmine_signals')) inserts.push(params[0]); };
+    const data = await body(await scan());
+    assert.deepEqual([data.candidates.length, data.tracking.newSignals], [25, 25]);
+    assert.deepEqual(inserts.map(json => JSON.parse(json).length), [10, 10, 5]);
+    assert.ok(inserts.every(json => json.length < 50000), `largest bound value ${Math.max(...inserts.map(json => json.length))} bytes`);
+    assert.deepEqual([signals().length, outcomes().length], [25, 100]);
+  });
+
   test('another scan holding the lock makes this one busy; a failure still releases the lock', async () => {
     d1.sqlite.prepare('INSERT INTO research_locks (id, owner, expires) VALUES (?, ?, ?)').run('goldmine:scan', 'other-scan', clock.now() + 30000);
     assert.deepEqual(await body(await scan()), {status: 'busy', candidates: []});
@@ -167,7 +182,7 @@ describe('outcome tracking', () => {
     assert.equal((await body(await scan())).tracking.outcomes.provider, 'not_needed', 'nothing is due before 15 minutes');
 
     clock.advance(6 * MINUTE);
-    assert.deepEqual((await body(await scan())).tracking.outcomes, {provider: 'ok', observed: 2, unavailable: 0, missed: 0});
+    assert.deepEqual((await body(await scan())).tracking.outcomes, {provider: 'ok', observed: 2, unavailable: 0, missed: 0, deferred: 0});
     assert.deepEqual(status(), {'15m': ['observed', 0.012], '1h': ['pending', null], '6h': ['pending', null], '24h': ['pending', null]});
 
     // The next check comes 80 minutes after detection: past the 1h window (60-75 minutes).
@@ -189,13 +204,13 @@ describe('outcome tracking', () => {
     clock.advance(16 * MINUTE);
     outcomePools = () => new Response('rate limited', {status: 429});
     const failed = await body(await scan());
-    assert.deepEqual(failed.tracking.outcomes, {provider: 'unavailable', observed: 0, unavailable: 0, missed: 0});
+    assert.deepEqual(failed.tracking.outcomes, {provider: 'unavailable', observed: 0, unavailable: 0, missed: 0, deferred: 0});
     assert.ok(failures.some(failure => failure.operation === 'outcome-provider' && failure.level === 'warn'));
     assert.equal(outcomes().filter(row => row.horizon === '15m' && row.status === 'pending').length, 2);
 
     clock.advance(MINUTE);
     outcomePools = () => Response.json({pairs: [outcomePool(addresses.pairA, addresses.tokenA, '0.011'), outcomePool(addresses.pairB, addresses.tokenA, '1'), {chainId: 'ethereum', pairAddress: addresses.pairB, baseToken: {address: addresses.tokenB}, priceUsd: '1'}]});
-    assert.deepEqual((await body(await scan())).tracking.outcomes, {provider: 'ok', observed: 1, unavailable: 1, missed: 0});
+    assert.deepEqual((await body(await scan())).tracking.outcomes, {provider: 'ok', observed: 1, unavailable: 1, missed: 0, deferred: 0});
     assert.deepEqual(outcomes().filter(row => row.horizon === '15m').map(row => [row.address, row.status, row.price]),
       [[addresses.tokenA, 'observed', 0.011], [addresses.tokenB, 'unavailable', null]]);
   });
@@ -217,5 +232,91 @@ describe('outcome tracking', () => {
       {state: 'REJECTED', horizon: '15m', pending: 0, observed: 1, unavailable: 0, missed: 0, meanReturnPct: -25, positiveShare: 0},
     ]);
     assert.deepEqual(data.stats.filter(row => row.horizon === '24h').map(row => [row.state, row.pending, row.meanReturnPct]), [['BREAKOUT', 1, null], ['REJECTED', 1, null]]);
+  });
+});
+
+describe('outcome batches', () => {
+  const BASE58 = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+  const pairAddress = index => 'Pair' + BASE58[Math.floor(index / BASE58.length)] + BASE58[index % BASE58.length] + 'B'.repeat(38);
+  let requests;
+
+  // `count` signals detected 16 minutes ago, one pool each, whose 15m outcomes are due now. Signal i was
+  // detected i seconds earlier than signal i+1, so its window closes first.
+  function seedDue(count) {
+    const now = clock.now();
+    for (let index = 0; index < count; index++) {
+      const detected = now - 16 * MINUTE - (count - index) * 1000;
+      const id = `batch-signal-${String(index).padStart(3, '0')}`;
+      d1.sqlite.prepare('INSERT INTO goldmine_signals (id, address, pair, symbol, model_version, state, score, opportunity, detected_at, detected_price, snapshot, assessment) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+        .run(id, addresses.tokenA, pairAddress(index), 'FIX', MODEL_VERSION, 'BUILDING', 60, 0, detected, 1, '{}', '{}');
+      d1.sqlite.prepare('INSERT INTO goldmine_outcomes (signal_id, horizon, due_at, deadline_at) VALUES (?, ?, ?, ?)').run(id, '15m', detected + 15 * MINUTE, detected + 20 * MINUTE);
+    }
+    return Array.from({length: count}, (_, index) => pairAddress(index));
+  }
+  const statusCounts = () => Object.fromEntries(d1.rows('SELECT status, COUNT(*) AS n FROM goldmine_outcomes GROUP BY status ORDER BY status').map(row => [row.status, row.n]));
+  const statusOf = pairAddressValue => d1.rows('SELECT o.status FROM goldmine_outcomes o JOIN goldmine_signals s ON s.id = o.signal_id WHERE s.pair = ?', pairAddressValue)[0].status;
+
+  beforeEach(() => {
+    // Discovery finds nothing, so only outcome evaluation reaches the provider.
+    feeds.profiles = feeds.boosts = () => Response.json([]);
+    requests = [];
+    outcomePools = url => {
+      const batch = url.split('/').pop().split(',');
+      requests.push(batch);
+      return Response.json({pairs: batch.map(pool => outcomePool(pool, addresses.tokenA, '1.2'))});
+    };
+  });
+
+  test('more than 30 due pools are read in deterministic batches of 30 and all settle in their window', async () => {
+    const pools = seedDue(45);
+    const data = await body(await scan());
+    assert.deepEqual(data.tracking.outcomes, {provider: 'ok', observed: 45, unavailable: 0, missed: 0, deferred: 0});
+    assert.deepEqual(requests, [pools.slice(0, 30), pools.slice(30)], 'earliest-closing windows first, at most 30 pools per request');
+    assert.deepEqual(statusCounts(), {observed: 45});
+
+    // After every window has closed, nothing was left to be marked missed.
+    clock.advance(10 * MINUTE);
+    assert.equal((await body(await scan())).tracking.outcomes.missed, 0);
+    assert.deepEqual(statusCounts(), {observed: 45});
+  });
+
+  test('a failed batch leaves only its own outcomes pending, and a later in-window scan settles them', async () => {
+    const pools = seedDue(45);
+    const healthy = outcomePools;
+    outcomePools = url => url.includes(pools[30]) ? new Response('rate limited', {status: 429}) : healthy(url);
+    const partial = await body(await scan());
+    assert.deepEqual(partial.tracking.outcomes, {provider: 'partial', observed: 30, unavailable: 0, missed: 0, deferred: 0});
+    assert.deepEqual(statusCounts(), {observed: 30, pending: 15});
+    assert.deepEqual([statusOf(pools[29]), statusOf(pools[30]), statusOf(pools[44])], ['observed', 'pending', 'pending']);
+    assert.deepEqual(failures.map(failure => [failure.operation, failure.level]), [['outcome-provider', 'warn'], ['provider', 'warn']]);
+
+    clock.advance(MINUTE);
+    outcomePools = healthy;
+    requests = [];
+    assert.deepEqual((await body(await scan())).tracking.outcomes, {provider: 'ok', observed: 15, unavailable: 0, missed: 0, deferred: 0});
+    assert.deepEqual(requests, [pools.slice(30)], 'only the failed batch is requested again');
+    assert.deepEqual(statusCounts(), {observed: 45});
+  });
+
+  test('every batch failing leaves every outcome pending', async () => {
+    seedDue(35);
+    outcomePools = () => new Response('down', {status: 503});
+    assert.deepEqual((await body(await scan())).tracking.outcomes, {provider: 'unavailable', observed: 0, unavailable: 0, missed: 0, deferred: 0});
+    assert.deepEqual(statusCounts(), {pending: 35});
+  });
+
+  test('provider requests stay bounded; pools beyond the cap are deferred, not skipped into missed', async () => {
+    const pools = seedDue(170);
+    const first = await body(await scan());
+    assert.equal(requests.length, 5, 'at most five requests per scan');
+    assert.ok(requests.every(batch => batch.length <= 30));
+    assert.deepEqual(first.tracking.outcomes, {provider: 'ok', observed: 150, unavailable: 0, missed: 0, deferred: 20});
+    assert.deepEqual([statusOf(pools[149]), statusOf(pools[150])], ['observed', 'pending'], 'the most urgent windows are read first');
+
+    clock.advance(MINUTE);
+    requests = [];
+    assert.deepEqual((await body(await scan())).tracking.outcomes, {provider: 'ok', observed: 20, unavailable: 0, missed: 0, deferred: 0});
+    assert.deepEqual(requests, [pools.slice(150)]);
+    assert.deepEqual(statusCounts(), {observed: 170});
   });
 });
