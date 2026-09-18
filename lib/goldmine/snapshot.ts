@@ -14,10 +14,32 @@ export type Flow = {buys: number | null; sells: number | null};
 // Public X evidence already cached in social_cache (lib/social-cache.ts). Scoring never requests it.
 export type SocialEvidence = {sampleSize: number; uniqueAuthors: number; duplicateText: number; fetchedAt: number};
 
-// Contract-level safety evidence (mint and freeze authority, holder concentration, LP status). No
-// configured provider supplies it yet: snapshotFromPair always records it as unavailable, which keeps
-// opportunity status blocked. 'verified' is the shape a future safety provider must fill.
-export type ContractSafety = {status: 'unavailable'; source: null} | {status: 'verified'; source: string};
+// Contract-level safety evidence (mint and freeze authority, holder concentration, LP status).
+// snapshotFromPair always records it as unavailable; only attachContractSafety (lib/goldmine/
+// contract-safety.ts) fills it in afterward, from a provider, never from the DEX Screener pair itself.
+//
+// Three states, kept distinguishable everywhere this is stored: no usable provider data ('unavailable'),
+// data obtained and at least one of our own deterministic checks against it failed ('unsafe'), and every
+// check available and passed ('verified'). A provider's own opaque score or verdict never decides this by
+// itself; 'facts' holds what was actually observed, so a later stage can see why, not just a yes/no.
+export type ContractSafetyRisk = {name: string; level: string; description: string};
+export type ContractSafetyFacts = {
+  mintAuthorityRenounced: boolean | null;
+  freezeAuthorityRenounced: boolean | null;
+  lpLockedPct: number | null;
+  totalMarketLiquidityUsd: number | null;
+  topHolderPct: number | null;
+  topHoldersPct: number | null;
+  creatorHoldingsPct: number | null;
+  insiderNetworksDetected: number | null;
+  rugged: boolean | null;
+  providerScoreNormalized: number | null;
+  providerRisks: ContractSafetyRisk[];
+};
+export type ContractSafety =
+  | {status: 'unavailable'; source: null}
+  | {status: 'unsafe'; source: string; checkedAt: number; facts: ContractSafetyFacts; failedChecks: string[]}
+  | {status: 'verified'; source: string; checkedAt: number; facts: ContractSafetyFacts};
 
 export type CandidateSnapshot = {
   schema: typeof SNAPSHOT_SCHEMA;

@@ -205,6 +205,7 @@ function safetyRisk(s: CandidateSnapshot, checks: RiskCheck[]): Component {
   let points = 0;
   const contract = s.contractSafety.status === 'verified';
   if (s.contractSafety.status === 'verified') { points += 7; evidence.push(`Contract safety verified by ${s.contractSafety.source} (+7).`); }
+  else if (s.contractSafety.status === 'unsafe') evidence.push(`Contract safety checked by ${s.contractSafety.source}: ${s.contractSafety.failedChecks.join('; ')} (+0 of 7).`);
   else evidence.push('Contract safety (mint and freeze authority, holder concentration, LP status) is unavailable (+0 of 7).');
   for (const check of checks) {
     if (check.passed) { points += check.points; evidence.push(`${check.pass} (+${check.points}).`); }

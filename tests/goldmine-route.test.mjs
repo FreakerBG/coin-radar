@@ -37,6 +37,11 @@ beforeEach(() => {
     profiles: () => Response.json([{chainId: 'solana', tokenAddress: addresses.tokenA}, {chainId: 'solana', tokenAddress: addresses.tokenB}]),
     boosts: () => Response.json([{chainId: 'solana', tokenAddress: addresses.tokenB}]),
     pairs: () => Response.json(discoveryPairs()),
+    // A real but empty RugCheck report by default: every test below that predates Stage 03B keeps
+    // scoring contractSafety as unavailable, exactly as before it existed, without logging a failure
+    // record (this is success with nothing usable yet, not a provider error). Tests about contract
+    // safety itself (tests/goldmine-contract-safety.test.mjs) override this.
+    safety: () => Response.json({token: {mintAuthority: null, freezeAuthority: null}, rugged: false}),
   };
   outcomePools = () => Response.json({pairs: [outcomePool(addresses.pairA, addresses.tokenA, '0.012'), outcomePool(addresses.pairB, addresses.tokenB, '1.5')]});
   calls = installFetch(url => {
@@ -44,6 +49,7 @@ beforeEach(() => {
     if (url.startsWith('https://api.dexscreener.com/token-boosts/')) return feeds.boosts();
     if (url.startsWith('https://api.dexscreener.com/tokens/v1/solana/')) return feeds.pairs();
     if (url.startsWith('https://api.dexscreener.com/latest/dex/pairs/solana/')) return outcomePools(url);
+    if (url.startsWith('https://api.rugcheck.xyz/v1/tokens/')) return feeds.safety(url);
     throw new Error('Unexpected request ' + url);
   });
 });
@@ -123,7 +129,7 @@ describe('scanning', () => {
     const social = address => data.candidates.find(c => c.address === address).components.find(part => part.id === 'social_momentum').points;
     assert.deepEqual([social(addresses.tokenA), social(addresses.tokenB)], [10, 0]);
     assert.equal(data.candidates.find(c => c.address === addresses.tokenA).score, 91);
-    assert.equal(calls.some(call => !call.url.startsWith('https://api.dexscreener.com/')), false);
+    assert.equal(calls.some(call => call.url.startsWith('https://api.x.com/')), false, 'social evidence never triggers an X request');
 
     // A malformed cache row is no evidence, not a failure.
     d1.sqlite.prepare('UPDATE social_cache SET data = ? WHERE address = ?').run('{not json', addresses.tokenA);
