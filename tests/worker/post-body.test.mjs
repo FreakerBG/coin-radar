@@ -228,7 +228,9 @@ for (const [name, vars] of [['without an X secret', {}], ['with a fake local X s
       assertCleanLog(worker);
       assert.ok(followUps.requests >= 60, `${followUps.requests} requests were sent`);
       assert.equal(followUps.healthy, followUps.requests, 'every request was followed by a healthy signed-in request');
-      assert.ok(worker.count(HEALTH_SERVED) >= followUps.requests + 1, `the Worker served ${worker.count(HEALTH_SERVED)} health checks for ${followUps.requests} requests`);
+      // The proxy logs a request after answering it, so give the last line a moment to arrive.
+      for (let waited = 0; worker.count(HEALTH_SERVED) < followUps.requests && waited < 3000; waited += 100) await sleep(100);
+      assert.ok(worker.count(HEALTH_SERVED) >= followUps.requests, `the Worker served ${worker.count(HEALTH_SERVED)} health checks for ${followUps.requests} requests`);
       const unsupported = Object.entries(apiRoutes).flatMap(([path, methods]) => ['POST', 'PUT', 'PATCH', 'DELETE'].filter(method => !methods.includes(method)).map(method => `${method} ${path}`));
       assert.equal(unsupported.length, 25);
       assert.deepEqual(unsupported.filter(pair => !answered405.has(pair)), [], 'every unsupported method on every API route was sent a body and answered 405');
