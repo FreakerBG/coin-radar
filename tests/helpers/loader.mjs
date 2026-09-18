@@ -1,5 +1,6 @@
 // Module resolution hooks for running route handlers under Node's test runner.
-// Only runtime boundaries are replaced: Cloudflare bindings and Next request headers.
+// Only runtime boundaries are replaced: Cloudflare bindings, Next request headers and vinext's
+// generated request handler.
 // Application modules (routes, lib/research-db, lib/advisor, lib/market) load unchanged.
 import {existsSync} from 'node:fs';
 import {fileURLToPath} from 'node:url';
@@ -9,6 +10,8 @@ const mocks = {
   'cloudflare:workers': 'export const env = globalThis.coinRadarTest.env;',
   'next/headers': 'export async function headers(){return globalThis.coinRadarTest.headers;}',
   'next/navigation': 'export function redirect(path){throw new Error("Unexpected redirect to "+path);}',
+  // worker/entry.ts delegates to vinext's generated handler; tests supply its behavior.
+  'vinext/server/fetch-handler': 'export default {fetch: (...args) => globalThis.coinRadarTest.vinextFetch(...args)};',
 };
 
 function withTypeScriptExtension(url) {
