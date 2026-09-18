@@ -4,6 +4,7 @@
 // A migration that intentionally rewrites existing data lists what it changes in `changes`
 // ({"table" or "table.column": reason}); any other change to pre-existing data fails the upgrade test.
 import assert from 'node:assert/strict';
+import {mock} from 'node:test';
 import {addresses, body, createD1, installFetch, jsonRequest, runtime, signIn} from '../helpers/harness.mjs';
 
 const userA = 'user-a', userB = 'user-b';
@@ -12,6 +13,7 @@ const ids = {
   aClosed: '22222222-2222-4222-8222-222222222222',
   bOpen: '33333333-3333-4333-8333-333333333333',
 };
+const goldmine = {recent: 'momentum-v2.0.0:recent-signal', old: 'momentum-v2.0.0:old-signal'};
 const configA = {bankroll: 1000, riskPct: 2, maxAllocationPct: 5, takeProfitPct: 50, stopPct: 25, trailingPct: 30, liquidityDropPct: 50, xDailyRequests: 10};
 const utcDay = time => new Date(time).toISOString().slice(0, 10);
 
@@ -127,6 +129,69 @@ export const upgradeFixtures = {
       assert.deepEqual([refreshed.status, refreshed.cached, refreshed.usedToday, refreshed.posts.length], ['connected', false, 5, 1]);
       assert.equal(calls.filter(call => call.url.startsWith('https://api.x.com/')).length, 1);
       assert.deepEqual(d1.rows('SELECT id, requests FROM social_usage ORDER BY id').map(row => row.requests), [9, 5, 1]);
+    },
+  },
+
+  '0001_goldmine_signals': {
+    seed(sqlite) {
+      const now = Date.now(), minute = 60000, hour = 60 * minute;
+      const signal = (id, address, pairAddress, state, detectedAt, price) => insert(sqlite, 'goldmine_signals', {
+        id, address, pair: pairAddress, symbol: 'FIX', model_version: 'momentum-v2.0.0', state, score: 70, opportunity: 0,
+        detected_at: detectedAt, detected_price: price,
+        snapshot: JSON.stringify({schema: 1, address, pair: pairAddress, priceUsd: price}),
+        assessment: JSON.stringify({modelVersion: 'momentum-v2.0.0', state, score: 70, summary: `${state} · score 70/100. Recorded before the upgrade.`}),
+      });
+      const outcome = (signalId, horizon, dueAt, deadlineAt, status = 'pending', observed = {}) => insert(sqlite, 'goldmine_outcomes', {
+        signal_id: signalId, horizon, due_at: dueAt, deadline_at: deadlineAt, status, ...observed,
+      });
+      // Detected 16 minutes ago: its 15m outcome is due now and still inside its window.
+      const recent = now - 16 * minute;
+      signal(goldmine.recent, addresses.tokenA, addresses.pairA, 'BUILDING', recent, 0.5);
+      outcome(goldmine.recent, '15m', recent + 15 * minute, recent + 20 * minute);
+      outcome(goldmine.recent, '1h', recent + hour, recent + hour + 15 * minute);
+      // Detected a day ago: settled outcomes, one missed, one delisted.
+      const old = now - 25 * hour;
+      signal(goldmine.old, addresses.tokenB, addresses.pairB, 'EARLY', old, 2);
+      outcome(goldmine.old, '15m', old + 15 * minute, old + 20 * minute, 'observed', {observed_at: old + 16 * minute, price: 2.5, liquidity: 80000.5});
+      outcome(goldmine.old, '1h', old + hour, old + hour + 15 * minute, 'missed');
+      outcome(goldmine.old, '6h', old + 6 * hour, old + 7 * hour, 'unavailable', {observed_at: old + 6 * hour});
+    },
+
+    async verify(sqlite) {
+      const goldmineRoute = await import('../../app/api/goldmine/route.ts');
+      const health = await import('../../app/api/health/route.ts');
+      const {pair} = await import('../helpers/goldmine-fixtures.mjs');
+      const d1 = createD1(sqlite);
+      runtime.env.DB = d1;
+      signIn(userB);
+      assert.equal((await body(await health.GET())).schema, 'compatible');
+
+      // Recorded signals and settled outcomes are served unchanged, with returns from the detection price.
+      const before = await body(await goldmineRoute.GET());
+      const old = before.signals.find(signal => signal.id === goldmine.old);
+      assert.deepEqual(old.outcomes.map(outcome => [outcome.horizon, outcome.status, outcome.price, outcome.returnPct]),
+        [['15m', 'observed', 2.5, 25], ['1h', 'missed', null, null], ['6h', 'unavailable', null, null]]);
+      assert.equal(old.assessment.summary, 'EARLY · score 70/100. Recorded before the upgrade.');
+      // Signals keep the model version that scored them; statistics never mix versions, so these v2.0.0
+      // rows are listed but not counted in the current version's statistics.
+      assert.deepEqual([old.modelVersion, before.stats], ['momentum-v2.0.0', []]);
+
+      // A scan settles the due outcome of the upgraded signal and records new ones next to it. A minute
+      // later, so provider responses cached by earlier fixtures' checks have expired.
+      mock.timers.setTime(Date.now() + 60000);
+      const now = Date.now();
+      installFetch(url => {
+        if (url.includes('/token-profiles/')) return Response.json([{chainId: 'solana', tokenAddress: addresses.tokenA}]);
+        if (url.includes('/token-boosts/')) return Response.json([]);
+        if (url.includes('/tokens/v1/solana/')) return Response.json([pair({pairCreatedAt: now - 48 * 3600000})]);
+        return Response.json({pairs: [{chainId: 'solana', pairAddress: addresses.pairA, baseToken: {address: addresses.tokenA}, priceUsd: '0.55', liquidity: {usd: 90000}}]});
+      });
+      const scan = await body(await goldmineRoute.POST(jsonRequest('/api/goldmine', {method: 'POST', body: {}})));
+      assert.deepEqual([scan.status, scan.tracking.outcomes.observed, scan.tracking.newSignals], ['checked', 1, 1]);
+      assert.deepEqual(d1.rows('SELECT horizon, status, price FROM goldmine_outcomes WHERE signal_id = ? ORDER BY due_at', goldmine.recent),
+        [{horizon: '15m', status: 'observed', price: 0.55}, {horizon: '1h', status: 'pending', price: null}]);
+      assert.equal(d1.rows('SELECT COUNT(*) AS n FROM goldmine_signals')[0].n, 3);
+      assert.deepEqual(d1.rows('SELECT id FROM research_locks WHERE id = ?', 'goldmine:scan'), []);
     },
   },
 };

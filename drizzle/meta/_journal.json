@@ -8,6 +8,13 @@
       "when": 1788976971737,
       "tag": "0000_rare_terror",
       "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "6",
+      "when": 1789742890121,
+      "tag": "0001_goldmine_signals",
+      "breakpoints": true
     }
   ]
 }

@@ -1,7 +1,7 @@
 // What the application requires of the D1 schema, derived from the SQL in app/ and lib/.
 // GET /api/health checks the tables and columns at runtime; tests/migrations/schema-contract.mjs
 // checks the whole contract against every migration.
-export type ColumnAffinity = 'TEXT' | 'INTEGER';
+export type ColumnAffinity = 'TEXT' | 'INTEGER' | 'REAL';
 
 export type TableRequirement = {
   // Required columns and their SQLite affinity. All are NOT NULL unless listed in `nullable`.
@@ -11,7 +11,7 @@ export type TableRequirement = {
   key: string[];
   // The columns the application's INSERT supplies; every other column must be nullable or defaulted.
   inserted: string[];
-  defaults?: Record<string, number | null>;
+  defaults?: Record<string, number | string | null>;
   // Shared by every user: a new column needs a cross-user isolation review.
   shared?: boolean;
 };
@@ -58,6 +58,30 @@ export const requiredTables: Record<string, TableRequirement> = {
     columns: {id: 'TEXT', requests: 'INTEGER'},
     key: ['id'],
     inserted: ['id', 'requests'],
+  },
+  // lib/goldmine/signals.ts: one market observation per token, model version, state and 6h bucket
+  // (INSERT OR IGNORE on id). Shared by every user and holds no user data; detected_at is epoch ms.
+  goldmine_signals: {
+    columns: {
+      id: 'TEXT', address: 'TEXT', pair: 'TEXT', symbol: 'TEXT', model_version: 'TEXT', state: 'TEXT', score: 'INTEGER',
+      opportunity: 'INTEGER', detected_at: 'INTEGER', detected_price: 'REAL', snapshot: 'TEXT', assessment: 'TEXT',
+    },
+    key: ['id'],
+    inserted: ['id', 'address', 'pair', 'symbol', 'model_version', 'state', 'score', 'opportunity', 'detected_at', 'detected_price', 'snapshot', 'assessment'],
+    shared: true,
+  },
+  // One row per signal and horizon (INSERT OR IGNORE on the pair), created pending; evaluation moves a
+  // pending row to observed, unavailable or missed exactly once. Times are epoch ms.
+  goldmine_outcomes: {
+    columns: {
+      signal_id: 'TEXT', horizon: 'TEXT', due_at: 'INTEGER', deadline_at: 'INTEGER', status: 'TEXT',
+      observed_at: 'INTEGER', price: 'REAL', liquidity: 'REAL',
+    },
+    nullable: ['observed_at', 'price', 'liquidity'],
+    key: ['signal_id', 'horizon'],
+    inserted: ['signal_id', 'horizon', 'due_at', 'deadline_at'],
+    defaults: {status: 'pending', observed_at: null, price: null, liquidity: null},
+    shared: true,
   },
 };
 

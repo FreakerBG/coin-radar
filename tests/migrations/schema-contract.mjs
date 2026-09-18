@@ -26,7 +26,7 @@ const sameColumns = (a, b) => a.length === b.length && [...a].sort().join() === 
 // Inserts a row the way the application does inside a savepoint that is always rolled back.
 function insertProblems(sqlite, table, spec) {
   const problems = [];
-  const values = Object.fromEntries(spec.inserted.map(name => [name, spec.columns[name] === 'INTEGER' ? 1 : `${PROBE}:${name}`]));
+  const values = Object.fromEntries(spec.inserted.map(name => [name, spec.columns[name] === 'INTEGER' ? 1 : spec.columns[name] === 'REAL' ? 1.5 : `${PROBE}:${name}`]));
   sqlite.exec('SAVEPOINT schema_contract');
   try {
     sqlite.prepare(`INSERT INTO ${table} (${spec.inserted.join(', ')}) VALUES (${spec.inserted.map(() => '?').join(', ')})`).run(...Object.values(values));
