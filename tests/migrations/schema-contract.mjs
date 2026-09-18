@@ -131,8 +131,8 @@ function sourceFiles(directory) {
   });
 }
 
-// Every D1 statement the application prepares. A prepare() whose SQL is not a plain string literal
-// is reported so this check is extended rather than silently skipping it.
+// Every D1 statement the application prepares. A prepare() whose SQL is not a plain string literal,
+// and any exec() call, is reported so this check is extended rather than silently skipping it.
 export function applicationStatements() {
   const statements = [];
   const unchecked = [];
@@ -144,6 +144,9 @@ export function applicationStatements() {
       .filter(([, quote, sql]) => quote !== '`' || !sql.includes('${'))
       .map(([, , sql]) => sql.replace(/\\(.)/g, '$1'));
     if (literals.length !== calls) unchecked.push(`${name}: ${calls - literals.length} prepare() call(s) without a plain SQL string literal`);
+    // D1's exec() runs raw SQL that is never prepared here (RegExp exec() is reported too; check it by hand).
+    const execs = source.match(/\.exec\(/g)?.length ?? 0;
+    if (execs) unchecked.push(`${name}: ${execs} exec() call(s) whose SQL is not checked`);
     statements.push(...literals.map(sql => ({file: name, sql})));
   }
   return {statements, unchecked};

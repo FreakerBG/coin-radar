@@ -13,6 +13,11 @@ import {
 // A malformed journal stops this file at load with the full problem list; lock problems fail the first test.
 const migrations = readMigrations();
 const first = migrations[0].tag;
+// Synthetic migrations take the next free number after the committed history, so these tests keep
+// passing as real migrations are appended. `next` is that journal position.
+const number = position => String(position).padStart(4, '0');
+const next = migrations.length;
+const probe = `${number(next)}_probe`;
 
 function temporaryDirectory(t, prefix) {
   const directory = mkdtempSync(path.join(tmpdir(), prefix));
@@ -84,18 +89,18 @@ test('file-name tracking and journal-timestamp tracking choose the same pending 
 describe('the migration check rejects an unsafe history', () => {
   test('duplicate, gapped or misnumbered journal entries', t => {
     const duplicate = historyCopy(t);
-    duplicate.append('0001_probe');
-    duplicate.editJournal(entries => { entries[1].idx = 0; });
-    assertRejected(duplicate, 'journal entry 1 (0001_probe): idx is 0, expected 1');
+    duplicate.append(probe);
+    duplicate.editJournal(entries => { entries[next].idx = next - 1; });
+    assertRejected(duplicate, `journal entry ${next} (${probe}): idx is ${next - 1}, expected ${next}`);
 
     const gap = historyCopy(t);
-    gap.append('0001_probe');
-    gap.editJournal(entries => { entries[1].idx = 2; });
-    assertRejected(gap, 'journal entry 1 (0001_probe): idx is 2, expected 1');
+    gap.append(probe);
+    gap.editJournal(entries => { entries[next].idx = next + 1; });
+    assertRejected(gap, `journal entry ${next} (${probe}): idx is ${next + 1}, expected ${next}`);
 
     const misnumbered = historyCopy(t);
-    misnumbered.append('0002_probe');
-    assertRejected(misnumbered, 'journal entry 1 (0002_probe): tag is numbered 0002, expected 0001');
+    misnumbered.append(`${number(next + 1)}_probe`);
+    assertRejected(misnumbered, `journal entry ${next} (${number(next + 1)}_probe): tag is numbered ${number(next + 1)}, expected ${number(next)}`);
   });
 
   test('duplicate migration numbers, unlisted SQL files and missing SQL files', t => {
@@ -105,16 +110,16 @@ describe('the migration check rejects an unsafe history', () => {
     assertRejected(duplicate, /0000_duplicate_probe\.sql is not listed in meta\/_journal\.json/);
 
     const missing = historyCopy(t);
-    missing.append('0001_probe');
-    rmSync(missing.file('0001_probe.sql'));
-    assertRejected(missing, /0001_probe\.sql is missing/);
+    missing.append(probe);
+    rmSync(missing.file(`${probe}.sql`));
+    assertRejected(missing, `drizzle/${probe}.sql is missing`);
   });
 
   test('a journal timestamp that is not newer, and disabled statement breakpoints', t => {
     const stale = historyCopy(t);
-    stale.append('0001_probe');
-    stale.editJournal(entries => { entries[1].when = entries[0].when; });
-    assertRejected(stale, 'journal entry 1 (0001_probe): "when" must be an integer timestamp newer than the previous entry\'s');
+    stale.append(probe);
+    stale.editJournal(entries => { entries[next].when = entries[next - 1].when; });
+    assertRejected(stale, `journal entry ${next} (${probe}): "when" must be an integer timestamp newer than the previous entry's`);
 
     const combined = historyCopy(t);
     combined.editJournal(entries => { entries[0].breakpoints = false; });
@@ -123,16 +128,16 @@ describe('the migration check rejects an unsafe history', () => {
 
   test('empty statements, a broken snapshot chain and an unreadable journal', t => {
     const empty = historyCopy(t);
-    empty.append('0001_probe', 'CREATE TABLE harness_probe (id text);\n--> statement-breakpoint\n-- nothing here\n');
-    assertRejected(empty, /0001_probe\.sql: statement 2 is empty/);
+    empty.append(probe, 'CREATE TABLE harness_probe (id text);\n--> statement-breakpoint\n-- nothing here\n');
+    assertRejected(empty, `${probe}.sql: statement 2 is empty`);
 
     const chain = historyCopy(t);
-    chain.append('0001_probe');
-    const snapshot = chain.file('meta/0001_snapshot.json');
+    chain.append(probe);
+    const snapshot = chain.file(`meta/${number(next)}_snapshot.json`);
     writeFileSync(snapshot, JSON.stringify({...JSON.parse(readFileSync(snapshot, 'utf8')), prevId: 'unrelated'}));
-    assertRejected(chain, "0001_probe: snapshot prevId does not point at the previous migration's snapshot");
+    assertRejected(chain, `${probe}: snapshot prevId does not point at the previous migration's snapshot`);
     rmSync(snapshot);
-    assertRejected(chain, /meta\/0001_snapshot\.json is missing/);
+    assertRejected(chain, `meta/${number(next)}_snapshot.json is missing`);
 
     const unreadable = historyCopy(t);
     writeFileSync(unreadable.file('meta/_journal.json'), '{"entries": [');
@@ -173,66 +178,97 @@ describe('db/migrations.lock.json keeps published migrations immutable', () => {
     assertRejected(renamed, `journal position 0 is ${first} but the lock records 0000_original_name`);
 
     const removed = historyCopy(t);
-    removed.append('0001_probe');
+    removed.append(probe);
     removed.lockAll();
     assert.equal(removed.verify().length, migrations.length + 1);
     removed.editJournal(entries => { entries.pop(); });
-    rmSync(removed.file('0001_probe.sql'));
-    rmSync(removed.file('meta/0001_snapshot.json'));
-    assertRejected(removed, '0001_probe is locked but no longer listed in the journal');
+    rmSync(removed.file(`${probe}.sql`));
+    rmSync(removed.file(`meta/${number(next)}_snapshot.json`));
+    assertRejected(removed, `${probe} is locked but no longer listed in the journal`);
   });
 
   test('a new migration is refused until its entry is appended to the lock', t => {
     const copy = historyCopy(t);
-    copy.append('0001_probe');
+    copy.append(probe);
     const entry = lockEntry(copy.read().at(-1));
     assertRejected(copy, `append ${JSON.stringify(entry)}`);
     const lock = JSON.parse(readFileSync(copy.lockFile, 'utf8'));
     writeFileSync(copy.lockFile, JSON.stringify({...lock, migrations: [...lock.migrations, entry]}, null, 2));
-    assert.deepEqual(copy.verify().map(migration => migration.tag), [...migrations.map(migration => migration.tag), '0001_probe']);
+    assert.deepEqual(copy.verify().map(migration => migration.tag), [...migrations.map(migration => migration.tag), probe]);
   });
 });
 
-// A minimal copy of the project: enough for the build gate and migration CLI, without dependencies.
+// A minimal copy of the project, at a path containing a space: enough for the build gate and
+// migration CLI, without dependencies.
 function projectCopy(t) {
-  const root = temporaryDirectory(t, 'coin-radar-project-');
-  for (const file of ['scripts/run-framework.mjs', 'scripts/execution-profile.mjs', 'scripts/migrations.mjs', 'scripts/db-migrations.mjs', 'db/migrations.lock.json', '.openai/hosting.json']) {
+  const root = temporaryDirectory(t, 'coin-radar project-');
+  for (const file of ['scripts/run-framework.mjs', 'scripts/execution-profile.mjs', 'scripts/migrations.mjs', 'scripts/db-migrations.mjs', 'scripts/sites-env.mjs', 'db/migrations.lock.json', '.openai/hosting.json']) {
     mkdirSync(path.dirname(path.join(root, file)), {recursive: true});
     cpSync(path.join(projectRoot, file), path.join(root, file));
   }
   cpSync(migrationsDir, path.join(root, 'drizzle'), {recursive: true});
   return root;
 }
-const runNode = (cwd, ...args) => spawnSync(process.execPath, args, {cwd, encoding: 'utf8'});
+// Stands in for a dependency's CLI in a project copy: prints the arguments it received and exits
+// with STUB_EXIT_CODE, so a test sees exactly what the wrapper passed on and returned.
+function stubCli(root, file) {
+  mkdirSync(path.dirname(path.join(root, file)), {recursive: true});
+  writeFileSync(path.join(root, file), 'console.log(JSON.stringify(process.argv.slice(2)));\nprocess.exitCode = Number(process.env.STUB_EXIT_CODE ?? 0);\n');
+}
+const runNode = (cwd, args, env = {}) => spawnSync(process.execPath, args, {cwd, encoding: 'utf8', env: {...process.env, ...env}});
+const stubArguments = result => JSON.parse(result.stdout.trim().split('\n').at(-1));
 
 describe('enforcement outside the test suite', () => {
   test('npm run build refuses a rewritten migration before building anything', t => {
     const root = projectCopy(t);
+    stubCli(root, 'node_modules/vinext/dist/cli.js');
     const sql = path.join(root, 'drizzle', `${first}.sql`);
     writeFileSync(sql, `${readFileSync(sql, 'utf8')}\n-- edited after publishing\n`);
-    const refused = runNode(root, 'scripts/run-framework.mjs', 'build');
+    const refused = runNode(root, ['scripts/run-framework.mjs', 'build']);
     assert.equal(refused.status, 1, refused.stderr);
     assert.match(refused.stderr, new RegExp(`Migration check failed:[\\s\\S]*${first}\\.sql changed after it was locked`));
+    assert.equal(refused.stdout, '', 'the framework build never started');
     assert.equal(existsSync(path.join(root, 'dist')), false);
 
-    // Restored, the check passes and the build reaches the framework, which this copy does not install.
+    // Restored, the check passes and the framework build receives every argument unchanged and
+    // decides the exit code.
     cpSync(path.join(migrationsDir, `${first}.sql`), sql);
-    const proceeded = runNode(root, 'scripts/run-framework.mjs', 'build');
-    assert.doesNotMatch(proceeded.stderr, /Migration check failed/);
-    assert.match(proceeded.stderr, /node_modules[\\/]vinext[\\/]dist[\\/]cli\.js/);
+    const proceeded = runNode(root, ['scripts/run-framework.mjs', 'build', '--mode', 'production', 'two words'], {STUB_EXIT_CODE: '7'});
+    assert.equal(proceeded.status, 7, proceeded.stderr);
+    assert.deepEqual(stubArguments(proceeded), ['build', '--mode', 'production', 'two words']);
   });
 
   test('the migration CLI checks offline and its local commands take no remote arguments', t => {
-    const check = runNode(projectRoot, 'scripts/db-migrations.mjs', 'check');
+    const check = runNode(projectRoot, ['scripts/db-migrations.mjs', 'check']);
     assert.equal(check.status, 0, check.stderr);
     assert.match(check.stdout, new RegExp(`^Migrations OK: ${migrations.length} in journal order and locked`));
     for (const args of [['apply-local', '--remote'], ['list-local', '--preview'], ['apply-remote'], []]) {
-      const refused = runNode(projectRoot, 'scripts/db-migrations.mjs', ...args);
+      const refused = runNode(projectRoot, ['scripts/db-migrations.mjs', ...args]);
       assert.equal(refused.status, 64, args.join(' '));
       assert.match(refused.stderr, /Extra arguments such as --remote are rejected/);
     }
-    const unbuilt = runNode(projectCopy(t), 'scripts/db-migrations.mjs', 'apply-local');
+    const unbuilt = runNode(projectCopy(t), ['scripts/db-migrations.mjs', 'apply-local']);
     assert.equal(unbuilt.status, 1, unbuilt.stderr);
     assert.match(unbuilt.stderr, /dist\/server\/wrangler\.json is missing\. Run `npm run build` first/);
+  });
+
+  test('the local migration commands always call Wrangler with --local, the built binding and drizzle/', t => {
+    const root = projectCopy(t);
+    stubCli(root, 'node_modules/wrangler/bin/wrangler.js');
+    mkdirSync(path.join(root, 'dist', 'server'), {recursive: true});
+    writeFileSync(path.join(root, 'dist', 'server', 'wrangler.json'), JSON.stringify({
+      name: 'coin-radar', compatibility_date: '2026-01-01',
+      d1_databases: [{binding: 'DB', database_name: 'site-creator-d1', database_id: '00000000-0000-4000-8000-000000000000'}],
+    }));
+    const configFile = path.join(root, '.wrangler', 'local-migrations', 'wrangler.json');
+    for (const [command, wranglerCommand] of [['apply-local', 'apply'], ['list-local', 'list']]) {
+      const result = runNode(root, ['scripts/db-migrations.mjs', command], {STUB_EXIT_CODE: '3'});
+      assert.equal(result.status, 3, result.stderr);
+      assert.deepEqual(stubArguments(result),
+        ['d1', 'migrations', wranglerCommand, 'DB', '--local', '--persist-to', '.wrangler/state', '--config', configFile]);
+    }
+    const config = JSON.parse(readFileSync(configFile, 'utf8'));
+    assert.deepEqual(config.d1_databases.map(database => [database.binding, database.database_name]), [['DB', 'site-creator-d1']]);
+    assert.equal(path.resolve(path.dirname(configFile), config.d1_databases[0].migrations_dir), path.join(root, 'drizzle'));
   });
 });

@@ -17,8 +17,10 @@ export function appliedMigrations(sqlite) {
   return tracked ? sqlite.prepare(`SELECT name FROM ${TRACKING_TABLE} ORDER BY id`).all().map(row => row.name) : [];
 }
 
-// Applies and records each pending migration individually, as Sites publishing documents, each in
-// its own transaction: a failure names the migration, keeps earlier ones and records nothing for it.
+// Applies and records each pending migration individually, as Sites publishing documents. Each runs
+// in its own transaction here (the Sites transaction scope is undocumented): a failure names the
+// migration, keeps earlier ones and records nothing for it. Inside the transaction SQLite ignores
+// PRAGMA foreign_keys, so foreign keys stay enforced.
 export function applyMigrations(sqlite, migrations = readMigrations()) {
   sqlite.exec(`CREATE TABLE IF NOT EXISTS ${TRACKING_TABLE} (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE, applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP NOT NULL)`);
   const applied = new Set(appliedMigrations(sqlite));

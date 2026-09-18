@@ -59,7 +59,7 @@ There is deliberately **no remote migration script**. Do not run `wrangler d1 mi
 | Review migration order and deploy order together, including rollback compatibility. | Review checklist in section 4. |
 | A remote migration runs only with a verified recovery point. | Manual gate in section 4. |
 
-**Unverified D1 difference:** Drizzle's SQLite table-rebuild migrations issue `PRAGMA foreign_keys=OFF`. The local tests use `node:sqlite`, which honors it; whether production D1 does was not verified. Before publishing a rebuild of a table that other tables reference, check current Cloudflare D1 documentation. The schema has no foreign keys today.
+**Unverified D1 difference:** Drizzle's SQLite table-rebuild migrations issue `PRAGMA foreign_keys=OFF`. The migration tests apply each migration inside a transaction, where SQLite ignores that pragma, so foreign keys stay enforced during the tests; `npm run db:migrate:local` runs through Miniflare instead. Whether production D1 honors the pragma was not verified. Before publishing a rebuild of a table that other tables reference, check current Cloudflare D1 documentation. The schema has no foreign keys today.
 
 ### Adding a migration
 
