@@ -1,17 +1,18 @@
-// Offline test harness: a D1-compatible database backed by node:sqlite with the
+// Offline test harness: a D1-compatible database backed by node:sqlite with every
 // production migration applied, simulated Sites authentication, a recorded fetch
 // double and a controllable clock. Nothing here contacts a network or real account.
-import {readFileSync} from 'node:fs';
 import {register} from 'node:module';
 import {DatabaseSync} from 'node:sqlite';
 import {mock} from 'node:test';
+import {readMigrations} from '../../scripts/migrations.mjs';
+import {applyMigrations} from './migration-db.mjs';
 
 export const runtime = globalThis.coinRadarTest ??= {env: {}, headers: new Headers()};
 register(new URL('./loader.mjs', import.meta.url));
 
 export const ORIGIN = 'https://coin-radar.test';
-const migration = readFileSync(new URL('../../drizzle/0000_rare_terror.sql', import.meta.url), 'utf8')
-  .split('--> statement-breakpoint').join('\n');
+// Every migration listed in drizzle/meta/_journal.json, in order; read once per test process.
+const migrations = readMigrations();
 
 // Contract-shaped (base58, 32-44 chars) fixture addresses. Not real tokens.
 export const addresses = {
@@ -26,12 +27,17 @@ export const addresses = {
 
 const tick = () => new Promise(resolve => setImmediate(resolve));
 
-// D1's prepared-statement surface (prepare/bind/first/all/run) over SQLite.
+function migratedMemoryDatabase() {
+  const sqlite = new DatabaseSync(':memory:');
+  applyMigrations(sqlite, migrations);
+  return sqlite;
+}
+
+// D1's prepared-statement surface (prepare/bind/first/all/run) over SQLite: a fresh
+// in-memory migrated database by default, or a given one (for example an upgraded file).
 // Each call yields to the event loop first so concurrent requests interleave
 // between statements, as they can against a remote D1 database.
-export function createD1() {
-  const sqlite = new DatabaseSync(':memory:');
-  sqlite.exec(migration);
+export function createD1(sqlite = migratedMemoryDatabase()) {
   const d1 = {
     sqlite,
     queries: [],

@@ -4,7 +4,7 @@ Private Solana research dashboard with market discovery, X evidence, budget-base
 
 ## Runtime and setup
 
-Vinext/React on Cloudflare Workers. Cloudflare D1 is declared as DB in `.openai/hosting.json`. Production migrations must be applied before using the research routes. The Site remains private.
+Vinext/React on Cloudflare Workers, hosted by OpenAI Sites. Cloudflare D1 is declared as DB in `.openai/hosting.json`. Sites publishing applies the migrations in `drizzle/` before the new Worker goes live; see [Database and deployment](#database-and-deployment). The Site remains private.
 
 X requires an `X_BEARER_TOKEN` server-side secret set in Sites environment settings and a publication applying that environment revision. Never put credentials in browser storage, source, or chat. Configure an X developer-console spending limit, then set a daily request cap in Advisor. Default cap is zero. No paid requests run automatically.
 
@@ -47,10 +47,11 @@ Node 22.13 or newer. Run `npm ci` first.
 
 | Command | Runs |
 | --- | --- |
-| `npm run verify` | `typecheck`, `lint`, `test`, `build` in that order; stops at the first failure. |
+| `npm run verify` | `typecheck`, `lint`, `test`, `build` in that order; stops at the first failure. `test` starts with the migration tests and `build` starts with the migration check. |
 | `npm run typecheck` | `tsc --noEmit` without writing `tsconfig.tsbuildinfo`. |
 | `npm run lint` | ESLint. Violations that existed before Stage 02 are recorded in `eslint-suppressions.json`; any new violation fails. |
-| `npm test` | All offline tests in `tests/` (Node test runner). |
+| `npm test` | `test:migrations`, then all other offline tests in `tests/` (Node test runner). |
+| `npm run test:migrations` | Migration safety tests only; see [Database and deployment](#database-and-deployment). |
 | `npm run test:research` | Advisor and market logic only. Also `node --experimental-strip-types scripts/check-research.mjs`. |
 | `npm run test:social-cache` | X cache isolation only. Also `node --experimental-strip-types --test scripts/check-social-cache.mjs`. |
 | `npm run test:browser` | Playwright smoke tests (not part of `verify`). Needs Chromium: `npx playwright install chromium`. |
@@ -61,12 +62,15 @@ Test groups:
 - `market.test.mjs`: input sanitizing, pair normalization, every score and warning boundary, verdicts, safe links; paid promotion never changes the result.
 - `social-cache.test.mjs`: two users sharing one cache row, legacy row projection, per-request quota and connection state, fresh/stale/zero-cap paths, removed credential, atomic quota, provider failure and malformed responses, contract lock release, auth and same-origin guards.
 - `portfolio-route.test.mjs`, `advisor-route.test.mjs`, `monitor-route.test.mjs`, `research-db.test.mjs`: auth, same-origin, validation, per-user isolation, idempotent recording, the 30-position limit, zero API allocation, social exclusion, per-user monitor locks, durable event deduplication, outages and lock release.
+- `migrations/structure.test.mjs`: journal, file and snapshot ordering, duplicate and missing migrations, the immutability lock, the build's migration check and the migration CLI.
+- `migrations/fresh.test.mjs`: every migration applied once, in order, to a new temporary database file; the schema contract the routes rely on (`migrations/schema-contract.mjs`); every application SQL statement compiled against the result; parity with `db/schema.ts`; a real read/write round trip.
+- `migrations/upgrade.test.mjs`: populated databases (`migrations/upgrade-fixtures.mjs`, including pre-Stage-02 shared X cache rows) upgraded from every historical version with no data lost or changed, then served by the real portfolio, monitor and social routes; self-tests proving destructive or incompatible migrations are reported.
 
-Route tests run the real route handlers and `lib/research-db.ts` against an in-memory SQLite database built from `drizzle/0000_rare_terror.sql`, through a D1-shaped adapter. Only runtime boundaries are replaced: Cloudflare `env`, Sites authentication headers and `fetch`. DEX Screener, CoinDesk and X responses are fixtures. No test makes a network request, uses real credentials or touches production D1; no live X request is made.
+Route tests run the real route handlers and `lib/research-db.ts` against an in-memory SQLite database built by applying every migration listed in `drizzle/meta/_journal.json`, through a D1-shaped adapter. Only runtime boundaries are replaced: Cloudflare `env`, Sites authentication headers and `fetch`. DEX Screener, CoinDesk and X responses are fixtures. No test makes a network request, uses real credentials or touches production D1; no live X request is made.
 
 Browser smoke (`e2e/`) starts the local dev server (mock Sites sign-in, local Miniflare) and fulfils every `/api/*` call in the browser from fixtures, aborting any non-local request. It covers initial render, provider outage, tab switching, device-local watchlist/alert settings, signed-out and unavailable Advisor account states, and horizontal overflow at 320, 360 and 390 px. It does not cover authenticated D1 flows, real providers or production hosting.
 
-GitHub Actions runs `npm run verify` and the Chromium browser smoke suite on Linux for every pull request and every push to `main`. Browser traces are retained for seven days when the smoke job fails.
+GitHub Actions runs `npm run verify` and the Chromium browser smoke suite on Linux for every pull request and every push to `main`. Browser traces are retained for seven days when the smoke job fails. CI never deploys, and Sites publishing does not wait for it.
 
 Known limitations, not changed in Stage 02:
 
@@ -75,6 +79,27 @@ Known limitations, not changed in Stage 02:
 - Failed paid X attempts consume the reserved request, by design. The daily cap uses the UTC date.
 - Allocation rounding can land one cent below an exact cent value, never above.
 - No migration is required for Stage 02.
+
+## Database and deployment
+
+Coin Radar is published through OpenAI Sites. `npm run build` first checks the migration history, then copies `drizzle/` into the build. Sites publishing applies pending migrations to the production D1 database (binding `DB`) one at a time, **before** the new Worker goes live, so the code already running must keep working on the new schema. The checklist, deployment sequence, smoke checks, rollback options and failure matrix are in [docs/deployment-runbook.md](docs/deployment-runbook.md).
+
+| Command | Scope |
+| --- | --- |
+| `npm run test:migrations` | Offline. Checks migration structure and the lock, builds a fresh database from every migration, upgrades populated databases from every historical version, and runs the real routes against the results. Included in `npm test` and `npm run verify`. |
+| `npm run db:migrations:check` | Offline. Validates `drizzle/` and `db/migrations.lock.json`. `npm run build` runs the same check and refuses to build on failure. |
+| `npm run db:generate` | Offline. Generates a migration from `db/schema.ts`. |
+| `npm run db:migrations:list:local`, `npm run db:migrate:local` | Local preview D1 in `.wrangler/state` only; run `npm run build` first. They accept no arguments, so `--remote` cannot be passed. |
+| `npm run verify`, `npm run test:browser` | Offline and local, as described under Validation. |
+| Sites publish | **Remote.** Applies production migrations, then deploys. Only the Site owner performs it, through the Sites plugin, after the runbook checklist. |
+
+The repository has no remote migration script. Do not run Wrangler with `--remote`, or `wrangler deploy`, against this project: Sites owns the production database, and applying migrations outside publishing bypasses its migration record.
+
+Migration rules:
+
+- Applied migrations are immutable. `db/migrations.lock.json` records a hash of every migration; editing, renaming, reordering or removing one fails the build and CI. Treat everything merged to `main` as applied.
+- A schema change is always a new migration: edit `db/schema.ts`, run `npm run db:generate`, add seed and verify coverage for the new tag in `tests/migrations/upgrade-fixtures.mjs`, then append the lock entry printed by `npm run db:migrations:check`.
+- Prefer additive changes. Destructive or data-rewriting migrations need a data-preservation plan and a confirmed recovery point before publishing (see the runbook).
 
 ## Provider documentation
 
