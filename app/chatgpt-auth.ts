@@ -18,7 +18,16 @@ const SIGN_IN_PATH = "/signin-with-chatgpt";
 const SIGN_OUT_PATH = "/signout-with-chatgpt";
 const CALLBACK_PATH = "/callback";
 
+// oai-authenticated-user-* headers are trustworthy only because OpenAI Sites' private front door
+// sets them itself, after Sign in with ChatGPT, and the Site cannot be reached without it. The
+// isolated Vercel build (next.config.ts) has no such front door and is publicly reachable, so a
+// visitor there can set these headers directly and pick any identity. Never honor them off Sites.
+function runsOutsideSites(): boolean {
+  return typeof process !== "undefined" && Boolean(process.env?.VERCEL);
+}
+
 export async function getChatGPTUser(): Promise<ChatGPTUser | null> {
+  if (runsOutsideSites()) return null;
   const requestHeaders = await headers();
   const userId = requestHeaders.get(USER_ID_HEADER);
   const email = requestHeaders.get(USER_EMAIL_HEADER);
