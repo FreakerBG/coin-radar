@@ -123,9 +123,9 @@ const idleScan = {status: 200, json: data => assert.deepEqual([data.status, data
 const methodNotAllowed = {status: 405, text: ''};
 // A body whose last chunk arrives after the old one-second cutoff.
 const slow = (first, rest) => [[0, first], [1500, rest]];
-const postRoutes = ['/api/portfolio', '/api/monitor', '/api/social'];
+const postRoutes = ['/api/portfolio', '/api/monitor', '/api/social', '/api/goldmine'];
 const apiRoutes = {
-  '/api/advisor': ['GET'], '/api/health': ['GET'], '/api/market': ['GET'], '/api/monitor': ['POST'],
+  '/api/advisor': ['GET'], '/api/goldmine': ['GET', 'POST'], '/api/health': ['GET'], '/api/market': ['GET'], '/api/monitor': ['POST'],
   '/api/news': ['GET'], '/api/portfolio': ['GET', 'POST'], '/api/social': ['GET', 'POST'],
 };
 
@@ -232,7 +232,7 @@ for (const [name, vars] of [['without an X secret', {}], ['with a fake local X s
       for (let waited = 0; worker.count(HEALTH_SERVED) < followUps.requests && waited < 3000; waited += 100) await sleep(100);
       assert.ok(worker.count(HEALTH_SERVED) >= followUps.requests, `the Worker served ${worker.count(HEALTH_SERVED)} health checks for ${followUps.requests} requests`);
       const unsupported = Object.entries(apiRoutes).flatMap(([path, methods]) => ['POST', 'PUT', 'PATCH', 'DELETE'].filter(method => !methods.includes(method)).map(method => `${method} ${path}`));
-      assert.equal(unsupported.length, 25);
+      assert.equal(unsupported.length, 28);
       assert.deepEqual(unsupported.filter(pair => !answered405.has(pair)), [], 'every unsupported method on every API route was sent a body and answered 405');
     });
   });

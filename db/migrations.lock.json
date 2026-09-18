@@ -6,6 +6,12 @@
       "when": 1788976971737,
       "sql": "16020943fb4293da75f7ab0648519abc5f39be44bf0d8c7329ed2adf97ab8d71",
       "snapshot": "f9877ce69ce2e969dd7ffcf7aa865a7cbcf0bd6c395c9f4e3d2c9daeaad36215"
+    },
+    {
+      "tag": "0001_goldmine_signals",
+      "when": 1789742890121,
+      "sql": "e1c7f34ad45f9fa34b1b57590727301333cae253ea06d8ceb2cdf80e9ee6474c",
+      "snapshot": "57588245d376fed567872a6e58addc0035d9dd350c38fa78d814dfa788fe4203"
     }
   ]
 }

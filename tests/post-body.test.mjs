@@ -1,7 +1,7 @@
 // Request-body lifecycle. The Worker entry (worker/entry.ts, lib/request-body.ts) reads every request
 // body to the end before the response is returned, whatever the route or framework did with it, and
 // without buffering it or cutting it off. The production POST routes (/api/portfolio, /api/monitor,
-// /api/social) answer 401, 403 and 409 without reading the body, never let rejected or malformed
+// /api/social, /api/goldmine) answer 401, 403 and 409 without reading the body, never let rejected or malformed
 // requests reach storage, locks, X quota or providers, and answer malformed JSON with 400.
 // These run the modules directly; tests/worker/post-body.test.mjs exercises the built Worker.
 import assert from 'node:assert/strict';
@@ -11,11 +11,12 @@ import {ORIGIN, addresses, body, createD1, failures, installFetch, runtime, sign
 const portfolio = await import('../app/api/portfolio/route.ts');
 const monitor = await import('../app/api/monitor/route.ts');
 const social = await import('../app/api/social/route.ts');
+const goldmine = await import('../app/api/goldmine/route.ts');
 const {withFinishedBody, readJsonObject} = await import('../lib/request-body.ts');
 const entry = (await import('../worker/entry.ts')).default;
 
 const FAKE_CREDENTIAL = 'offline-test-credential';
-const routes = {'/api/portfolio': portfolio.POST, '/api/monitor': monitor.POST, '/api/social': social.POST};
+const routes = {'/api/portfolio': portfolio.POST, '/api/monitor': monitor.POST, '/api/social': social.POST, '/api/goldmine': goldmine.POST};
 const encoder = new TextEncoder();
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 
@@ -137,6 +138,14 @@ describe('accepted requests keep their behavior', () => {
     assert.deepEqual([response.status, data.status, data.newEvents], [200, 'idle', []]);
     assert.deepEqual([request.bodyUsed, state.pulledBytes], [false, 0], 'the monitor does not interpret a payload');
     assert.deepEqual([calls, failures], [[], []]);
+  });
+
+  test('/api/goldmine never reads its body', async () => {
+    const {request, state} = tracked('/api/goldmine', ['{"scan":', '"anything"}'], {contentType: 'text/plain'});
+    const response = await goldmine.POST(request);
+    // The fetch double rejects every provider call, so discovery reports the provider unavailable.
+    assert.deepEqual([response.status, (await body(response)).status], [200, 'provider_unavailable']);
+    assert.deepEqual([request.bodyUsed, state.pulledBytes], [false, 0], 'the scan does not interpret a payload');
   });
 
   test('/api/portfolio saves valid JSON as before', async () => {
