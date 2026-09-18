@@ -35,25 +35,22 @@ function wranglerSync(args, env) {
   if (result.status !== 0) throw new Error(`wrangler ${args.slice(0, 3).join(' ')} failed:\n${result.stdout}\n${result.stderr}`);
 }
 
-// Live process IDs in the tree: on POSIX the process group led by `root`; on Windows `root`, the
-// processes already recorded as belonging to it (which outlive a parent killed first) and their
-// descendants.
+// Live members of the tree started as `root`. On POSIX that is its process group. On Windows it is
+// `root`, every process already recorded as a member (they outlive a parent killed first) and their
+// descendants; a Windows member is 'pid@creation-time', so a recycled process ID is never mistaken
+// for, or killed as, part of the tree.
 function treeProcesses(root, recorded = []) {
   if (windows) {
-    const listing = spawnSync('powershell.exe', ['-NoProfile', '-Command', 'Get-CimInstance Win32_Process | ForEach-Object { "$($_.ProcessId) $($_.ParentProcessId)" }'], {encoding: 'utf8'});
-    const children = new Map();
-    const alive = new Set();
-    for (const line of listing.stdout.split(/\r?\n/)) {
-      const [pid, parent] = line.trim().split(' ').map(Number);
-      if (!pid) continue;
-      alive.add(pid);
-      children.set(parent, [...(children.get(parent) || []), pid]);
-    }
-    const found = [...new Set([root, ...recorded])].filter(pid => alive.has(pid));
+    const listing = spawnSync('powershell.exe', ['-NoProfile', '-Command', 'Get-CimInstance Win32_Process | ForEach-Object { "$($_.ProcessId) $($_.ParentProcessId) $($_.CreationDate.Ticks)" }'], {encoding: 'utf8'});
+    const processes = listing.stdout.split(/\r?\n/).map(line => line.trim().split(' ')).filter(([pid]) => pid)
+      .map(([pid, parent, created]) => ({id: `${pid}@${created}`, pid: Number(pid), parent: Number(parent), created: Number(created)}));
+    const found = processes.filter(({pid, id}) => (!recorded.length && pid === root) || recorded.includes(id));
     for (let i = 0; i < found.length; i++) {
-      for (const pid of children.get(found[i]) || []) if (!found.includes(pid)) found.push(pid);
+      for (const process of processes) {
+        if (process.parent === found[i].pid && process.created >= found[i].created && !found.includes(process)) found.push(process);
+      }
     }
-    return found;
+    return found.map(({id}) => id);
   }
   return readdirSync('/proc').filter(entry => /^\d+$/.test(entry)).filter(pid => {
     try {
@@ -65,10 +62,9 @@ function treeProcesses(root, recorded = []) {
   }).map(Number);
 }
 
-function killTree(root, known) {
+function killTree(root, members) {
   if (windows) {
-    spawnSync('taskkill', ['/T', '/F', '/PID', String(root)], {stdio: 'ignore'});
-    for (const pid of known) spawnSync('taskkill', ['/F', '/PID', String(pid)], {stdio: 'ignore'});
+    for (const member of members) spawnSync('taskkill', ['/F', '/PID', member.split('@')[0]], {stdio: 'ignore'});
   } else {
     try { process.kill(-root, 'SIGKILL'); } catch { /* already gone */ }
   }
@@ -92,7 +88,7 @@ export async function startBuiltWorker({vars = {}} = {}) {
   let child = null;
   let known = [];
   let log = '';
-  const emergencyStop = () => { if (child) killTree(child.pid, known); };
+  const emergencyStop = () => { if (child) killTree(child.pid, treeProcesses(child.pid, known)); };
   async function remaining() {
     let survivors = [];
     for (let attempt = 0; attempt < 50; attempt++) {
@@ -124,7 +120,7 @@ export async function startBuiltWorker({vars = {}} = {}) {
       }
       process.off('exit', emergencyStop);
       try {
-        rmSync(tempRoot, {recursive: true, force: true, maxRetries: 10, retryDelay: 200});
+        rmSync(tempRoot, {recursive: true, force: true, maxRetries: 25, retryDelay: 200});
       } catch {
         // Reported through tempRemoved.
       }
@@ -147,6 +143,7 @@ export async function startBuiltWorker({vars = {}} = {}) {
     worker.port = await freePort();
     worker.origin = `http://127.0.0.1:${worker.port}`;
     child = spawn(process.execPath, startArguments(stateDir, worker.port, vars), {cwd: projectRoot, env, detached: !windows, stdio: ['ignore', 'pipe', 'pipe']});
+    known = treeProcesses(child.pid);
     process.on('exit', emergencyStop);
     child.stdout.on('data', chunk => { log += chunk; });
     child.stderr.on('data', chunk => { log += chunk; });
@@ -160,7 +157,7 @@ export async function startBuiltWorker({vars = {}} = {}) {
         // Not listening yet.
       }
     }
-    known = treeProcesses(child.pid);
+    known = treeProcesses(child.pid, known);
     return worker;
   } catch (error) {
     await worker.stop();

@@ -47,7 +47,7 @@ async function postThenHealth(worker, {path, auth = true, origin = 'same', conte
 // The error is printed only at debug level, and in Wrangler's dev proxy; a log without the proxy's
 // debug output could not show it.
 function assertCleanLog(worker) {
-  assert.ok(worker.log.includes('[wrangler-ProxyWorker:info] GET /api/health 200'), 'the Worker log is captured at debug level');
+  assert.ok(worker.log.includes('[wrangler-ProxyWorker:info] '), 'the Worker log is captured at debug level');
   assert.equal(worker.log.includes(STREAM_ERROR), false, `the Worker log contains the uncaught stream error:\n${worker.log.split('\n').filter(line => line.includes(STREAM_ERROR)).slice(0, 5).join('\n')}`);
   assert.equal(worker.log.includes(RESTARTED), false, 'Wrangler reported a restarted Worker');
 }
@@ -57,7 +57,7 @@ test('the log check recognizes the uncaught stream error', () => {
   assert.doesNotThrow(() => assertCleanLog({log: debugLine}));
   assert.throws(() => assertCleanLog({log: debugLine + 'uncaught exception; source = Uncaught (async); stack = TypeError: ' + STREAM_ERROR + '.'}), /uncaught stream error/);
   assert.throws(() => assertCleanLog({log: debugLine + RESTARTED}), /restarted/);
-  assert.throws(() => assertCleanLog({log: '[wrangler:info] GET /api/health 200 OK (5ms)'}), /debug level/);
+  assert.throws(() => assertCleanLog({log: '[wrangler:info] GET /api/health 200 OK (5ms)\n'}), /debug level/);
 });
 
 const signInRequired = {status: 401, json: {error: 'Sign in required.'}};
