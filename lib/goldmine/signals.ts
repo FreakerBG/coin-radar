@@ -124,8 +124,8 @@ const percent = (value: number | null) => value === null ? null : Number((value 
 
 // Recent signals with their outcomes, and per-state outcome counts for the current model version.
 export async function readTracking(database: D1Database) {
-  const signals = (await database.prepare('SELECT id, address, pair, symbol, model_version, state, score, opportunity, detected_at, detected_price, assessment FROM goldmine_signals ORDER BY detected_at DESC, id LIMIT 50')
-    .all<{id: string; address: string; pair: string; symbol: string; model_version: string; state: string; score: number; opportunity: number; detected_at: number; detected_price: number; assessment: string}>()).results;
+  const signals = (await database.prepare('SELECT id, address, pair, symbol, model_version, state, score, opportunity, detected_at, detected_price, snapshot, assessment FROM goldmine_signals ORDER BY detected_at DESC, id LIMIT 50')
+    .all<{id: string; address: string; pair: string; symbol: string; model_version: string; state: string; score: number; opportunity: number; detected_at: number; detected_price: number; snapshot: string; assessment: string}>()).results;
   const outcomes = signals.length ? (await database.prepare('SELECT signal_id, horizon, status, due_at, observed_at, price, liquidity FROM goldmine_outcomes WHERE signal_id IN (SELECT value FROM json_each(?))')
     .bind(JSON.stringify(signals.map(signal => signal.id))).all<{signal_id: string; horizon: string; status: string; due_at: number; observed_at: number | null; price: number | null; liquidity: number | null}>()).results : [];
   const stats = (await database.prepare("SELECT s.state AS state, o.horizon AS horizon, o.status AS status, COUNT(*) AS count, AVG(CASE WHEN o.status = 'observed' THEN o.price / s.detected_price - 1 END) AS mean_return, SUM(CASE WHEN o.status = 'observed' AND o.price > s.detected_price THEN 1 ELSE 0 END) AS positive FROM goldmine_outcomes o JOIN goldmine_signals s ON s.id = o.signal_id WHERE s.model_version = ? GROUP BY s.state, o.horizon, o.status")
@@ -157,6 +157,9 @@ export async function readTracking(database: D1Database) {
       opportunity: signal.opportunity === 1,
       detectedAt: new Date(signal.detected_at).toISOString(),
       detectedPrice: signal.detected_price,
+      // From the snapshot recorded at detection time, never recomputed: a dashboard can show exactly
+      // what safety evidence backed this signal without querying RugCheck again.
+      contractSafety: (JSON.parse(signal.snapshot) as CandidateSnapshot).contractSafety,
       assessment: JSON.parse(signal.assessment) as Assessment,
       outcomes: outcomes.filter(outcome => outcome.signal_id === signal.id).sort(byHorizon).map(outcome => ({
         horizon: outcome.horizon,

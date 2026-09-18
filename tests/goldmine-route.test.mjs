@@ -233,6 +233,7 @@ describe('outcome tracking', () => {
     const a = data.signals[0];
     assert.deepEqual(a.outcomes.map(outcome => [outcome.horizon, outcome.status, outcome.returnPct]), [['15m', 'observed', 20], ['1h', 'pending', null], ['6h', 'pending', null], ['24h', 'pending', null]]);
     assert.equal(a.assessment.summary.startsWith('BREAKOUT · score 81/100.'), true);
+    assert.deepEqual(data.signals.map(signal => signal.contractSafety.status), ['unavailable', 'unavailable'], 'the dashboard can read contract safety without a second RugCheck call');
     assert.deepEqual(data.stats.filter(row => row.horizon === '15m'), [
       {state: 'BREAKOUT', horizon: '15m', pending: 0, observed: 1, unavailable: 0, missed: 0, meanReturnPct: 20, positiveShare: 1},
       {state: 'REJECTED', horizon: '15m', pending: 0, observed: 1, unavailable: 0, missed: 0, meanReturnPct: -25, positiveShare: 0},
