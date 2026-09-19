@@ -24,6 +24,12 @@ const goldmineChecked = (overrides = {}) => ({
   ...overrides,
 });
 const goldmineTracking = (overrides = {}) => ({modelVersion: 'momentum-v2.1.0', signals: [], stats: [], disclaimer: 'Research signal only, not financial advice.', ...overrides});
+const goldmineBacktest = (overrides = {}) => ({
+  modelVersion: 'momentum-v2.1.0', totalSignals: 0, skippedMalformedRows: 0,
+  replay: {currentVersionSignals: 0, matched: 0, mismatched: [], unsupportedCount: 0, unsupportedModelVersions: []},
+  performance: [], calibration: null, limitations: ['Research signal only, not financial advice.'], disclaimer: 'Research signal only, not financial advice.',
+  ...overrides,
+});
 
 async function mockApis(page, overrides = {}) {
   const responses = {
@@ -34,13 +40,15 @@ async function mockApis(page, overrides = {}) {
     advisor: {status: 401, json: {error: 'Sign in required.'}},
     monitor: {status: 401, json: {error: 'Sign in required.'}},
     goldmine: {status: 200, json: goldmineTracking()},
+    'goldmine:backtest': {status: 200, json: goldmineBacktest()},
     ...overrides,
   };
   await page.context().route(url => !['localhost', '127.0.0.1'].includes(url.hostname), route => route.abort());
   await page.route('**/api/**', route => {
     const url = new URL(route.request().url());
     const name = url.pathname.split('/')[2];
-    const key = name === 'goldmine' && route.request().method() === 'POST' ? 'goldmine:post' : name;
+    const sub = url.pathname.split('/')[3];
+    const key = sub ? `${name}:${sub}` : (name === 'goldmine' && route.request().method() === 'POST' ? 'goldmine:post' : name);
     const response = responses[key] ?? responses[name];
     return response ? route.fulfill(response) : route.fulfill({status: 404, json: {error: 'No fixture.'}});
   });
@@ -80,6 +88,30 @@ test('switches between Discover, Watchlist, Goldmine, Advisor and Alerts', async
   await expect(page.getByRole('heading', {name: 'Watchlist alerts'})).toBeVisible();
   await tab(page, 'Discover').click();
   await expect(page.getByRole('heading', {name: 'Market radar'})).toBeVisible();
+});
+
+test('Goldmine: backtesting section degrades gracefully with too few recorded signals', async ({page}) => {
+  await mockApis(page);
+  await openDashboard(page);
+  await tab(page, 'Goldmine').click();
+  await expect(page.getByRole('heading', {name: 'Backtesting & calibration'})).toBeVisible();
+  await expect(page.getByRole('heading', {name: 'Not enough recorded signals yet'})).toBeVisible();
+});
+
+test('Goldmine: backtesting section shows a performance and calibration report once there is enough history', async ({page}) => {
+  const performance = [{modelVersion: 'momentum-v2.1.0', state: 'BREAKOUT', horizon: '15m', coverage: {pending: 0, observed: 12, unavailable: 0, missed: 0}, returnsPct: {count: 12, mean: 4.2, median: 3.1, stdev: 6.5}, positiveShare: 0.6}];
+  const calibration = {
+    cutoffAt: Date.parse('2026-01-01T00:00:00.000Z'), referenceCount: 6, evaluationCount: 6, descriptiveOnly: true,
+    rows: [{threshold: 60, eligibleCount: 4, byHorizon: [{horizon: '15m', eligibleWithOutcome: 4, returnsPct: {count: 4, mean: 2, median: 1, stdev: 3}, positiveShare: 0.5}]}],
+  };
+  await mockApis(page, {'goldmine:backtest': {status: 200, json: goldmineBacktest({totalSignals: 12, replay: {currentVersionSignals: 12, matched: 12, mismatched: [], unsupportedCount: 0, unsupportedModelVersions: []}, performance, calibration})}});
+  await openDashboard(page);
+  await tab(page, 'Goldmine').click();
+  await expect(page.getByRole('heading', {name: 'Backtesting & calibration'})).toBeVisible();
+  await expect(page.getByText('12 signals recorded.')).toBeVisible();
+  await expect(page.getByText('BREAKOUT')).toBeVisible();
+  await expect(page.getByText('Score threshold sweep (descriptive only)')).toBeVisible();
+  await expect(page.getByText('Too few evaluation signals for a performance conclusion', {exact: false})).toBeVisible();
 });
 
 test('Goldmine: idle state before any scan, distinct from an empty result', async ({page}) => {

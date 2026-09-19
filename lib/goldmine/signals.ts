@@ -130,6 +130,55 @@ function parseSnapshot(raw: string): unknown {
   try { return JSON.parse(raw); } catch { return null; }
 }
 
+// A stored assessment is always written as JSON.stringify of a real Assessment (recordSignals); the same
+// defensive treatment as parseSnapshot applies to any row that predates a field or holds corrupt JSON.
+function parseAssessment(raw: string): Assessment | null {
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    return parsed !== null && typeof parsed === 'object' ? (parsed as Assessment) : null;
+  } catch {
+    return null;
+  }
+}
+
+export type OutcomeStatus = 'pending' | 'observed' | 'unavailable' | 'missed';
+export type StoredSignalRow = {
+  id: string; address: string; pair: string; symbol: string; modelVersion: string; state: string;
+  score: number; opportunity: boolean; detectedAt: number; detectedPrice: number;
+  snapshot: CandidateSnapshot; assessment: Assessment;
+};
+export type StoredOutcomeRow = {signalId: string; horizon: string; status: OutcomeStatus; dueAt: number; observedAt: number | null; price: number | null; liquidity: number | null};
+
+// Every stored signal and its outcomes, for read-only backtesting/calibration (lib/goldmine/backtest.ts).
+// Unlike readTracking (last 50 signals, current-model-version stats only), this reads every signal ever
+// recorded, across every model version, so per-version and full-history analysis is possible. A row whose
+// stored snapshot or assessment JSON is missing, corrupt or not an object is skipped - it is counted in
+// `skipped`, never guessed at, and never crashes the read for every other row. This performs no writes.
+export async function readAllSignalsWithOutcomes(database: D1Database): Promise<{signals: StoredSignalRow[]; outcomes: StoredOutcomeRow[]; skipped: number}> {
+  const rows = (await database.prepare('SELECT id, address, pair, symbol, model_version, state, score, opportunity, detected_at, detected_price, snapshot, assessment FROM goldmine_signals ORDER BY detected_at, id')
+    .all<{id: string; address: string; pair: string; symbol: string; model_version: string; state: string; score: number; opportunity: number; detected_at: number; detected_price: number; snapshot: string; assessment: string}>()).results;
+  let skipped = 0;
+  const signals: StoredSignalRow[] = [];
+  for (const row of rows) {
+    const snapshot = parseSnapshot(row.snapshot);
+    const assessment = parseAssessment(row.assessment);
+    if (snapshot === null || typeof snapshot !== 'object' || assessment === null) { skipped++; continue; }
+    signals.push({
+      id: row.id, address: row.address, pair: row.pair, symbol: row.symbol, modelVersion: row.model_version, state: row.state,
+      score: row.score, opportunity: row.opportunity === 1, detectedAt: row.detected_at, detectedPrice: row.detected_price,
+      snapshot: snapshot as CandidateSnapshot, assessment,
+    });
+  }
+  const outcomeRows = signals.length ? (await database.prepare('SELECT signal_id, horizon, status, due_at, observed_at, price, liquidity FROM goldmine_outcomes WHERE signal_id IN (SELECT value FROM json_each(?))')
+    .bind(JSON.stringify(signals.map(signal => signal.id))).all<{signal_id: string; horizon: string; status: string; due_at: number; observed_at: number | null; price: number | null; liquidity: number | null}>()).results : [];
+  const outcomes: StoredOutcomeRow[] = outcomeRows.map(row => ({
+    signalId: row.signal_id, horizon: row.horizon,
+    status: (row.status === 'observed' || row.status === 'unavailable' || row.status === 'missed' ? row.status : 'pending') as OutcomeStatus,
+    dueAt: row.due_at, observedAt: row.observed_at, price: row.price, liquidity: row.liquidity,
+  }));
+  return {signals, outcomes, skipped};
+}
+
 // Recent signals with their outcomes, and per-state outcome counts for the current model version.
 export async function readTracking(database: D1Database) {
   const signals = (await database.prepare('SELECT id, address, pair, symbol, model_version, state, score, opportunity, detected_at, detected_price, snapshot, assessment FROM goldmine_signals ORDER BY detected_at DESC, id LIMIT 50')
