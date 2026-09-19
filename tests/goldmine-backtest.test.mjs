@@ -71,13 +71,55 @@ describe('replayAll', () => {
     assert.equal(summary.totalSignals, 3);
     assert.equal(summary.currentVersionSignals, 2);
     assert.equal(summary.matched, 1);
-    assert.deepEqual(summary.mismatched.map(m => m.signalId), ['b']);
+    assert.equal(summary.mismatchedCount, 1);
+    assert.deepEqual(summary.mismatchedSample.map(m => m.signalId), ['b']);
+    assert.equal(summary.mismatchedSampleTruncated, false);
     assert.equal(summary.unsupportedCount, 1);
     assert.deepEqual(summary.unsupportedModelVersions, ['momentum-v2.0.0']);
+    assert.equal(summary.invalidCount, 0);
   });
 
   test('an empty input never crashes and reports all zeros', () => {
-    assert.deepEqual(replayAll([]), {totalSignals: 0, currentVersionSignals: 0, matched: 0, mismatched: [], unsupportedModelVersions: [], unsupportedCount: 0});
+    assert.deepEqual(replayAll([]), {
+      totalSignals: 0, currentVersionSignals: 0, matched: 0,
+      mismatchedCount: 0, mismatchedSample: [], mismatchedSampleTruncated: false,
+      unsupportedModelVersions: [], unsupportedCount: 0, invalidCount: 0,
+    });
+  });
+
+  test('mismatchedSample is capped and mismatchedSampleTruncated is set once the true count exceeds the cap', () => {
+    const drifted = Array.from({length: 25}, (_, i) => {
+      const s = makeSignal({}, {id: `d${i}`});
+      s.assessment = {...s.assessment, score: 999};
+      return s;
+    });
+    const summary = replayAll(drifted);
+    assert.equal(summary.mismatchedCount, 25);
+    assert.equal(summary.mismatchedSample.length, 20);
+    assert.equal(summary.mismatchedSampleTruncated, true);
+  });
+
+  test('a signal whose snapshot makes scoreCandidate throw is skipped and counted as invalid, not thrown out of replayAll', () => {
+    const signal = makeSignal();
+    // A shape that passes this test's construction but is missing a field score.ts dereferences without a
+    // guard, simulating a bad historical row that structural validation did not anticipate.
+    signal.snapshot = {...signal.snapshot, txns: null};
+    const summary = replayAll([signal]);
+    assert.equal(summary.totalSignals, 1);
+    assert.equal(summary.currentVersionSignals, 0, 'an invalid row never counts as a supported replay');
+    assert.equal(summary.invalidCount, 1);
+    assert.equal(summary.unsupportedCount, 0, 'invalid rows are not folded into "unsupported model version"');
+  });
+});
+
+describe('replaySignal: defense-in-depth against a bad row', () => {
+  test('a snapshot that makes scoreCandidate throw returns an invalid result, not an exception', () => {
+    const signal = makeSignal();
+    signal.snapshot = {...signal.snapshot, txns: null};
+    const result = replaySignal(signal);
+    assert.equal(result.supported, false);
+    assert.equal(result.invalid, true);
+    assert.match(result.reason, /failed replay scoring/);
   });
 });
 
@@ -220,12 +262,26 @@ describe('calibrationSweep', () => {
     assert.ok(result.rows.length > 0, 'rows are still returned for visibility, not withheld');
   });
 
-  test('descriptiveOnly is false once the evaluation half reaches MIN_EVALUATION_SIGNALS', () => {
+  test('descriptiveOnly is false once the evaluation half reaches MIN_EVALUATION_SIGNALS AND every reported cell is individually sufficient', () => {
+    const evaluation = Array.from({length: MIN_EVALUATION_SIGNALS}, (_, i) => evalSignal('eval' + i, NOW + i, 65, 0.05));
+    // Every horizon gets a real observed outcome for every signal, and only threshold 60 is asked about
+    // (all 20 signals are eligible there), so every one of the 4 reported cells is individually sufficient.
+    const outcomes = evaluation.flatMap(s => ['15m', '1h', '6h', '24h'].map(horizon => outcomeFor(s, horizon)));
+    const result = calibrationSweep(evaluation, outcomes, {cutoffAt: NOW, thresholds: [60]});
+    assert.equal(result.evaluationCount, MIN_EVALUATION_SIGNALS);
+    assert.equal(result.insufficientCellCount, 0);
+    assert.equal(result.descriptiveOnly, false);
+  });
+
+  test('reaching MIN_EVALUATION_SIGNALS alone, with other thresholds/horizons still weak, keeps descriptiveOnly true', () => {
+    // Reproduces the original (single-horizon, default-thresholds) fixture: only 15m has outcomes, so 1h/
+    // 6h/24h remain insufficient (eligible but unobserved) and every threshold above 65 has zero eligible
+    // signals (not_evaluable). Evaluation-half size alone must not flip descriptiveOnly to false.
     const evaluation = Array.from({length: MIN_EVALUATION_SIGNALS}, (_, i) => evalSignal('eval' + i, NOW + i, 65, 0.05));
     const outcomes = evaluation.map(s => outcomeFor(s));
     const result = calibrationSweep(evaluation, outcomes, {cutoffAt: NOW});
     assert.equal(result.evaluationCount, MIN_EVALUATION_SIGNALS);
-    assert.equal(result.descriptiveOnly, false);
+    assert.equal(result.descriptiveOnly, true);
   });
 
   test('a higher threshold only ever narrows (never widens) the eligible set', () => {
@@ -308,6 +364,72 @@ describe('calibrationSweep', () => {
     const horizon15m = result.rows[0].byHorizon.find(h => h.horizon === '15m');
     assert.deepEqual(horizon15m.coverage, {pending: 1, observed: 1, unavailable: 1, missed: 1});
     assert.equal(horizon15m.eligible, 4);
+  });
+
+  // --- Per-cell evidence status: cellStatus, reconciliation counts, and descriptiveOnly semantics --------
+  // (Opus finding #2, Medium: "one populated cell makes the whole calibration look non-descriptive")
+
+  test('a threshold/horizon cell with zero eligible signals is not_evaluable, distinct from insufficient', () => {
+    const evaluation = Array.from({length: MIN_EVALUATION_SIGNALS}, (_, i) => evalSignal('eval' + i, NOW + i, 30, 0.1)); // never eligible at threshold 90
+    const outcomes = evaluation.map(s => outcomeFor(s));
+    const result = calibrationSweep(evaluation, outcomes, {cutoffAt: NOW, thresholds: [90]});
+    const horizon15m = result.rows[0].byHorizon.find(h => h.horizon === '15m');
+    assert.equal(horizon15m.eligible, 0);
+    assert.equal(horizon15m.cellStatus, 'not_evaluable');
+    assert.equal(horizon15m.sufficientEvidence, false);
+  });
+
+  test('exact reconciliation: sufficientCellCount + insufficientCellCount + notEvaluableCellCount === totalCellCount', () => {
+    const evaluation = Array.from({length: MIN_EVALUATION_SIGNALS}, (_, i) => evalSignal('eval' + i, NOW + i, 65, 0.05));
+    const outcomes = evaluation.map(s => outcomeFor(s)); // only 15m has an outcome; 1h/6h/24h are not_evaluable-by-outcome (but still eligible)
+    const result = calibrationSweep(evaluation, outcomes, {cutoffAt: NOW, thresholds: [40, 60, 90]});
+    assert.equal(result.totalCellCount, 3 * 4);
+    assert.equal(result.sufficientCellCount + result.insufficientCellCount + result.notEvaluableCellCount, result.totalCellCount);
+  });
+
+  test('a single sufficient cell among many weak/not-evaluable cells never makes descriptiveOnly false (20 signals, only 15m observed)', () => {
+    const evaluation = Array.from({length: MIN_EVALUATION_SIGNALS}, (_, i) => evalSignal('eval' + i, NOW + i, 65, 0.05));
+    const outcomes = evaluation.map(s => outcomeFor(s)); // 20 observed 15m returns: 15m/threshold<=65 cells are sufficient
+    const result = calibrationSweep(evaluation, outcomes, {cutoffAt: NOW, thresholds: CALIBRATION_THRESHOLDS});
+    const sufficientCells = result.rows.flatMap(r => r.byHorizon).filter(h => h.cellStatus === 'sufficient');
+    assert.ok(sufficientCells.length >= 1, 'at least one cell (15m, threshold<=65) is sufficient in this setup');
+    // 1h/6h/24h horizons have no outcome rows at all -> not_evaluable is impossible here since eligible>0;
+    // they are insufficient (eligible signals, zero observed returns), which must keep descriptiveOnly true.
+    assert.ok(result.insufficientCellCount > 0, 'most cells (1h/6h/24h, and higher thresholds) remain weak');
+    assert.equal(result.descriptiveOnly, true, 'one strong cell must never validate the whole calibration result');
+  });
+
+  test('when every evaluable cell is sufficient and the evaluation half is large enough, descriptiveOnly is false', () => {
+    const evaluation = Array.from({length: MIN_EVALUATION_SIGNALS}, (_, i) => evalSignal('eval' + i, NOW + i, 65, 0.05));
+    // Every horizon gets an observed outcome for every signal, all eligible at threshold 60 (the only one
+    // we ask about), so every reported cell is sufficient.
+    const outcomes = evaluation.flatMap(s => ['15m', '1h', '6h', '24h'].map(horizon => outcomeFor(s, horizon)));
+    const result = calibrationSweep(evaluation, outcomes, {cutoffAt: NOW, thresholds: [60]});
+    assert.equal(result.insufficientCellCount, 0);
+    assert.ok(result.sufficientCellCount > 0);
+    assert.equal(result.descriptiveOnly, false);
+  });
+
+  test('when every evaluable cell is insufficient, descriptiveOnly is true', () => {
+    const evaluation = Array.from({length: MIN_EVALUATION_SIGNALS}, (_, i) => evalSignal('eval' + i, NOW + i, 65, 0.05));
+    // Only 2 observed returns per horizon - well below MIN_OBSERVED_RETURN_SAMPLES everywhere.
+    const outcomes = evaluation.slice(0, 2).flatMap(s => ['15m', '1h', '6h', '24h'].map(horizon => outcomeFor(s, horizon)));
+    const result = calibrationSweep(evaluation, outcomes, {cutoffAt: NOW, thresholds: [60]});
+    assert.equal(result.sufficientCellCount, 0);
+    assert.ok(result.insufficientCellCount > 0);
+    assert.equal(result.descriptiveOnly, true);
+  });
+
+  test('an observed outcome that cannot produce a finite return is excluded from returns and does not inflate sufficiency', () => {
+    const signal = evalSignal('a', NOW, 90, 0.1);
+    // A corrupt-in-effect price (Infinity) is stamped 'observed' but must never become part of the return
+    // sample: sufficiency is judged from returns.length, never from coverage.observed alone.
+    const outcome = {signalId: signal.id, horizon: '15m', status: 'observed', dueAt: NOW, observedAt: NOW, price: Infinity, liquidity: 1};
+    const result = calibrationSweep([signal], [outcome], {cutoffAt: NOW - 1, thresholds: [90]});
+    const horizon15m = result.rows[0].byHorizon.find(h => h.horizon === '15m');
+    assert.equal(horizon15m.coverage.observed, 1, 'coverage still counts the stamped status');
+    assert.equal(horizon15m.returnsPct.count, 0, 'but no usable finite return was produced');
+    assert.equal(horizon15m.cellStatus, 'insufficient');
   });
 
   // --- Model-version isolation ------------------------------------------------------------------------

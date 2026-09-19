@@ -20,14 +20,21 @@ export const BACKTEST_LIMITATIONS = [
   'Only momentum-v2.1.0 has an implementation in this codebase. Signals recorded under a different stored model_version show their original stored assessment only; there is no supported replay for them here.',
   'Outcome coverage (pending/unavailable/missed) is reported next to observed returns, never dropped from the denominator or treated as a zero return - a state with mostly missed or unavailable outcomes has little realized evidence regardless of its observed mean.',
   'The calibration threshold sweep is descriptive only: candidate thresholds are fixed, never chosen or searched for to fit this data, and it is calibrated on the current model version alone - signals from any other stored model_version are excluded, never reinterpreted under these thresholds.',
-  'A calibration result is only as good as its evidence: it is flagged descriptive-only whenever the evaluation half is small OR its outcomes are still mostly pending/unavailable/missed, whichever is the binding constraint - evaluation-half signal count alone never implies sufficient evidence.',
+  'Evidence sufficiency is judged per threshold/horizon cell, from the actual observed returns used in that cell\'s distribution, not from how many signals were evaluated: descriptiveOnly stays true unless every reported, evaluable cell (one with at least one eligible signal) individually meets the observed-return requirement - one strong cell can never make the whole result read as validated.',
+  'Samples are not statistically independent: the same token can be recorded again in a later scan, and one signal contributes to up to four overlapping horizon buckets (15m/1h/6h/24h) at once. Treat every mean, median and stdev here as descriptive of this recorded history, not as an estimate from independent trials - and treat any mean computed from a single observed return (n=1) as a single data point, not a statistic.',
+  'History is read newest-first and bounded per request; if `truncated` is true, only the most recently detected signals within that bound are reflected below, not the full stored history. Rows or outcomes that fail structural validation are excluded and counted (skippedMalformedRows/skippedMalformedOutcomes), never guessed at or silently folded into any status.',
 ];
 
 // --- Historical replay ------------------------------------------------------------------------------
 
 export type ReplaySupported = {supported: true; signalId: string; modelVersion: string; matchesStored: boolean; recomputed: Assessment};
-export type ReplayUnsupported = {supported: false; signalId: string; modelVersion: string; reason: string};
-export type ReplayResult = ReplaySupported | ReplayUnsupported;
+export type ReplayUnsupported = {supported: false; signalId: string; modelVersion: string; reason: string; invalid?: false};
+// A signal stored under the current MODEL_VERSION whose snapshot passed structural validation
+// (isValidStoredSnapshot) but still made scoreCandidate throw - defense-in-depth against any input shape
+// validation did not anticipate. Skipped and counted like any other malformed row, never allowed to fail
+// the whole report with a 503.
+export type ReplayInvalid = {supported: false; signalId: string; modelVersion: string; reason: string; invalid: true};
+export type ReplayResult = ReplaySupported | ReplayUnsupported | ReplayInvalid;
 
 export function replaySignal(signal: StoredSignalRow): ReplayResult {
   if (signal.modelVersion !== MODEL_VERSION) {
@@ -38,17 +45,38 @@ export function replaySignal(signal: StoredSignalRow): ReplayResult {
       reason: `No implementation of model version ${signal.modelVersion} exists in this codebase (current: ${MODEL_VERSION}). Original stored assessment only; no supported replay.`,
     };
   }
-  const recomputed = scoreCandidate(signal.snapshot);
-  return {supported: true, signalId: signal.id, modelVersion: signal.modelVersion, matchesStored: deepEqual(recomputed, signal.assessment), recomputed};
+  try {
+    const recomputed = scoreCandidate(signal.snapshot);
+    return {supported: true, signalId: signal.id, modelVersion: signal.modelVersion, matchesStored: deepEqual(recomputed, signal.assessment), recomputed};
+  } catch {
+    // Structural validation (isValidStoredSnapshot) already rejects every shape known to make
+    // scoreCandidate throw; this catch is defense-in-depth for the unknown case, so one unexpected bad
+    // historical row is skipped and counted rather than throwing out of replayAll and failing the whole
+    // GET /api/goldmine/backtest report for every other signal.
+    return {supported: false, signalId: signal.id, modelVersion: signal.modelVersion, reason: 'Stored snapshot failed replay scoring; row skipped.', invalid: true};
+  }
 }
+
+// A small, deterministic sample of mismatched signal ids/addresses to return from the API - never the
+// full list, which is unbounded by the size of stored history. `mismatchedCount` is always the true total;
+// `mismatchedSampleTruncated` says whether the sample below is a subset of it.
+export const MISMATCHED_SAMPLE_LIMIT = 20;
 
 export type ReplaySummary = {
   totalSignals: number;
   currentVersionSignals: number;
   matched: number;
-  mismatched: {signalId: string; address: string}[];
+  mismatchedCount: number;
+  mismatchedSample: {signalId: string; address: string}[];
+  mismatchedSampleTruncated: boolean;
   unsupportedModelVersions: string[];
   unsupportedCount: number;
+  // Rows that matched the current model version and passed structural validation, but still failed replay
+  // scoring for an unanticipated reason (see ReplayInvalid). Included in `unsupportedCount`/
+  // `currentVersionSignals` accounting is deliberately kept separate: invalidCount is never silently
+  // folded into "no implementation of this model version" (unsupportedModelVersions), which would be a
+  // different and misleading reason.
+  invalidCount: number;
 };
 
 // Replays every signal and summarizes the result. Never mutates the input rows; each ReplayResult is a
@@ -57,16 +85,21 @@ export function replayAll(signals: StoredSignalRow[]): ReplaySummary {
   const byId = new Map(signals.map(signal => [signal.id, signal]));
   const results = signals.map(replaySignal);
   const supported = results.filter((result): result is ReplaySupported => result.supported);
-  const unsupported = results.filter((result): result is ReplayUnsupported => !result.supported);
+  const unsupported = results.filter((result): result is ReplayUnsupported | ReplayInvalid => !result.supported);
+  const invalid = unsupported.filter((result): result is ReplayInvalid => result.invalid === true);
+  const versionUnsupported = unsupported.filter(result => result.invalid !== true);
   const mismatched = supported.filter(result => !result.matchesStored)
     .map(result => ({signalId: result.signalId, address: byId.get(result.signalId)?.address ?? ''}));
   return {
     totalSignals: signals.length,
     currentVersionSignals: supported.length,
     matched: supported.length - mismatched.length,
-    mismatched,
-    unsupportedModelVersions: [...new Set(unsupported.map(result => result.modelVersion))].sort(),
-    unsupportedCount: unsupported.length,
+    mismatchedCount: mismatched.length,
+    mismatchedSample: mismatched.slice(0, MISMATCHED_SAMPLE_LIMIT),
+    mismatchedSampleTruncated: mismatched.length > MISMATCHED_SAMPLE_LIMIT,
+    unsupportedModelVersions: [...new Set(versionUnsupported.map(result => result.modelVersion))].sort(),
+    unsupportedCount: versionUnsupported.length,
+    invalidCount: invalid.length,
   };
 }
 
@@ -170,6 +203,17 @@ export function wouldBeOpportunityAt(assessment: Assessment, threshold: number):
 // silently dropped from, the observed-returns sample. `eligibleWithOutcome` is kept as the observed-return
 // sample count (the field earlier versions of this report used); `coverage`/`coverageRatio` make the full
 // breakdown (including pending/unavailable/missed) and its completeness explicit.
+//
+// Cell evidence status - explicit per cell, never implied by a sibling cell or by the evaluation-half size:
+//   'not_evaluable' - zero eligible signals for this threshold/horizon at all; there is nothing to report.
+//   'insufficient'  - at least one eligible signal, but fewer than MIN_OBSERVED_RETURN_SAMPLES *usable*
+//                      observed returns (returns.length - the values distribution() was actually computed
+//                      from, not coverage.observed, which counts every outcome row stamped 'observed' even
+//                      one whose price/detectedPrice could not produce a finite return).
+//   'sufficient'    - at least MIN_OBSERVED_RETURN_SAMPLES usable observed returns.
+// A populated 15m cell must never lend credibility to a weak or not-evaluable 1h/6h/24h cell, or to a
+// different threshold row - each cell's status is computed only from its own returns.
+export type CellEvidenceStatus = 'sufficient' | 'insufficient' | 'not_evaluable';
 export type CalibrationHorizonRow = {
   horizon: string;
   eligible: number;
@@ -178,10 +222,10 @@ export type CalibrationHorizonRow = {
   eligibleWithOutcome: number;
   returnsPct: Distribution;
   positiveShare: number | null;
-  // True once this specific threshold/horizon cell has at least MIN_OBSERVED_RETURN_SAMPLES observed
-  // returns. A row can be eligible-and-numerous while still having almost no *observed* evidence (most
-  // outcomes pending or unavailable) - this flag is what actually gates a performance claim, not eligible
-  // count alone.
+  cellStatus: CellEvidenceStatus;
+  // Kept for readability alongside cellStatus: true exactly when cellStatus === 'sufficient'. Derived from
+  // returnsPct.count (the usable observed-return sample actually used by the distribution), not
+  // coverage.observed.
   sufficientEvidence: boolean;
 };
 export type CalibrationRow = {threshold: number; eligibleCount: number; byHorizon: CalibrationHorizonRow[]};
@@ -195,11 +239,19 @@ export type CalibrationResult = {
   cutoffAt: number;
   referenceCount: number;
   evaluationCount: number;
-  // True when the report should not be read as a performance conclusion: too few evaluation-half signals
-  // (fewer than MIN_EVALUATION_SIGNALS) OR - regardless of how many evaluation signals exist - no
-  // threshold/horizon cell has reached MIN_OBSERVED_RETURN_SAMPLES actual observed returns. A large
-  // evaluation half whose outcomes are still pending, unavailable or missed is exactly the case this
-  // second condition exists to catch: signal *count* is not outcome *evidence*.
+  // Exact reconciliation over every reported cell (thresholds.length * HORIZONS.length): each cell is
+  // counted in exactly one of these three, so sufficientCellCount + insufficientCellCount +
+  // notEvaluableCellCount === totalCellCount always.
+  sufficientCellCount: number;
+  insufficientCellCount: number;
+  notEvaluableCellCount: number;
+  totalCellCount: number;
+  // True whenever the report should not be read as a performance conclusion. False only when there is at
+  // least one evaluable cell (eligible > 0) AND every evaluable cell individually reached
+  // MIN_OBSERVED_RETURN_SAMPLES (insufficientCellCount === 0) AND the evaluation half itself has at least
+  // MIN_EVALUATION_SIGNALS signals. A single sufficient cell can never flip this to false while any other
+  // evaluable cell remains insufficient - sufficiency is judged per cell, never inferred from a sibling
+  // cell or from evaluation-half signal count alone.
   descriptiveOnly: boolean;
   rows: CalibrationRow[];
 };
@@ -227,12 +279,11 @@ export function defaultCutoff(signals: StoredSignalRow[]): number | null {
 // buckets) - `excludedOtherVersionSignals` reports how many were excluded from this calibration, so the
 // exclusion is transparent rather than silent.
 //
-// `descriptiveOnly` is true whenever there is not enough *realized* evidence to draw a conclusion from:
-// either the evaluation half itself has fewer than MIN_EVALUATION_SIGNALS signals, or - independent of
-// that count - no single threshold/horizon cell has reached MIN_OBSERVED_RETURN_SAMPLES observed returns.
-// A large evaluation half whose outcomes are still pending/unavailable/missed must not read as sufficient
-// evidence merely because it contains many signals; `rows` are still returned in full for visibility even
-// when descriptiveOnly is true, never withheld.
+// `descriptiveOnly` is true whenever there is not enough *realized* evidence to draw a conclusion from -
+// see the field's comment on CalibrationResult for the exact per-cell rule. A large evaluation half whose
+// outcomes are still pending/unavailable/missed must not read as sufficient evidence merely because it
+// contains many signals; `rows` are still returned in full for visibility even when descriptiveOnly is
+// true, never withheld.
 export function calibrationSweep(signals: StoredSignalRow[], outcomes: StoredOutcomeRow[], options: {cutoffAt: number; thresholds?: number[]; modelVersion?: string}): CalibrationResult {
   const {cutoffAt, thresholds = CALIBRATION_THRESHOLDS, modelVersion = MODEL_VERSION} = options;
   const inScope = signals.filter(signal => signal.modelVersion === modelVersion);
@@ -245,7 +296,7 @@ export function calibrationSweep(signals: StoredSignalRow[], outcomes: StoredOut
     list.push(outcome);
     outcomesBySignal.set(outcome.signalId, list);
   }
-  let anySufficientCell = false;
+  let sufficientCellCount = 0, insufficientCellCount = 0, notEvaluableCellCount = 0;
   const rows = thresholds.map(threshold => {
     const eligible = evaluation.filter(signal => wouldBeOpportunityAt(signal.assessment, threshold));
     const byHorizon = HORIZONS.map(({id}) => {
@@ -258,12 +309,20 @@ export function calibrationSweep(signals: StoredSignalRow[], outcomes: StoredOut
         if (outcome.status === 'pending' || outcome.status === 'observed' || outcome.status === 'unavailable' || outcome.status === 'missed') coverage[outcome.status]++;
         if (outcome.status === 'observed' && outcome.price !== null && signal.detectedPrice > 0) {
           const returnPct = (outcome.price / signal.detectedPrice - 1) * 100;
-          returns.push(returnPct);
-          if (outcome.price > signal.detectedPrice) positive++;
+          if (Number.isFinite(returnPct)) {
+            returns.push(returnPct);
+            if (outcome.price > signal.detectedPrice) positive++;
+          }
         }
       }
-      const sufficientEvidence = coverage.observed >= MIN_OBSERVED_RETURN_SAMPLES;
-      if (sufficientEvidence) anySufficientCell = true;
+      // Evidence sufficiency is judged from returns.length - the sample distribution() actually computed
+      // over - never from coverage.observed, which can exceed returns.length whenever an 'observed' row's
+      // price/detectedPrice could not produce a finite, usable return.
+      const cellStatus: CellEvidenceStatus = eligible.length === 0 ? 'not_evaluable'
+        : returns.length >= MIN_OBSERVED_RETURN_SAMPLES ? 'sufficient' : 'insufficient';
+      if (cellStatus === 'sufficient') sufficientCellCount++;
+      else if (cellStatus === 'insufficient') insufficientCellCount++;
+      else notEvaluableCellCount++;
       return {
         horizon: id as string,
         eligible: eligible.length,
@@ -272,18 +331,27 @@ export function calibrationSweep(signals: StoredSignalRow[], outcomes: StoredOut
         eligibleWithOutcome: returns.length,
         returnsPct: distribution(returns),
         positiveShare: returns.length ? Number((positive / returns.length).toFixed(4)) : null,
-        sufficientEvidence,
+        cellStatus,
+        sufficientEvidence: cellStatus === 'sufficient',
       };
     });
     return {threshold, eligibleCount: eligible.length, byHorizon};
   });
+  const totalCellCount = sufficientCellCount + insufficientCellCount + notEvaluableCellCount;
   return {
     modelVersion,
+    sufficientCellCount,
+    insufficientCellCount,
+    notEvaluableCellCount,
+    totalCellCount,
     excludedOtherVersionSignals,
     cutoffAt,
     referenceCount: reference.length,
     evaluationCount: evaluation.length,
-    descriptiveOnly: evaluation.length < MIN_EVALUATION_SIGNALS || !anySufficientCell,
+    // False only when there is at least one evaluable (eligible > 0) cell, none of those evaluable cells is
+    // insufficient, and the evaluation half itself reached MIN_EVALUATION_SIGNALS. A single sufficient cell
+    // can never outweigh a remaining insufficient one (insufficientCellCount > 0 keeps this true).
+    descriptiveOnly: evaluation.length < MIN_EVALUATION_SIGNALS || insufficientCellCount > 0 || sufficientCellCount === 0,
     rows,
   };
 }

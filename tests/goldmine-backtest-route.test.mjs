@@ -55,8 +55,12 @@ describe('empty history', () => {
     assert.equal(data.totalSignals, 0);
     assert.deepEqual(data.performance, []);
     assert.equal(data.calibration, null);
-    assert.deepEqual(data.replay, {currentVersionSignals: 0, matched: 0, mismatched: [], unsupportedCount: 0, unsupportedModelVersions: []});
+    assert.deepEqual(data.replay, {
+      currentVersionSignals: 0, matched: 0, mismatchedCount: 0, mismatchedSample: [], mismatchedSampleTruncated: false,
+      unsupportedCount: 0, unsupportedModelVersions: [], invalidCount: 0,
+    });
     assert.ok(Array.isArray(data.limitations) && data.limitations.length > 0);
+    assert.equal(data.skippedMalformedOutcomes, 0);
   });
 });
 
@@ -66,7 +70,10 @@ describe('replay', () => {
     insertSignal({id: 'sig-1', detectedAt: now});
     const before = d1.rows('SELECT * FROM goldmine_signals');
     const data = await body(await read());
-    assert.deepEqual(data.replay, {currentVersionSignals: 1, matched: 1, mismatched: [], unsupportedCount: 0, unsupportedModelVersions: []});
+    assert.deepEqual(data.replay, {
+      currentVersionSignals: 1, matched: 1, mismatchedCount: 0, mismatchedSample: [], mismatchedSampleTruncated: false,
+      unsupportedCount: 0, unsupportedModelVersions: [], invalidCount: 0,
+    });
     assert.deepEqual(d1.rows('SELECT * FROM goldmine_signals'), before, 'replay never mutates the stored signal row');
   });
 
@@ -74,7 +81,10 @@ describe('replay', () => {
     const now = clock.now();
     insertSignal({id: 'sig-legacy', detectedAt: now, modelVersion: 'momentum-v1.0.0'});
     const data = await body(await read());
-    assert.deepEqual(data.replay, {currentVersionSignals: 0, matched: 0, mismatched: [], unsupportedCount: 1, unsupportedModelVersions: ['momentum-v1.0.0']});
+    assert.deepEqual(data.replay, {
+      currentVersionSignals: 0, matched: 0, mismatchedCount: 0, mismatchedSample: [], mismatchedSampleTruncated: false,
+      unsupportedCount: 1, unsupportedModelVersions: ['momentum-v1.0.0'], invalidCount: 0,
+    });
   });
 
   test('a corrupt stored snapshot/assessment row is skipped, not crashed on, and reported in skippedMalformedRows', async () => {
@@ -83,6 +93,33 @@ describe('replay', () => {
     const data = await body(await read());
     assert.equal(data.totalSignals, 0);
     assert.equal(data.skippedMalformedRows, 1);
+  });
+
+  test('a stored row with {status:"unsafe"} and no failedChecks never crashes the endpoint - other valid rows are still reported (200, not 503)', async () => {
+    const now = clock.now();
+    const badSnapshot = {...snapshotFromPair(pair(), now), contractSafety: {status: 'unsafe'}};
+    d1.sqlite.prepare('INSERT INTO goldmine_signals (id, address, pair, symbol, model_version, state, score, opportunity, detected_at, detected_price, snapshot, assessment) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run('sig-bad-safety', badSnapshot.address, badSnapshot.pair, badSnapshot.symbol, MODEL_VERSION, 'BREAKOUT', 81, 0, now, badSnapshot.priceUsd,
+        JSON.stringify(badSnapshot), JSON.stringify({...scoreCandidate(snapshotFromPair(pair(), now)), modelVersion: MODEL_VERSION}));
+    insertSignal({id: 'sig-ok', detectedAt: now + 1});
+    const response = await read();
+    assert.equal(response.status, 200);
+    const data = await body(response);
+    assert.equal(data.totalSignals, 1);
+    assert.equal(data.skippedMalformedRows, 1);
+  });
+});
+
+describe('malformed outcomes', () => {
+  test('an unknown outcome status is excluded and counted in skippedMalformedOutcomes, never inflating pending coverage', async () => {
+    const now = clock.now();
+    insertSignal({id: 'sig-1', detectedAt: now});
+    d1.sqlite.prepare('INSERT INTO goldmine_outcomes (signal_id, horizon, due_at, deadline_at, status, observed_at, price, liquidity) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      .run('sig-1', '15m', now, now + MINUTE, 'CORRUPT', null, null, null);
+    const data = await body(await read());
+    assert.equal(data.skippedMalformedOutcomes, 1);
+    const byHorizon = Object.fromEntries(data.performance.map(bucket => [bucket.horizon, bucket]));
+    assert.equal(byHorizon['15m'], undefined, 'the malformed row never contributes to any coverage bucket, pending or otherwise');
   });
 });
 

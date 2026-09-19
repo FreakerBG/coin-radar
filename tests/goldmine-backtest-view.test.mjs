@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import {describe, test} from 'node:test';
 
-const {hasEnoughData, performanceRowsWithData, coverageTotal, coverageLabel, MIN_SIGNALS_FOR_REPORT} = await import('../lib/goldmine/backtest-view.ts');
+const {hasEnoughData, performanceRowsWithData, coverageTotal, coverageLabel, hasDataQualityWarning, dataQualityWarning, cellStatusLabel, MIN_SIGNALS_FOR_REPORT} = await import('../lib/goldmine/backtest-view.ts');
 
 describe('hasEnoughData', () => {
   test('null report: not enough data', () => assert.equal(hasEnoughData(null), false));
@@ -38,5 +38,47 @@ describe('coverageTotal / coverageLabel', () => {
   });
   test('a populated bucket reports every status, not only observed', () => {
     assert.equal(coverageLabel({pending: 1, observed: 2, unavailable: 0, missed: 1}), '2/4 observed, 1 pending, 0 unavailable, 1 missed.');
+  });
+});
+
+describe('hasDataQualityWarning / dataQualityWarning (truncation and malformed-data visibility)', () => {
+  const clean = {totalSignals: 20, truncated: false, skippedMalformedRows: 0, skippedMalformedOutcomes: 0};
+
+  test('null report: no warning', () => assert.equal(hasDataQualityWarning(null), false));
+  test('a clean report: no warning', () => {
+    assert.equal(hasDataQualityWarning(clean), false);
+    assert.equal(dataQualityWarning(clean), '');
+  });
+  test('truncated: true triggers a warning that states the analysis is partial and how many rows were analyzed', () => {
+    const report = {...clean, truncated: true};
+    assert.equal(hasDataQualityWarning(report), true);
+    const warning = dataQualityWarning(report);
+    assert.match(warning, /Partial analysis/);
+    assert.match(warning, /20/);
+    assert.match(warning, /most recently detected/, 'must say the newest part of history was retained, not silently imply completeness');
+  });
+  test('skippedMalformedRows > 0 triggers a warning naming the excluded row count', () => {
+    const report = {...clean, skippedMalformedRows: 3};
+    assert.equal(hasDataQualityWarning(report), true);
+    assert.match(dataQualityWarning(report), /3 stored signal rows failed validation/);
+  });
+  test('skippedMalformedOutcomes > 0 triggers a warning naming the excluded outcome count', () => {
+    const report = {...clean, skippedMalformedOutcomes: 5};
+    assert.equal(hasDataQualityWarning(report), true);
+    assert.match(dataQualityWarning(report), /5 stored outcome rows failed validation/);
+  });
+  test('a report must never show an unqualified "N signals recorded" style total when truncated', () => {
+    const warning = dataQualityWarning({...clean, totalSignals: 20000, truncated: true});
+    assert.doesNotMatch(warning, /^20000 signals recorded\.?$/, 'a truncated total must be qualified as partial, not stated as if complete');
+  });
+});
+
+describe('cellStatusLabel', () => {
+  test('sufficient has no label (nothing to warn about)', () => assert.equal(cellStatusLabel('sufficient'), ''));
+  test('insufficient is labeled honestly', () => assert.equal(cellStatusLabel('insufficient'), 'insufficient evidence'));
+  test('not_evaluable is labeled distinctly from insufficient', () => {
+    const label = cellStatusLabel('not_evaluable');
+    assert.notEqual(label, '');
+    assert.notEqual(label, cellStatusLabel('insufficient'));
   });
 });

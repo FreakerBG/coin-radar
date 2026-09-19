@@ -3,7 +3,7 @@ import {useCallback,useEffect,useRef,useState} from 'react';
 import {Gem,RefreshCw,ShieldCheck,ShieldAlert,ArrowUpRight,Radio} from 'lucide-react';
 import {toast} from 'sonner';
 import {isStale,opportunitiesOf,scanState,type PostedCandidate} from '@/lib/goldmine/dashboard-view';
-import {coverageLabel,hasEnoughData,performanceRowsWithData,type BacktestReport} from '@/lib/goldmine/backtest-view';
+import {cellStatusLabel,coverageLabel,dataQualityWarning,hasDataQualityWarning,hasEnoughData,performanceRowsWithData,type BacktestReport} from '@/lib/goldmine/backtest-view';
 import type {ContractSafetySummary} from '@/lib/goldmine/snapshot';
 
 type ScanResponse = {
@@ -108,10 +108,14 @@ function BacktestingSection({report, error, onRetry}: {report: BacktestReport | 
       )}
       {!error && hasEnoughData(report) && report && (
         <div style={{padding: '0 22px 22px'}}>
+          {hasDataQualityWarning(report) && (
+            <div className="banner" role="status" style={{margin: '0 0 12px'}}>{dataQualityWarning(report)}</div>
+          )}
           <p className="muted" style={{fontSize: 13}}>
             {report.totalSignals} signals recorded. Replay (model {report.modelVersion}): {report.replay.matched}/{report.replay.currentVersionSignals} current-version signals reproduce their stored assessment exactly
-            {report.replay.mismatched.length > 0 ? `, ${report.replay.mismatched.length} mismatched` : ''}.
+            {report.replay.mismatchedCount > 0 ? `, ${report.replay.mismatchedCount} mismatched${report.replay.mismatchedSampleTruncated ? ` (showing ${report.replay.mismatchedSample.length})` : ''}` : ''}.
             {report.replay.unsupportedCount > 0 && ` ${report.replay.unsupportedCount} signals from other model versions (${report.replay.unsupportedModelVersions.join(', ')}) have no supported replay.`}
+            {report.replay.invalidCount > 0 && ` ${report.replay.invalidCount} signal${report.replay.invalidCount === 1 ? '' : 's'} could not be replayed and ${report.replay.invalidCount === 1 ? 'was' : 'were'} skipped.`}
           </p>
 
           <h3 style={{fontSize: 14, margin: '14px 0 6px'}}>Outcome performance by model version, state and horizon</h3>
@@ -125,7 +129,7 @@ function BacktestingSection({report, error, onRetry}: {report: BacktestReport | 
                     <td>{bucket.state}</td>
                     <td>{bucket.horizon}</td>
                     <td className="muted" style={{whiteSpace: 'nowrap'}}>{coverageLabel(bucket.coverage)}</td>
-                    <td style={{textAlign: 'right'}}>{bucket.returnsPct.count ? `${pct(bucket.returnsPct.mean)} (n=${bucket.returnsPct.count})` : '—'}</td>
+                    <td style={{textAlign: 'right'}}>{bucket.returnsPct.count ? `${pct(bucket.returnsPct.mean)} (n=${bucket.returnsPct.count})${bucket.returnsPct.count === 1 ? ' single sample' : ''}` : '—'}</td>
                     <td style={{textAlign: 'right'}}>{pct(bucket.returnsPct.median)}</td>
                     <td style={{textAlign: 'right'}}>{bucket.returnsPct.stdev === null ? '—' : `${bucket.returnsPct.stdev.toFixed(1)}pp`}</td>
                   </tr>
@@ -141,7 +145,8 @@ function BacktestingSection({report, error, onRetry}: {report: BacktestReport | 
               <p className="muted" style={{fontSize: 12, margin: '0 0 8px'}}>
                 Reference (earlier) signals: {report.calibration.referenceCount}. Evaluation (later) signals: {report.calibration.evaluationCount}, reported below only.
                 {report.calibration.excludedOtherVersionSignals > 0 && ` ${report.calibration.excludedOtherVersionSignals} signals from other model versions were excluded from this calibration.`}
-                {report.calibration.descriptiveOnly && ' Too few evaluation signals, or too few observed outcomes, for a performance conclusion - shown for visibility only, not as a result.'}
+                {' '}{report.calibration.sufficientCellCount}/{report.calibration.totalCellCount} threshold/horizon cells have sufficient observed evidence ({report.calibration.insufficientCellCount} insufficient, {report.calibration.notEvaluableCellCount} not evaluable).
+                {report.calibration.descriptiveOnly && ' Descriptive only: at least one evaluable cell (or the evaluation half itself) does not yet meet the evidence requirement - a cell shown as sufficient does not make the rest of this table a validated result.'}
               </p>
               <div style={{overflowX: 'auto'}}>
                 <table className="mono" style={{fontSize: 12, borderCollapse: 'collapse', width: '100%'}}>
@@ -154,7 +159,7 @@ function BacktestingSection({report, error, onRetry}: {report: BacktestReport | 
                         {row.byHorizon.map(h => (
                           <td key={h.horizon} title={`${h.coverage.observed} observed, ${h.coverage.pending} pending, ${h.coverage.unavailable} unavailable, ${h.coverage.missed} missed`}>
                             {h.returnsPct.count ? `${pct(h.returnsPct.mean)} (${h.returnsPct.count}/${h.eligible})` : `— (0/${h.eligible})`}
-                            {!h.sufficientEvidence && h.eligible > 0 && <span className="muted"> insufficient</span>}
+                            {h.cellStatus !== 'sufficient' && <span className="muted"> {cellStatusLabel(h.cellStatus)}</span>}
                           </td>
                         ))}
                       </tr>

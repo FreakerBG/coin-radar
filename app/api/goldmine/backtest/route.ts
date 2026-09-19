@@ -14,7 +14,7 @@ export async function GET() {
   const user = await getChatGPTUser();
   if (!user) return Response.json({error: 'Sign in required.'}, {status: 401, headers: noStore});
   try {
-    const {signals, outcomes, skipped, truncated} = await readAllSignalsWithOutcomes(db());
+    const {signals, outcomes, skippedMalformedSignals, skippedMalformedOutcomes, truncated} = await readAllSignalsWithOutcomes(db());
     const replay = replayAll(signals);
     const performance = performanceReport(signals, outcomes);
     // The calibration cutoff is computed from the current model version's signals only, so the
@@ -26,14 +26,18 @@ export async function GET() {
     return Response.json({
       modelVersion: MODEL_VERSION,
       totalSignals: signals.length,
-      skippedMalformedRows: skipped,
+      skippedMalformedRows: skippedMalformedSignals,
+      skippedMalformedOutcomes,
       truncated,
       replay: {
         currentVersionSignals: replay.currentVersionSignals,
         matched: replay.matched,
-        mismatched: replay.mismatched,
+        mismatchedCount: replay.mismatchedCount,
+        mismatchedSample: replay.mismatchedSample,
+        mismatchedSampleTruncated: replay.mismatchedSampleTruncated,
         unsupportedCount: replay.unsupportedCount,
         unsupportedModelVersions: replay.unsupportedModelVersions,
+        invalidCount: replay.invalidCount,
       },
       performance,
       calibration,
