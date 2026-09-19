@@ -14,15 +14,20 @@ export async function GET() {
   const user = await getChatGPTUser();
   if (!user) return Response.json({error: 'Sign in required.'}, {status: 401, headers: noStore});
   try {
-    const {signals, outcomes, skipped} = await readAllSignalsWithOutcomes(db());
+    const {signals, outcomes, skipped, truncated} = await readAllSignalsWithOutcomes(db());
     const replay = replayAll(signals);
     const performance = performanceReport(signals, outcomes);
-    const cutoffAt = defaultCutoff(signals);
+    // The calibration cutoff is computed from the current model version's signals only, so the
+    // chronological split is not skewed by detection timestamps from other, unrelated model versions.
+    // calibrationSweep itself independently restricts (and reports) that same isolation - see its comment.
+    const currentVersionSignals = signals.filter(signal => signal.modelVersion === MODEL_VERSION);
+    const cutoffAt = defaultCutoff(currentVersionSignals);
     const calibration = cutoffAt === null ? null : calibrationSweep(signals, outcomes, {cutoffAt});
     return Response.json({
       modelVersion: MODEL_VERSION,
       totalSignals: signals.length,
       skippedMalformedRows: skipped,
+      truncated,
       replay: {
         currentVersionSignals: replay.currentVersionSignals,
         matched: replay.matched,

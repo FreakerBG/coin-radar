@@ -5,12 +5,31 @@
 export type Distribution = {count: number; mean: number | null; median: number | null; stdev: number | null};
 export type OutcomeCoverage = {pending: number; observed: number; unavailable: number; missed: number};
 export type PerformanceBucket = {modelVersion: string; state: string; horizon: string; coverage: OutcomeCoverage; returnsPct: Distribution; positiveShare: number | null};
-export type CalibrationRow = {threshold: number; eligibleCount: number; byHorizon: {horizon: string; eligibleWithOutcome: number; returnsPct: Distribution; positiveShare: number | null}[]};
-export type CalibrationResult = {cutoffAt: number; referenceCount: number; evaluationCount: number; descriptiveOnly: boolean; rows: CalibrationRow[]};
+export type CalibrationHorizonRow = {
+  horizon: string;
+  eligible: number;
+  coverage: OutcomeCoverage;
+  coverageRatio: number | null;
+  eligibleWithOutcome: number;
+  returnsPct: Distribution;
+  positiveShare: number | null;
+  sufficientEvidence: boolean;
+};
+export type CalibrationRow = {threshold: number; eligibleCount: number; byHorizon: CalibrationHorizonRow[]};
+export type CalibrationResult = {
+  modelVersion: string;
+  excludedOtherVersionSignals: number;
+  cutoffAt: number;
+  referenceCount: number;
+  evaluationCount: number;
+  descriptiveOnly: boolean;
+  rows: CalibrationRow[];
+};
 export type BacktestReport = {
   modelVersion: string;
   totalSignals: number;
   skippedMalformedRows: number;
+  truncated: boolean;
   replay: {currentVersionSignals: number; matched: number; mismatched: {signalId: string; address: string}[]; unsupportedCount: number; unsupportedModelVersions: string[]};
   performance: PerformanceBucket[];
   calibration: CalibrationResult | null;

@@ -114,13 +114,14 @@ function BacktestingSection({report, error, onRetry}: {report: BacktestReport | 
             {report.replay.unsupportedCount > 0 && ` ${report.replay.unsupportedCount} signals from other model versions (${report.replay.unsupportedModelVersions.join(', ')}) have no supported replay.`}
           </p>
 
-          <h3 style={{fontSize: 14, margin: '14px 0 6px'}}>Outcome performance by state and horizon</h3>
+          <h3 style={{fontSize: 14, margin: '14px 0 6px'}}>Outcome performance by model version, state and horizon</h3>
           <div style={{overflowX: 'auto'}}>
             <table className="mono" style={{fontSize: 12, borderCollapse: 'collapse', width: '100%'}}>
-              <thead><tr><th style={{textAlign: 'left'}}>State</th><th style={{textAlign: 'left'}}>Horizon</th><th style={{textAlign: 'left'}}>Coverage</th><th style={{textAlign: 'right'}}>Mean</th><th style={{textAlign: 'right'}}>Median</th><th style={{textAlign: 'right'}}>Stdev</th></tr></thead>
+              <thead><tr><th style={{textAlign: 'left'}}>Model</th><th style={{textAlign: 'left'}}>State</th><th style={{textAlign: 'left'}}>Horizon</th><th style={{textAlign: 'left'}}>Coverage</th><th style={{textAlign: 'right'}}>Mean</th><th style={{textAlign: 'right'}}>Median</th><th style={{textAlign: 'right'}}>Stdev</th></tr></thead>
               <tbody>
                 {performanceRowsWithData(report.performance).map(bucket => (
                   <tr key={`${bucket.modelVersion}:${bucket.state}:${bucket.horizon}`}>
+                    <td className="muted" style={{whiteSpace: 'nowrap'}}>{bucket.modelVersion}</td>
                     <td>{bucket.state}</td>
                     <td>{bucket.horizon}</td>
                     <td className="muted" style={{whiteSpace: 'nowrap'}}>{coverageLabel(bucket.coverage)}</td>
@@ -129,27 +130,33 @@ function BacktestingSection({report, error, onRetry}: {report: BacktestReport | 
                     <td style={{textAlign: 'right'}}>{bucket.returnsPct.stdev === null ? '—' : `${bucket.returnsPct.stdev.toFixed(1)}pp`}</td>
                   </tr>
                 ))}
-                {!performanceRowsWithData(report.performance).length && <tr><td colSpan={6} className="muted">No outcomes recorded yet.</td></tr>}
+                {!performanceRowsWithData(report.performance).length && <tr><td colSpan={7} className="muted">No outcomes recorded yet.</td></tr>}
               </tbody>
             </table>
           </div>
 
           {report.calibration && (
             <>
-              <h3 style={{fontSize: 14, margin: '18px 0 6px'}}>Score threshold sweep (descriptive only)</h3>
+              <h3 style={{fontSize: 14, margin: '18px 0 6px'}}>Score threshold sweep (descriptive only) - model {report.calibration.modelVersion}</h3>
               <p className="muted" style={{fontSize: 12, margin: '0 0 8px'}}>
                 Reference (earlier) signals: {report.calibration.referenceCount}. Evaluation (later) signals: {report.calibration.evaluationCount}, reported below only.
-                {report.calibration.descriptiveOnly && ' Too few evaluation signals for a performance conclusion - shown for visibility only, not as a result.'}
+                {report.calibration.excludedOtherVersionSignals > 0 && ` ${report.calibration.excludedOtherVersionSignals} signals from other model versions were excluded from this calibration.`}
+                {report.calibration.descriptiveOnly && ' Too few evaluation signals, or too few observed outcomes, for a performance conclusion - shown for visibility only, not as a result.'}
               </p>
               <div style={{overflowX: 'auto'}}>
                 <table className="mono" style={{fontSize: 12, borderCollapse: 'collapse', width: '100%'}}>
-                  <thead><tr><th style={{textAlign: 'left'}}>If threshold were</th><th style={{textAlign: 'right'}}>Eligible</th><th style={{textAlign: 'left'}}>15m mean (n)</th><th style={{textAlign: 'left'}}>1h mean (n)</th><th style={{textAlign: 'left'}}>6h mean (n)</th><th style={{textAlign: 'left'}}>24h mean (n)</th></tr></thead>
+                  <thead><tr><th style={{textAlign: 'left'}}>If threshold were</th><th style={{textAlign: 'right'}}>Eligible</th><th style={{textAlign: 'left'}}>15m mean (n obs/elig)</th><th style={{textAlign: 'left'}}>1h mean (n obs/elig)</th><th style={{textAlign: 'left'}}>6h mean (n obs/elig)</th><th style={{textAlign: 'left'}}>24h mean (n obs/elig)</th></tr></thead>
                   <tbody>
                     {report.calibration.rows.map(row => (
                       <tr key={row.threshold}>
                         <td>{row.threshold}</td>
                         <td style={{textAlign: 'right'}}>{row.eligibleCount}</td>
-                        {row.byHorizon.map(h => <td key={h.horizon}>{h.returnsPct.count ? `${pct(h.returnsPct.mean)} (${h.returnsPct.count})` : '—'}</td>)}
+                        {row.byHorizon.map(h => (
+                          <td key={h.horizon} title={`${h.coverage.observed} observed, ${h.coverage.pending} pending, ${h.coverage.unavailable} unavailable, ${h.coverage.missed} missed`}>
+                            {h.returnsPct.count ? `${pct(h.returnsPct.mean)} (${h.returnsPct.count}/${h.eligible})` : `— (0/${h.eligible})`}
+                            {!h.sufficientEvidence && h.eligible > 0 && <span className="muted"> insufficient</span>}
+                          </td>
+                        ))}
                       </tr>
                     ))}
                   </tbody>

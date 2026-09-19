@@ -25,7 +25,7 @@ const goldmineChecked = (overrides = {}) => ({
 });
 const goldmineTracking = (overrides = {}) => ({modelVersion: 'momentum-v2.1.0', signals: [], stats: [], disclaimer: 'Research signal only, not financial advice.', ...overrides});
 const goldmineBacktest = (overrides = {}) => ({
-  modelVersion: 'momentum-v2.1.0', totalSignals: 0, skippedMalformedRows: 0,
+  modelVersion: 'momentum-v2.1.0', totalSignals: 0, skippedMalformedRows: 0, truncated: false,
   replay: {currentVersionSignals: 0, matched: 0, mismatched: [], unsupportedCount: 0, unsupportedModelVersions: []},
   performance: [], calibration: null, limitations: ['Research signal only, not financial advice.'], disclaimer: 'Research signal only, not financial advice.',
   ...overrides,
@@ -98,20 +98,26 @@ test('Goldmine: backtesting section degrades gracefully with too few recorded si
   await expect(page.getByRole('heading', {name: 'Not enough recorded signals yet'})).toBeVisible();
 });
 
-test('Goldmine: backtesting section shows a performance and calibration report once there is enough history', async ({page}) => {
+const populatedBacktest = () => {
   const performance = [{modelVersion: 'momentum-v2.1.0', state: 'BREAKOUT', horizon: '15m', coverage: {pending: 0, observed: 12, unavailable: 0, missed: 0}, returnsPct: {count: 12, mean: 4.2, median: 3.1, stdev: 6.5}, positiveShare: 0.6}];
   const calibration = {
+    modelVersion: 'momentum-v2.1.0', excludedOtherVersionSignals: 0,
     cutoffAt: Date.parse('2026-01-01T00:00:00.000Z'), referenceCount: 6, evaluationCount: 6, descriptiveOnly: true,
-    rows: [{threshold: 60, eligibleCount: 4, byHorizon: [{horizon: '15m', eligibleWithOutcome: 4, returnsPct: {count: 4, mean: 2, median: 1, stdev: 3}, positiveShare: 0.5}]}],
+    rows: [{threshold: 60, eligibleCount: 4, byHorizon: [{horizon: '15m', eligible: 4, coverage: {pending: 0, observed: 4, unavailable: 0, missed: 0}, coverageRatio: 1, eligibleWithOutcome: 4, returnsPct: {count: 4, mean: 2, median: 1, stdev: 3}, positiveShare: 0.5, sufficientEvidence: false}]}],
   };
-  await mockApis(page, {'goldmine:backtest': {status: 200, json: goldmineBacktest({totalSignals: 12, replay: {currentVersionSignals: 12, matched: 12, mismatched: [], unsupportedCount: 0, unsupportedModelVersions: []}, performance, calibration})}});
+  return goldmineBacktest({totalSignals: 12, replay: {currentVersionSignals: 12, matched: 12, mismatched: [], unsupportedCount: 0, unsupportedModelVersions: []}, performance, calibration});
+};
+
+test('Goldmine: backtesting section shows a performance and calibration report once there is enough history', async ({page}) => {
+  await mockApis(page, {'goldmine:backtest': {status: 200, json: populatedBacktest()}});
   await openDashboard(page);
   await tab(page, 'Goldmine').click();
   await expect(page.getByRole('heading', {name: 'Backtesting & calibration'})).toBeVisible();
   await expect(page.getByText('12 signals recorded.')).toBeVisible();
   await expect(page.getByText('BREAKOUT')).toBeVisible();
-  await expect(page.getByText('Score threshold sweep (descriptive only)')).toBeVisible();
-  await expect(page.getByText('Too few evaluation signals for a performance conclusion', {exact: false})).toBeVisible();
+  await expect(page.getByText('momentum-v2.1.0').first()).toBeVisible();
+  await expect(page.getByText('Score threshold sweep (descriptive only) - model momentum-v2.1.0')).toBeVisible();
+  await expect(page.getByText('Too few evaluation signals, or too few observed outcomes, for a performance conclusion', {exact: false})).toBeVisible();
 });
 
 test('Goldmine: idle state before any scan, distinct from an empty result', async ({page}) => {
@@ -289,5 +295,19 @@ for (const [label, width, height] of [['narrow mobile', 320, 800], ['narrow mobi
       const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
       expect(overflow, `${name} tab overflows horizontally by ${overflow}px`).toBeLessThanOrEqual(0);
     }
+  });
+
+  // Same check with a populated backtesting/calibration report: the widest tables on the Goldmine tab
+  // (model version + state + horizon + coverage columns) must still scroll inside their own container
+  // rather than widening the page itself, at this width.
+  test(`${label} viewport (${width}px): populated backtesting report has no horizontal page overflow`, async ({page}) => {
+    await page.setViewportSize({width, height});
+    await mockApis(page, {'goldmine:backtest': {status: 200, json: populatedBacktest()}});
+    await openDashboard(page);
+    await tab(page, 'Goldmine').click();
+    await expect(page.getByRole('heading', {name: 'Backtesting & calibration'})).toBeVisible();
+    await expect(page.getByText('Score threshold sweep (descriptive only) - model momentum-v2.1.0')).toBeVisible();
+    const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+    expect(overflow, `Goldmine tab with a populated backtest report overflows horizontally by ${overflow}px`).toBeLessThanOrEqual(0);
   });
 }

@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import {describe, test} from 'node:test';
 import {pair} from './helpers/goldmine-fixtures.mjs';
 
-const {replaySignal, replayAll, distribution, performanceReport, wouldBeOpportunityAt, calibrationSweep, defaultCutoff, MIN_EVALUATION_SIGNALS, CALIBRATION_THRESHOLDS} = await import('../lib/goldmine/backtest.ts');
+const {replaySignal, replayAll, distribution, performanceReport, wouldBeOpportunityAt, calibrationSweep, defaultCutoff, MIN_EVALUATION_SIGNALS, MIN_OBSERVED_RETURN_SAMPLES, CALIBRATION_THRESHOLDS} = await import('../lib/goldmine/backtest.ts');
 const {scoreCandidate, MODEL_VERSION} = await import('../lib/goldmine/score.ts');
 const {snapshotFromPair} = await import('../lib/goldmine/snapshot.ts');
 
@@ -247,5 +247,91 @@ describe('calibrationSweep', () => {
     const before = JSON.stringify([evaluation, outcomes]);
     calibrationSweep(evaluation, outcomes, {cutoffAt: NOW - 1});
     assert.equal(JSON.stringify([evaluation, outcomes]), before);
+  });
+
+  // --- Coverage and evidence sufficiency (does not become "sufficient" merely from evaluation count) ----
+
+  test('>= MIN_EVALUATION_SIGNALS evaluation signals with zero observed outcomes is still descriptiveOnly', () => {
+    const evaluation = Array.from({length: MIN_EVALUATION_SIGNALS}, (_, i) => evalSignal('eval' + i, NOW + i, 65, 0.05));
+    // No outcomes recorded for any of them at all (imagine every horizon still pending/unsettled).
+    const result = calibrationSweep(evaluation, [], {cutoffAt: NOW});
+    assert.equal(result.evaluationCount, MIN_EVALUATION_SIGNALS);
+    assert.equal(result.descriptiveOnly, true, 'a large evaluation half with no observed outcomes must never read as sufficient evidence');
+    const row60 = result.rows.find(r => r.threshold === 60);
+    const horizon15m = row60.byHorizon.find(h => h.horizon === '15m');
+    assert.equal(horizon15m.eligible, MIN_EVALUATION_SIGNALS);
+    assert.deepEqual(horizon15m.coverage, {pending: 0, observed: 0, unavailable: 0, missed: 0}, 'missing outcomes are never guessed at as any status');
+    assert.equal(horizon15m.eligibleWithOutcome, 0);
+    assert.ok(horizon15m.eligibleWithOutcome < MIN_OBSERVED_RETURN_SAMPLES);
+    assert.equal(horizon15m.sufficientEvidence, false);
+  });
+
+  test('partial outcome coverage: some signals observed, most pending - reported explicitly, not rounded up to sufficient', () => {
+    const evaluation = Array.from({length: MIN_EVALUATION_SIGNALS}, (_, i) => evalSignal('eval' + i, NOW + i, 65, 0.05));
+    // Only 3 of the 20 have an observed 15m outcome; the rest are pending.
+    const outcomes = evaluation.map((s, i) => i < 3
+      ? outcomeFor(s)
+      : {signalId: s.id, horizon: '15m', status: 'pending', dueAt: s.detectedAt, observedAt: null, price: null, liquidity: 1});
+    const result = calibrationSweep(evaluation, outcomes, {cutoffAt: NOW});
+    const row60 = result.rows.find(r => r.threshold === 60);
+    const horizon15m = row60.byHorizon.find(h => h.horizon === '15m');
+    assert.deepEqual(horizon15m.coverage, {pending: 17, observed: 3, unavailable: 0, missed: 0});
+    assert.equal(horizon15m.eligibleWithOutcome, 3);
+    assert.equal(horizon15m.coverageRatio, Number((3 / 20).toFixed(4)));
+    assert.equal(horizon15m.sufficientEvidence, false, 'only 3 observed returns, below MIN_OBSERVED_RETURN_SAMPLES');
+    assert.equal(result.descriptiveOnly, true);
+  });
+
+  test('a threshold/horizon with eligible signals but zero observed returns is distinguished from one with none eligible', () => {
+    const eligibleNoOutcome = evalSignal('a', NOW, 90, 0.1); // eligible at every threshold up to 90
+    const outcome = {signalId: eligibleNoOutcome.id, horizon: '15m', status: 'unavailable', dueAt: NOW, observedAt: NOW, price: null, liquidity: null};
+    const result = calibrationSweep([eligibleNoOutcome], [outcome], {cutoffAt: NOW - 1, thresholds: [90]});
+    const horizon15m = result.rows[0].byHorizon.find(h => h.horizon === '15m');
+    assert.equal(horizon15m.eligible, 1);
+    assert.deepEqual(horizon15m.coverage, {pending: 0, observed: 0, unavailable: 1, missed: 0});
+    assert.equal(horizon15m.eligibleWithOutcome, 0);
+    assert.equal(horizon15m.returnsPct.count, 0, 'an unavailable outcome never becomes a zero return');
+  });
+
+  test('every outcome status (pending/observed/unavailable/missed) is separated correctly within a threshold/horizon cell', () => {
+    const signals = [
+      evalSignal('a', NOW, 90, 0.1), evalSignal('b', NOW, 90, 0.1),
+      evalSignal('c', NOW, 90, 0.1), evalSignal('d', NOW, 90, 0.1),
+    ];
+    const outcomes = [
+      outcomeFor(signals[0]),
+      {signalId: signals[1].id, horizon: '15m', status: 'pending', dueAt: NOW, observedAt: null, price: null, liquidity: null},
+      {signalId: signals[2].id, horizon: '15m', status: 'unavailable', dueAt: NOW, observedAt: NOW, price: null, liquidity: null},
+      {signalId: signals[3].id, horizon: '15m', status: 'missed', dueAt: NOW, observedAt: null, price: null, liquidity: null},
+    ];
+    const result = calibrationSweep(signals, outcomes, {cutoffAt: NOW - 1, thresholds: [90]});
+    const horizon15m = result.rows[0].byHorizon.find(h => h.horizon === '15m');
+    assert.deepEqual(horizon15m.coverage, {pending: 1, observed: 1, unavailable: 1, missed: 1});
+    assert.equal(horizon15m.eligible, 4);
+  });
+
+  // --- Model-version isolation ------------------------------------------------------------------------
+
+  test('signals from an unsupported model version are excluded from calibration, never reinterpreted under the current thresholds', () => {
+    const current = evalSignal('cur', NOW, 65, 0.1);
+    // A different, unimplemented model version: an assessment shape that would be eligible under this
+    // sweep's rules by coincidence, but must never be scored as if it were the current model's output.
+    const legacy = {...evalSignal('legacy', NOW, 65, 0.1), modelVersion: 'momentum-v1.0.0'};
+    const outcomes = [outcomeFor(current), outcomeFor(legacy)];
+    const result = calibrationSweep([current, legacy], outcomes, {cutoffAt: NOW - 1, thresholds: [60]});
+    assert.equal(result.modelVersion, 'momentum-v2.1.0');
+    assert.equal(result.excludedOtherVersionSignals, 1);
+    assert.equal(result.evaluationCount, 1, 'the legacy-version signal never joins the evaluation half');
+    assert.equal(result.rows[0].eligibleCount, 1);
+  });
+
+  test('an explicit modelVersion option restricts the sweep to that version instead of the imported default', () => {
+    const v1 = {...evalSignal('a', NOW, 65, 0.1), modelVersion: 'momentum-v1.0.0'};
+    const v2 = evalSignal('b', NOW, 65, 0.1);
+    const outcomes = [outcomeFor(v1), outcomeFor(v2)];
+    const result = calibrationSweep([v1, v2], outcomes, {cutoffAt: NOW - 1, thresholds: [60], modelVersion: 'momentum-v1.0.0'});
+    assert.equal(result.modelVersion, 'momentum-v1.0.0');
+    assert.equal(result.excludedOtherVersionSignals, 1);
+    assert.equal(result.evaluationCount, 1);
   });
 });
