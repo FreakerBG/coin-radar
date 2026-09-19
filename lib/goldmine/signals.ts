@@ -5,8 +5,8 @@
 // observations and hold no user data. Prices are provider quotes, not executable prices.
 import {reportFailure} from '../diagnostics';
 import {fetchJson} from '../market';
-import {MODEL_VERSION, type Assessment} from './score';
-import {at, contractSafetySummary, socialEvidence, type CandidateSnapshot} from './snapshot';
+import {MODEL_VERSION, STATES, type Assessment} from './score';
+import {at, contractSafetySummary, socialEvidence, WINDOWS, type CandidateSnapshot, type ContractSafety, type ContractSafetyFacts} from './snapshot';
 
 const MINUTE = 60000, HOUR = 60 * MINUTE;
 export const HORIZONS = [
@@ -128,6 +128,265 @@ const percent = (value: number | null) => value === null ? null : Number((value 
 // other signal.
 function parseSnapshot(raw: string): unknown {
   try { return JSON.parse(raw); } catch { return null; }
+}
+
+// A stored assessment is always written as JSON.stringify of a real Assessment (recordSignals); the same
+// defensive treatment as parseSnapshot applies to any row that predates a field or holds corrupt JSON.
+function parseAssessment(raw: string): unknown {
+  try { return JSON.parse(raw); } catch { return null; }
+}
+
+const isPlainObject = (value: unknown): value is Record<string, unknown> => value !== null && typeof value === 'object' && !Array.isArray(value);
+const isFiniteOrNull = (value: unknown): value is number | null => value === null || (typeof value === 'number' && Number.isFinite(value));
+// Any amount that scoring reads as a magnitude (liquidity, market cap, volume, transaction counts) can
+// never be negative in reality; a negative value here is impossible data, not a small or unusual one, and
+// must be rejected rather than silently fed into scoreCandidate's arithmetic.
+const isNonNegativeOrNull = (value: unknown): value is number | null => value === null || (typeof value === 'number' && Number.isFinite(value) && value >= 0);
+const isNonNegativeIntOrNull = (value: unknown): value is number | null => isNonNegativeOrNull(value) && (value === null || Number.isInteger(value));
+const isFlow = (value: unknown): boolean => isPlainObject(value) && isNonNegativeIntOrNull(value.buys) && isNonNegativeIntOrNull(value.sells);
+const everyWindow = (value: unknown, check: (window: unknown) => boolean): boolean => isPlainObject(value) && WINDOWS.every(window => check(value[window]));
+
+const CONTRACT_SAFETY_STATUSES = ['unavailable', 'unsafe', 'verified'] as const;
+
+// A stored contractSafety's `facts` object, when present. Every fact is independently nullable at write
+// time (lib/goldmine/contract-safety.ts), so validation only constrains the type/sign of whatever is
+// present, never requires every fact to be non-null.
+function isValidContractSafetyFacts(value: unknown): value is ContractSafetyFacts {
+  if (!isPlainObject(value)) return false;
+  const boolOrNull = (v: unknown) => v === null || typeof v === 'boolean';
+  const pctOrNull = (v: unknown) => v === null || (typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= 100);
+  if (!boolOrNull(value.mintAuthorityRenounced) || !boolOrNull(value.freezeAuthorityRenounced) || !boolOrNull(value.rugged)) return false;
+  if (!pctOrNull(value.lpLockedPct) || !pctOrNull(value.topHolderPct) || !pctOrNull(value.topHoldersPct) || !pctOrNull(value.creatorHoldingsPct)) return false;
+  if (!isNonNegativeOrNull(value.totalMarketLiquidityUsd)) return false;
+  if (!isNonNegativeIntOrNull(value.insiderNetworksDetected)) return false;
+  if (!isFiniteOrNull(value.providerScoreNormalized)) return false;
+  if (!Array.isArray(value.providerRisks) || !value.providerRisks.every(risk => isPlainObject(risk) && typeof risk.name === 'string' && typeof risk.level === 'string' && typeof risk.description === 'string')) return false;
+  return true;
+}
+
+// contractSafety is a real discriminated union (lib/goldmine/snapshot.ts), not just an object with a
+// string `status`. `scoreCandidate` (lib/goldmine/score.ts:206-208) dereferences `source`/`failedChecks`
+// directly for 'unsafe' and 'verified' without a further type guard - a stored row whose status claims
+// 'unsafe' but omits `failedChecks` (or stores it as something other than a string[]) throws there. Every
+// branch is validated by its actual required shape; any other status string is rejected outright.
+function isValidContractSafety(value: unknown): value is ContractSafety {
+  if (!isPlainObject(value)) return false;
+  if (typeof value.status !== 'string' || !(CONTRACT_SAFETY_STATUSES as readonly string[]).includes(value.status)) return false;
+  if (value.status === 'unavailable') return value.source === null;
+  if (!(typeof value.source === 'string' && value.source) || typeof value.checkedAt !== 'number' || !Number.isFinite(value.checkedAt)) return false;
+  if (!isValidContractSafetyFacts(value.facts)) return false;
+  if (value.status === 'unsafe') return Array.isArray(value.failedChecks) && value.failedChecks.length > 0 && value.failedChecks.every(check => typeof check === 'string');
+  return true; // 'verified'
+}
+
+// Structural validation of a stored, parsed snapshot value against the fields replay (scoreCandidate) and
+// reporting actually read. This is not a full schema validator: it rejects the shapes a real
+// CandidateSnapshot can never be (an array, `{}`, `null`, a wrong primitive type, a missing nested field,
+// an impossible negative amount, an unrecognized contractSafety status or a status-specific field of the
+// wrong shape) without re-deriving every rule snapshot.ts already enforces at write time.
+// `typeof value === 'object'` alone is not enough - `[]`, `{}` and a partially-shaped object all pass
+// that check but would throw or silently misbehave once scoreCandidate reads into them; a bare
+// `typeof status === 'string'` check on contractSafety is not enough either - `{status: 'unsafe'}` with no
+// `failedChecks` passes that check and throws inside scoreCandidate's safetyRisk component.
+export function isValidStoredSnapshot(value: unknown): value is CandidateSnapshot {
+  if (!isPlainObject(value)) return false;
+  if (typeof value.address !== 'string' || !value.address) return false;
+  if (typeof value.pair !== 'string' || !value.pair) return false;
+  if (typeof value.symbol !== 'string') return false;
+  if (typeof value.observedAt !== 'number' || !Number.isFinite(value.observedAt)) return false;
+  if (typeof value.promoted !== 'boolean') return false;
+  if (value.priceUsd !== null && (typeof value.priceUsd !== 'number' || !Number.isFinite(value.priceUsd) || value.priceUsd <= 0)) return false;
+  if (!isNonNegativeOrNull(value.liquidityUsd) || !isNonNegativeOrNull(value.marketCapUsd) || !isNonNegativeOrNull(value.fdvUsd) || !isNonNegativeOrNull(value.ageMinutes)) return false;
+  if (!everyWindow(value.volumeUsd, isNonNegativeOrNull)) return false;
+  if (!everyWindow(value.priceChangePct, v => isFiniteOrNull(v) && (v === null || v >= -100))) return false;
+  if (!everyWindow(value.txns, isFlow)) return false;
+  if (!isPlainObject(value.links) || !isNonNegativeIntOrNull(value.links.websites) || value.links.websites === null || !isNonNegativeIntOrNull(value.links.socials) || value.links.socials === null) return false;
+  if (!isValidContractSafety(value.contractSafety)) return false;
+  return true;
+}
+
+const KNOWN_STATES: readonly string[] = STATES;
+// Assessment score is the sum of every component's points, each already clamped to its own max
+// (lib/goldmine/score.ts liquidityVolume/volumeAcceleration/buyerPressure/ageValuation/socialMomentum/
+// safetyRisk: 20+20+20+15+10+15 = 100), so a real assessment's score can never fall outside [0, 100].
+const MAX_SCORE = 100;
+
+// Structural validation of a stored, parsed assessment value against the fields replay and reporting
+// actually read (modelVersion, state, score, opportunity, blockers[].id, address/pair/symbol for display).
+// Same rationale as isValidStoredSnapshot: reject arrays, `{}`, `null`, wrong-typed/missing fields, an
+// unrecognized `state` (state is a closed enum - STATES - not an arbitrary string) and a score outside the
+// domain scoreCandidate can ever produce.
+export function isValidStoredAssessment(value: unknown): value is Assessment {
+  if (!isPlainObject(value)) return false;
+  if (typeof value.modelVersion !== 'string' || !value.modelVersion) return false;
+  if (typeof value.address !== 'string' || typeof value.pair !== 'string' || typeof value.symbol !== 'string') return false;
+  if (typeof value.state !== 'string' || !KNOWN_STATES.includes(value.state)) return false;
+  if (typeof value.score !== 'number' || !Number.isFinite(value.score) || value.score < 0 || value.score > MAX_SCORE) return false;
+  if (typeof value.opportunity !== 'boolean') return false;
+  const isGate = (gate: unknown) => isPlainObject(gate) && typeof gate.id === 'string' && gate.id.length > 0 && typeof gate.message === 'string';
+  if (!Array.isArray(value.blockers) || !value.blockers.every(isGate)) return false;
+  if (!Array.isArray(value.rejections) || !value.rejections.every(isGate)) return false;
+  if (!Array.isArray(value.components) || !Array.isArray(value.risks)) return false;
+  return true;
+}
+
+export const OUTCOME_STATUSES = ['pending', 'observed', 'unavailable', 'missed'] as const;
+const KNOWN_HORIZONS: readonly string[] = HORIZONS.map(h => h.id);
+
+// Structural validation of a stored, parsed outcome row against exactly the shape evaluateOutcomes ever
+// writes (lib/goldmine/signals.ts): a known status, a known horizon, and status-appropriate nullability
+// of observed_at/price/liquidity. An unrecognized status string (a corrupt or hand-edited row) must never
+// be reinterpreted as 'pending' - that would silently inflate pending coverage and hide the corruption.
+export function isValidStoredOutcomeRow(row: {horizon: string; status: string; observed_at: number | null; price: number | null; liquidity: number | null}): boolean {
+  if (!KNOWN_HORIZONS.includes(row.horizon)) return false;
+  if (!(OUTCOME_STATUSES as readonly string[]).includes(row.status)) return false;
+  if (row.status === 'observed') {
+    if (typeof row.observed_at !== 'number' || !Number.isFinite(row.observed_at)) return false;
+    if (typeof row.price !== 'number' || !Number.isFinite(row.price) || row.price <= 0) return false;
+    if (row.liquidity !== null && (typeof row.liquidity !== 'number' || !Number.isFinite(row.liquidity) || row.liquidity < 0)) return false;
+    return true;
+  }
+  if (row.status === 'unavailable') {
+    // evaluateOutcomes always stamps observed_at when a batch responds, even when no usable price/pool
+    // was found (that is exactly what 'unavailable' records); price and liquidity are always null.
+    return typeof row.observed_at === 'number' && Number.isFinite(row.observed_at) && row.price === null && row.liquidity === null;
+  }
+  // 'pending' and 'missed' never carry an observation.
+  return row.observed_at === null && row.price === null && row.liquidity === null;
+}
+
+export type OutcomeStatus = 'pending' | 'observed' | 'unavailable' | 'missed';
+export type StoredSignalRow = {
+  id: string; address: string; pair: string; symbol: string; modelVersion: string; state: string;
+  score: number; opportunity: boolean; detectedAt: number; detectedPrice: number;
+  snapshot: CandidateSnapshot; assessment: Assessment;
+};
+export type StoredOutcomeRow = {signalId: string; horizon: string; status: OutcomeStatus; dueAt: number; observedAt: number | null; price: number | null; liquidity: number | null};
+
+// Signals are read in fixed-size pages ordered by (detected_at, id) DESCENDING - a stable keyset cursor,
+// never an OFFSET, so a page boundary is unaffected by rows inserted or settled between pages (an OFFSET
+// page can skip or repeat rows when the underlying order changes mid-read; a keyset cursor cannot, because
+// it names the last row actually seen rather than a position). Descending order matters whenever the read
+// is bounded and truncates: it must keep the newest signals (the ones still relevant to calibration's
+// chronological split and to any operator debugging recent behavior), never silently drop them in favor of
+// the oldest rows still fitting inside the cap. Signals sharing the same detected_at are still totally
+// ordered (and never split incorrectly) because id is the tiebreaker in both the query and the cursor.
+// `signals` is reversed back to ascending order (normalizeAscending below) before it is returned, so every
+// consumer (replay, performanceReport, calibrationSweep's chronological split) sees the same chronological
+// order it always has.
+export const SIGNAL_READ_BATCH_SIZE = 200;
+// A safety bound on total pages read by one call, so a single request cannot loop indefinitely against an
+// unbounded table and so worst-case memory/query cost stays bounded and documented (see
+// MAX_RETAINED_SIGNALS and the query-count comment on readAllSignalsWithOutcomes below). This does not
+// delete or archive anything (no retention policy exists); once stored history exceeds
+// SIGNAL_READ_BATCH_SIZE * MAX_SIGNAL_READ_BATCHES rows, the read stops (keeping the newest rows) and
+// reports `truncated: true` rather than silently reading forever, an unbounded number of D1 queries, or an
+// unbounded amount of retained JSON.
+export const MAX_SIGNAL_READ_BATCHES = 10;
+// The largest number of signal rows (each holding a full snapshot + assessment, ~4 KB of JSON per the
+// SIGNALS_PER_INSERT comment above) any one call ever holds in memory at once. At the current constants
+// (200 * 10) that is 2,000 rows: roughly 8 MB of raw JSON text, and measured in tests/goldmine-backtest-
+// limits.test.mjs at well under 20 MB of parsed JS objects in the Node test harness - a large margin below
+// a Workers isolate's 128 MB memory limit even before accounting for the difference between Node's and
+// V8-on-Workers' per-object overhead (see that test file's comment for the measurement method and why the
+// Node number is treated as an upper *approximation*, not an exact Workers figure).
+export const MAX_RETAINED_SIGNALS = SIGNAL_READ_BATCH_SIZE * MAX_SIGNAL_READ_BATCHES;
+// Outcome lookups are batched by signal id, well under D1's bound statement parameter/payload limits, so
+// one read never binds every signal id ever recorded into a single json_each(?) value.
+export const OUTCOME_ID_BATCH_SIZE = 200;
+// Worst-case D1 query count for one readAllSignalsWithOutcomes call, at the constants above:
+//   MAX_SIGNAL_READ_BATCHES (signal pages, at most 10)
+//   + ceil(MAX_RETAINED_SIGNALS / OUTCOME_ID_BATCH_SIZE) (outcome id batches, at most 10)
+//   = 20 queries, independent of how much history is actually stored.
+// This is a conservative, documented budget chosen without assuming a paid Cloudflare plan - it leaves
+// wide margin below any per-invocation D1/subrequest ceiling a Workers Free plan could plausibly impose,
+// and is verified directly in tests/goldmine-backtest-limits.test.mjs (worst-case query count assertion).
+export const MAX_WORST_CASE_QUERIES = MAX_SIGNAL_READ_BATCHES + Math.ceil(MAX_RETAINED_SIGNALS / OUTCOME_ID_BATCH_SIZE);
+
+type SignalRow = {id: string; address: string; pair: string; symbol: string; model_version: string; state: string; score: number; opportunity: number; detected_at: number; detected_price: number; snapshot: string; assessment: string};
+type OutcomeRow = {signal_id: string; horizon: string; status: string; due_at: number; observed_at: number | null; price: number | null; liquidity: number | null};
+
+// Every stored signal and its outcomes, for read-only backtesting/calibration (lib/goldmine/backtest.ts).
+// Unlike readTracking (last 50 signals, current-model-version stats only), this reads every signal up to
+// the bound above, across every model version, so per-version and full-history analysis is possible.
+//
+// A row is skipped (never entered into `signals`, counted in `skippedMalformedSignals`) when any of the
+// following holds, so one unexpected historical row can never crash the read for every other row or enter
+// replay/calibration with data scoreCandidate cannot safely process:
+//   - its stored snapshot or assessment JSON is missing, corrupt, or structurally not a real
+//     CandidateSnapshot/Assessment (isValidStoredSnapshot/isValidStoredAssessment, including a rejected
+//     contractSafety shape, an unknown assessment `state`, a non-finite/negative amount, or a score outside
+//     [0, 100]);
+//   - the row's own `model_version` or `state` column disagrees with the parsed assessment's `modelVersion`/
+//     `state` - replay and calibration read the column for filtering/grouping but the assessment for
+//     content, so a mismatch here would silently let one thing be replayed/reported as if it were the
+//     other; a mismatched row is malformed data, not read under either interpretation;
+//   - `detected_price` is not a finite, positive number (every return computation divides by it).
+export async function readAllSignalsWithOutcomes(database: D1Database, options: {signalBatchSize?: number; maxSignalBatches?: number; outcomeIdBatchSize?: number} = {}): Promise<{signals: StoredSignalRow[]; outcomes: StoredOutcomeRow[]; skippedMalformedSignals: number; skippedMalformedOutcomes: number; truncated: boolean}> {
+  const signalBatchSize = options.signalBatchSize ?? SIGNAL_READ_BATCH_SIZE;
+  const maxSignalBatches = options.maxSignalBatches ?? MAX_SIGNAL_READ_BATCHES;
+  const outcomeIdBatchSize = options.outcomeIdBatchSize ?? OUTCOME_ID_BATCH_SIZE;
+
+  let skippedMalformedSignals = 0;
+  let truncated = false;
+  const signals: StoredSignalRow[] = []; // collected newest-first; reversed to ascending before return
+  let cursor: {detectedAt: number; id: string} | null = null;
+
+  for (let batch = 0; batch < maxSignalBatches; batch++) {
+    // LIMIT signalBatchSize + 1 is a lookahead: fetching one extra row is the only reliable way to tell
+    // "the history ends exactly at the cap" (no extra row comes back: truncated must stay false) apart
+    // from "the cap falls mid-history" (an extra row comes back: there is strictly more data beyond what
+    // this call will keep). Comparing rows.length to signalBatchSize without that lookahead cannot make
+    // this distinction, which is exactly how an earlier version of this function misreported an
+    // exact-cap-sized history as truncated.
+    const lookahead = signalBatchSize + 1;
+    const query: D1PreparedStatement = cursor
+      ? database.prepare('SELECT id, address, pair, symbol, model_version, state, score, opportunity, detected_at, detected_price, snapshot, assessment FROM goldmine_signals WHERE detected_at < ? OR (detected_at = ? AND id < ?) ORDER BY detected_at DESC, id DESC LIMIT ?')
+        .bind(cursor.detectedAt, cursor.detectedAt, cursor.id, lookahead)
+      : database.prepare('SELECT id, address, pair, symbol, model_version, state, score, opportunity, detected_at, detected_price, snapshot, assessment FROM goldmine_signals ORDER BY detected_at DESC, id DESC LIMIT ?')
+        .bind(lookahead);
+    const fetched: SignalRow[] = (await query.all<SignalRow>()).results;
+    if (!fetched.length) break;
+    const hasMore = fetched.length > signalBatchSize;
+    const rows = hasMore ? fetched.slice(0, signalBatchSize) : fetched; // drop the lookahead row itself
+    for (const row of rows) {
+      const snapshot = parseSnapshot(row.snapshot);
+      const assessment = parseAssessment(row.assessment);
+      if (!isValidStoredSnapshot(snapshot) || !isValidStoredAssessment(assessment)) { skippedMalformedSignals++; continue; }
+      if (row.model_version !== assessment.modelVersion || row.state !== assessment.state) { skippedMalformedSignals++; continue; }
+      if (typeof row.detected_price !== 'number' || !Number.isFinite(row.detected_price) || row.detected_price <= 0) { skippedMalformedSignals++; continue; }
+      signals.push({
+        id: row.id, address: row.address, pair: row.pair, symbol: row.symbol, modelVersion: row.model_version, state: row.state,
+        score: row.score, opportunity: row.opportunity === 1, detectedAt: row.detected_at, detectedPrice: row.detected_price,
+        snapshot, assessment,
+      });
+    }
+    const last = rows[rows.length - 1];
+    cursor = {detectedAt: last.detected_at, id: last.id};
+    if (!hasMore) break; // nothing past this page: the read is complete, whatever the page count so far
+    if (batch === maxSignalBatches - 1) truncated = true; // more rows exist beyond the allowed page budget
+  }
+  signals.reverse(); // newest-first collection order -> ascending chronological order for every consumer
+
+  const outcomes: StoredOutcomeRow[] = [];
+  let skippedMalformedOutcomes = 0;
+  for (let index = 0; index < signals.length; index += outcomeIdBatchSize) {
+    const ids = signals.slice(index, index + outcomeIdBatchSize).map(signal => signal.id);
+    const rows = (await database.prepare('SELECT signal_id, horizon, status, due_at, observed_at, price, liquidity FROM goldmine_outcomes WHERE signal_id IN (SELECT value FROM json_each(?))')
+      .bind(JSON.stringify(ids)).all<OutcomeRow>()).results;
+    for (const row of rows) {
+      // An outcome row whose status/horizon/nullability does not match exactly what evaluateOutcomes ever
+      // writes is malformed data, not a value to guess at - it is excluded from both the returned list and
+      // every downstream coverage/return computation, and counted separately so it is never mistaken for
+      // (or silently folded into) 'pending' coverage.
+      if (!isValidStoredOutcomeRow(row)) { skippedMalformedOutcomes++; continue; }
+      outcomes.push({
+        signalId: row.signal_id, horizon: row.horizon, status: row.status as OutcomeStatus,
+        dueAt: row.due_at, observedAt: row.observed_at, price: row.price, liquidity: row.liquidity,
+      });
+    }
+  }
+  return {signals, outcomes, skippedMalformedSignals, skippedMalformedOutcomes, truncated};
 }
 
 // Recent signals with their outcomes, and per-state outcome counts for the current model version.

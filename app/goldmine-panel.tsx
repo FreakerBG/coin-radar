@@ -3,6 +3,7 @@ import {useCallback,useEffect,useRef,useState} from 'react';
 import {Gem,RefreshCw,ShieldCheck,ShieldAlert,ArrowUpRight,Radio} from 'lucide-react';
 import {toast} from 'sonner';
 import {isStale,opportunitiesOf,scanState,type PostedCandidate} from '@/lib/goldmine/dashboard-view';
+import {cellStatusLabel,coverageLabel,dataQualityWarning,hasDataQualityWarning,hasEnoughData,performanceRowsWithData,type BacktestReport} from '@/lib/goldmine/backtest-view';
 import type {ContractSafetySummary} from '@/lib/goldmine/snapshot';
 
 type ScanResponse = {
@@ -74,14 +75,119 @@ async function fetchTracking(): Promise<Tracking | {error: string}> {
   }
 }
 
+// Fetches the read-only backtesting/calibration report. Same plain-function pattern as fetchTracking:
+// state updates happen in the caller's effect/callback, never synchronously during render.
+async function fetchBacktest(): Promise<BacktestReport | {error: string}> {
+  try {
+    const r = await fetch('/api/goldmine/backtest');
+    const d = await r.json() as BacktestReport & {error?: string};
+    if (!r.ok || d.error) return {error: d.error || 'Backtest report unavailable.'};
+    return d;
+  } catch {
+    return {error: 'Cannot reach Goldmine. Check your connection and retry.'};
+  }
+}
+
+const pct = (value: number | null) => value === null ? '—' : `${value > 0 ? '+' : ''}${value.toFixed(1)}%`;
+
+function BacktestingSection({report, error, onRetry}: {report: BacktestReport | null; error: string; onRetry: () => void}) {
+  return (
+    <>
+      <div className="panel-head" style={{marginTop: 0}}>
+        <h2 style={{margin: 0}}>Backtesting &amp; calibration</h2>
+        <span className="muted" style={{fontSize: 13}}>Read-only replay and outcome analysis of stored signals - a research diagnostic, not a forecast.</span>
+      </div>
+      {error && (
+        <div className="banner" role="alert" style={{margin: '16px 22px 0'}}>
+          {error}
+          <button className="btn" style={{marginLeft: 12}} onClick={onRetry}>Retry</button>
+        </div>
+      )}
+      {!error && !hasEnoughData(report) && (
+        <div className="empty"><h3>Not enough recorded signals yet</h3><span>Backtesting needs a history of tracked signals to report on. Run scans over time and check back here.</span></div>
+      )}
+      {!error && hasEnoughData(report) && report && (
+        <div style={{padding: '0 22px 22px'}}>
+          {hasDataQualityWarning(report) && (
+            <div className="banner" role="status" style={{margin: '0 0 12px'}}>{dataQualityWarning(report)}</div>
+          )}
+          <p className="muted" style={{fontSize: 13}}>
+            {report.totalSignals} signals recorded. Replay (model {report.modelVersion}): {report.replay.matched}/{report.replay.currentVersionSignals} current-version signals reproduce their stored assessment exactly
+            {report.replay.mismatchedCount > 0 ? `, ${report.replay.mismatchedCount} mismatched${report.replay.mismatchedSampleTruncated ? ` (showing ${report.replay.mismatchedSample.length})` : ''}` : ''}.
+            {report.replay.unsupportedCount > 0 && ` ${report.replay.unsupportedCount} signals from other model versions (${report.replay.unsupportedModelVersions.join(', ')}) have no supported replay.`}
+            {report.replay.invalidCount > 0 && ` ${report.replay.invalidCount} signal${report.replay.invalidCount === 1 ? '' : 's'} could not be replayed and ${report.replay.invalidCount === 1 ? 'was' : 'were'} skipped.`}
+          </p>
+
+          <h3 style={{fontSize: 14, margin: '14px 0 6px'}}>Outcome performance by model version, state and horizon</h3>
+          <div style={{overflowX: 'auto'}}>
+            <table className="mono" style={{fontSize: 12, borderCollapse: 'collapse', width: '100%'}}>
+              <thead><tr><th style={{textAlign: 'left'}}>Model</th><th style={{textAlign: 'left'}}>State</th><th style={{textAlign: 'left'}}>Horizon</th><th style={{textAlign: 'left'}}>Coverage</th><th style={{textAlign: 'right'}}>Mean</th><th style={{textAlign: 'right'}}>Median</th><th style={{textAlign: 'right'}}>Stdev</th></tr></thead>
+              <tbody>
+                {performanceRowsWithData(report.performance).map(bucket => (
+                  <tr key={`${bucket.modelVersion}:${bucket.state}:${bucket.horizon}`}>
+                    <td className="muted" style={{whiteSpace: 'nowrap'}}>{bucket.modelVersion}</td>
+                    <td>{bucket.state}</td>
+                    <td>{bucket.horizon}</td>
+                    <td className="muted" style={{whiteSpace: 'nowrap'}}>{coverageLabel(bucket.coverage)}</td>
+                    <td style={{textAlign: 'right'}}>{bucket.returnsPct.count ? `${pct(bucket.returnsPct.mean)} (n=${bucket.returnsPct.count})${bucket.returnsPct.count === 1 ? ' single sample' : ''}` : '—'}</td>
+                    <td style={{textAlign: 'right'}}>{pct(bucket.returnsPct.median)}</td>
+                    <td style={{textAlign: 'right'}}>{bucket.returnsPct.stdev === null ? '—' : `${bucket.returnsPct.stdev.toFixed(1)}pp`}</td>
+                  </tr>
+                ))}
+                {!performanceRowsWithData(report.performance).length && <tr><td colSpan={7} className="muted">No outcomes recorded yet.</td></tr>}
+              </tbody>
+            </table>
+          </div>
+
+          {report.calibration && (
+            <>
+              <h3 style={{fontSize: 14, margin: '18px 0 6px'}}>Score threshold sweep (descriptive only) - model {report.calibration.modelVersion}</h3>
+              <p className="muted" style={{fontSize: 12, margin: '0 0 8px'}}>
+                Reference (earlier) signals: {report.calibration.referenceCount}. Evaluation (later) signals: {report.calibration.evaluationCount}, reported below only.
+                {report.calibration.excludedOtherVersionSignals > 0 && ` ${report.calibration.excludedOtherVersionSignals} signals from other model versions were excluded from this calibration.`}
+                {' '}{report.calibration.sufficientCellCount}/{report.calibration.totalCellCount} threshold/horizon cells have sufficient observed evidence ({report.calibration.insufficientCellCount} insufficient, {report.calibration.notEvaluableCellCount} not evaluable).
+                {report.calibration.descriptiveOnly && ' Descriptive only: at least one evaluable cell (or the evaluation half itself) does not yet meet the evidence requirement - a cell shown as sufficient does not make the rest of this table a validated result.'}
+              </p>
+              <div style={{overflowX: 'auto'}}>
+                <table className="mono" style={{fontSize: 12, borderCollapse: 'collapse', width: '100%'}}>
+                  <thead><tr><th style={{textAlign: 'left'}}>If threshold were</th><th style={{textAlign: 'right'}}>Eligible</th><th style={{textAlign: 'left'}}>15m mean (n obs/elig)</th><th style={{textAlign: 'left'}}>1h mean (n obs/elig)</th><th style={{textAlign: 'left'}}>6h mean (n obs/elig)</th><th style={{textAlign: 'left'}}>24h mean (n obs/elig)</th></tr></thead>
+                  <tbody>
+                    {report.calibration.rows.map(row => (
+                      <tr key={row.threshold}>
+                        <td>{row.threshold}</td>
+                        <td style={{textAlign: 'right'}}>{row.eligibleCount}</td>
+                        {row.byHorizon.map(h => (
+                          <td key={h.horizon} title={`${h.coverage.observed} observed, ${h.coverage.pending} pending, ${h.coverage.unavailable} unavailable, ${h.coverage.missed} missed`}>
+                            {h.returnsPct.count ? `${pct(h.returnsPct.mean)} (${h.returnsPct.count}/${h.eligible})` : `— (0/${h.eligible})`}
+                            {h.cellStatus !== 'sufficient' && <span className="muted"> {cellStatusLabel(h.cellStatus)}</span>}
+                          </td>
+                        ))}
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </>
+          )}
+
+          <p className="muted" style={{fontSize: 11, marginTop: 14}}>{report.limitations.join(' ')}</p>
+        </div>
+      )}
+    </>
+  );
+}
+
 export default function GoldminePanel() {
   const [tracking, setTracking] = useState<Tracking | null>(null);
   const [historyError, setHistoryError] = useState('');
   const [scan, setScan] = useState<ScanResponse | null>(null);
   const [scanError, setScanError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [backtest, setBacktest] = useState<BacktestReport | null>(null);
+  const [backtestError, setBacktestError] = useState('');
   const historyId = useRef(0);
   const scanId = useRef(0);
+  const backtestId = useRef(0);
   const scanning = useRef(false);
   // Read only inside effects/handlers, never during render, so staleness can be shown without an
   // impure Date.now() call in the render body; ticks slowly since a minute of drift here is harmless.
@@ -96,6 +202,15 @@ export default function GoldminePanel() {
   }, []);
   const retryHistory = useCallback(() => { const id = ++historyId.current; void fetchTracking().then(result => applyTracking(id, result)); }, [applyTracking]);
   useEffect(() => { const id = ++historyId.current; void fetchTracking().then(result => applyTracking(id, result)); }, [applyTracking]);
+
+  const applyBacktest = useCallback((id: number, result: BacktestReport | {error: string}) => {
+    if (id !== backtestId.current) return;
+    if ('error' in result) { setBacktestError(result.error); return; }
+    setBacktest(result);
+    setBacktestError('');
+  }, []);
+  const retryBacktest = useCallback(() => { const id = ++backtestId.current; void fetchBacktest().then(result => applyBacktest(id, result)); }, [applyBacktest]);
+  useEffect(() => { const id = ++backtestId.current; void fetchBacktest().then(result => applyBacktest(id, result)); }, [applyBacktest]);
 
   const runScan = useCallback(async () => {
     if (scanning.current) return;
@@ -200,6 +315,8 @@ export default function GoldminePanel() {
         {(scan?.disclaimer || tracking?.disclaimer) ?? 'Research signal from provider snapshots, not an executable price, a prediction or financial advice. No outcome or profit is implied.'}
         {' '}Outcome tracking is retrospective model evaluation, not a live price feed.
       </div>
+
+      <BacktestingSection report={backtest} error={backtestError} onRetry={retryBacktest} />
     </section>
   );
 }
