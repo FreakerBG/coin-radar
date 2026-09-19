@@ -100,20 +100,28 @@ describe('worst-case query count and retained data, at the real constants', () =
     assert.ok(d1.queries.every(sql => /^\s*SELECT/i.test(sql)), 'read-only, even at scale');
   });
 
-  // Approximate peak retained memory, measured in this Node test harness as a proxy for a Workers isolate.
-  // This is deliberately conservative and documented as an *approximation*: V8-in-Node and V8-in-a-Workers-
-  // isolate have different baseline/per-object overhead, so this number is not a Workers measurement, but
-  // the margin below is large enough (single-digit MB vs a 128 MB isolate limit) to absorb that difference.
-  test('approximate peak retained data at the cap stays with large margin under a 128 MB Workers isolate limit', async () => {
+  // This measures the SERIALIZED JSON TEXT SIZE of what readAllSignalsWithOutcomes returns at the cap -
+  // NOT retained heap, and not a Workers-isolate memory measurement of any kind. It is a deterministic,
+  // CI-safe fixture-size check: JSON.stringify().length is exact and reproducible, unlike a heap
+  // measurement (which needs --expose-gc, is sensitive to GC timing, and would be flaky in normal CI, so
+  // it is deliberately not asserted here).
+  //
+  // This number is smaller than actual retained heap (parsed JS objects carry additional per-object/
+  // per-property overhead beyond their JSON form) and is not a substitute for one. A separate, one-off
+  // diagnostic measurement (Node's --expose-gc, actual retained heap, run outside normal CI, not
+  // committed as a test) observed approximately 16.4 MB of retained heap for a comparable 2,000-signal /
+  // 8,000-outcome dataset with RugCheck facts and risks populated. Neither that Node-heap number nor this
+  // JSON-size number is a measurement of a Cloudflare Workers V8 isolate's actual memory use - Node's V8
+  // and a Workers isolate's V8 have different baseline and per-object overhead - so neither is formal
+  // proof of peak Workers memory. Both are treated as conservative approximations with a wide margin
+  // (single-digit-to-low-double-digit MB) below a Workers isolate's 128 MB limit, not as an exact bound.
+  test('serialized JSON text size of the retained data at the cap stays with large margin under a 128 MB Workers isolate limit', async () => {
     const now = clock.now();
     for (let i = 0; i < MAX_RETAINED_SIGNALS; i++) insertSignal(`sig-${String(i).padStart(5, '0')}`, now + i);
     const result = await readAllSignalsWithOutcomes(d1);
     assert.equal(result.signals.length, MAX_RETAINED_SIGNALS);
-    // A rough but conservative proxy for retained heap: the JSON-serialized size of what is held (parsed
-    // JS objects are typically larger than their JSON form, but by a small constant factor, not orders of
-    // magnitude) - measured directly rather than asserted from the SIGNALS_PER_INSERT "~4 KB" comment.
-    const approxBytes = Buffer.byteLength(JSON.stringify(result.signals)) + Buffer.byteLength(JSON.stringify(result.outcomes));
-    const approxMB = approxBytes / (1024 * 1024);
-    assert.ok(approxMB < 30, `approx ${approxMB.toFixed(1)} MB of JSON for ${MAX_RETAINED_SIGNALS} signals - expected well under 30 MB (large margin below a 128 MB Workers isolate limit even accounting for parsed-object overhead)`);
+    const serializedBytes = Buffer.byteLength(JSON.stringify(result.signals)) + Buffer.byteLength(JSON.stringify(result.outcomes));
+    const serializedMB = serializedBytes / (1024 * 1024);
+    assert.ok(serializedMB < 30, `serialized JSON text for ${MAX_RETAINED_SIGNALS} signals was ${serializedMB.toFixed(1)} MB - expected well under 30 MB. This is a JSON-text-size check, not a heap measurement; see the comment above for what it does and does not prove.`);
   });
 });
