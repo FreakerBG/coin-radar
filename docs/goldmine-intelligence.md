@@ -94,6 +94,29 @@ RugCheck's own score or verdict is never read. Instead its facts feed our own de
 - Due outcomes are grouped by recorded pool and read in batches of at most 30 pools, earliest-closing window first (then pool and token), with at most 5 requests per scan, sent in parallel. A failed batch leaves only its own outcomes pending; pools beyond the cap are reported as `deferred` and read by the next scan while their windows are open.
 - Evaluation runs only when someone scans, so without a scheduler many outcomes will be `missed`. Prices are provider quotes, not executable prices; returns ignore fees, slippage and liquidity.
 
+## 4b. Dashboard review (Stage 03C audit of app/goldmine-panel.tsx)
+
+No dashboard code changed in Stage 03C; this is an audit against Stage 03B's requirements, for a future,
+separately-scoped dashboard change:
+
+- **No auto-refresh.** `GET /api/goldmine` (recent signals) is fetched once on mount and again after a
+  manual "Scan now" click; nothing polls it. Once an automated scan exists (section 6b.1), signals it
+  records will not appear until the user reloads or scans manually themselves — the dashboard has no way
+  to reflect background activity.
+- **`stats` is computed but never rendered.** `readTracking` (lib/goldmine/signals.ts) returns per-state,
+  per-horizon outcome statistics (pending/observed/unavailable/missed counts, mean return, positive
+  share); `GET /api/goldmine` serves them, but `app/goldmine-panel.tsx` never reads `tracking.stats` at
+  all. This is the most direct outcome-visibility gap for evaluating whether the model is any good.
+- **No manual/automated distinction.** The "Last scan" line only reflects the current browser session's
+  own POST response; there is no way to tell from the dashboard whether the most recent recorded signal
+  came from a person or an automated caller.
+- **Missing/rejected candidates are invisible in history.** "Recent opportunities" filters to
+  `signal.opportunity`; a REJECTED or non-actionable candidate is recorded (for future gate evaluation)
+  but never shown anywhere in the UI, so a user cannot see why a token they noticed never appeared.
+- **Mobile usability:** verified fine at the layout level — `npm run test:browser` includes Goldmine at
+  320/360/390/768/1440px with no horizontal overflow — but this is a base viewport check, not a review of
+  information density or touch target size specific to the Goldmine cards.
+
 ## 5. Extension points
 
 - **Contract safety dashboard:** built (section 6, 03B). `GET /api/goldmine`'s `signals[]` now includes each signal's `contractSafety`, reduced to the client-facing `ContractSafetySummary` shape (`{status}` for verified/unavailable, `{status, reason}` for unsafe) - never the stored `facts`, `failedChecks` wording beyond that reason, or RugCheck's own `providerRisks`/`providerScoreNormalized`, which stay server-side only. A deeper view would need a new, deliberately-scoped field, not widening this one.
@@ -106,13 +129,79 @@ RugCheck's own score or verdict is never read. Instead its facts feed our own de
 
 | Stage | Scope | Needs approval |
 | --- | --- | --- |
-| 03A (this) | Snapshot model, Momentum Score v2, hard gates, states, signal and outcome tracking, explanations. | No |
+| 03A | Snapshot model, Momentum Score v2, hard gates, states, signal and outcome tracking, explanations. | No |
 | 03B | Contract safety evidence (mint and freeze authority, top-holder concentration, LP status), so opportunities can exist (done, section 3b); Goldmine dashboard panel with explanations and outcome history (done, app/goldmine-panel.tsx). | Safety provider — approved and implemented: RugCheck's public API (section 3b) |
-| 03C | Scheduled scans and outcome evaluation, and retention of old signals. | Confirm Sites supports Worker cron triggers |
+| 03C (this) | Scan pipeline extracted for reuse; a fail-closed, secret-protected automated entry point (`POST /api/goldmine/scheduled`) built and tested. **Actually triggering it on a schedule remains blocked** (section 6b.1). | Platform confirmation of a working scheduler |
 | 03D | Backtesting and calibration: re-score stored snapshots, per-state and per-version outcome reports, threshold review. | No |
 | 03E | Paper trading from signals, with simulated fees and slippage. No real funds. | No |
 | 03F | Smart-wallet tracking. | Paid or keyed provider |
 | 03G | Telegram alerts. | Bot token secret |
+
+## 6b. Automated scans (Stage 03C)
+
+`lib/goldmine/scan.ts` extracts the scan pipeline (settle due outcomes, discover, score, verify contract
+safety, record) out of the POST route, so any authorized caller can run it under the same
+`goldmine:scan` lock. Two callers exist:
+
+- `POST /api/goldmine` (unchanged): signed-in ChatGPT session, same-origin, exactly as before.
+- `POST /api/goldmine/scheduled`: a dedicated, fail-closed secret (`GOLDMINE_CRON_SECRET`, header
+  `x-goldmine-cron-secret`) instead of a session or Origin check, since an automated caller has neither.
+  An unset, empty or wrong secret is always rejected before any storage or provider call — never a
+  configuration that accidentally authorizes everyone. It reuses the same lock, so a manual and an
+  automated scan can never run concurrently, and the same idempotent signal/outcome handling, so neither
+  can duplicate a record the other already wrote. It never requests X, respects the same RugCheck and
+  DEX Screener budgets as the manual route, and completes on the same order of magnitude (well inside
+  the 60-second scan lock).
+
+### 6b.1 What is not done, and why
+
+Nothing in this repository or its build wires an actual periodic trigger to either route, and this is a
+deliberate stop, not an oversight. Two possible mechanisms were assessed against the real hosting
+(docs/deployment-runbook.md section 1) and neither could be verified safe:
+
+1. **Vercel Cron**, calling an HTTP endpoint on a schedule, is the natural fit for `vercel.json` and is
+   what `GOLDMINE_CRON_SECRET`/`POST /api/goldmine/scheduled` was shaped after. It cannot work at all on
+   this project's Vercel deployment: that build has no D1 binding by design
+   (`lib/vercel-cloudflare-workers.ts` freezes `env` empty), so `db()` throws immediately and every scan
+   would be a guaranteed, permanent `503`. No cron frequency fixes this; the blocker is the missing
+   database, not the schedule.
+2. **A Cloudflare Cron Trigger**, invoking the Worker's native `scheduled(event, env, ctx)` export
+   directly (bypassing HTTP and, with it, Sites' private-Site sign-in gate), is the correct primitive for
+   the actual production target — the OpenAI Sites-hosted Cloudflare Worker that owns the real D1
+   database. Whether Sites' proprietary publish tooling reads or honors a `triggers.crons` declaration is
+   **unconfirmed**: `.openai/hosting.json` has no field for it, `vite.config.ts`'s binding config is for
+   local Miniflare only and is not what Sites deploys, and this repository has no access to Sites'
+   deploy-time configuration to add or test one. Adding an unwired `scheduled()` export on the strength
+   of a guess would be exactly the "fake scheduler" this stage must not ship.
+
+Cron frequency itself was still worth assessing in case support is confirmed later: Cloudflare Cron
+Triggers support standard cron expressions down to one-minute resolution, so a `*/15 * * * *` schedule
+would comfortably keep the 15m window's 5-minute slack (and every wider window) covered. **Do not claim
+reliable 15-minute (or any) automated tracking exists in production** until one of these mechanisms is
+confirmed and actually wired; until then, outcome evaluation runs only when someone opens the dashboard
+and scans manually, exactly as in 03A/03B.
+
+**Next step to unblock:** get the Site owner (or whoever administers the Sites publish) to confirm
+whether Cron Triggers are supported and how to declare one for this Worker. If yes, add a `scheduled()`
+export that calls `runGoldmineScan` under the same lock and wire the trigger; `POST
+/api/goldmine/scheduled` can then be retired or kept as a manual-override/backfill path. If Sites cannot
+support this, the alternative is a separate, approved external caller (for example, another Cloudflare
+Worker with its own confirmed Cron Trigger performing a fetch to this Site's production URL with the
+configured secret) — but only after confirming Sites' private-Site gate does not itself block that
+request before it reaches the Worker.
+
+### 6b.2 Signal retention (proposed, not implemented)
+
+Signals and outcomes still grow without a retention policy. No deletion code ships in this stage: Stage
+03D (backtesting) re-scores stored snapshots under later model versions, so removing rows now would
+remove data a still-planned stage needs, and there is no scan volume data yet (scans are still manually
+triggered) to size a policy against. Proposed policy for a later stage, once 03D's needs and real volume
+are known: delete only signals whose every outcome has reached a terminal status (`observed`,
+`unavailable` or `missed` — never one still `pending`) and whose latest (24h) outcome resolved more than
+a fixed number of days ago, in small bounded batches (matching the existing chunked-write pattern in
+`lib/goldmine/signals.ts`), with `goldmine_outcomes` rows removed by the same `signal_id` set in the same
+operation. This is additive-safe (no schema change, no migration) but still deletes data, so it needs its
+own review and explicit approval before it ships, not a default assumed here.
 
 ## 7. Known limitations
 
@@ -122,4 +211,5 @@ RugCheck's own score or verdict is never read. Instead its facts feed our own de
 - The detection price is the discovery response, which the shared provider cache may have fetched up to 60 seconds before `detected_at`; outcome prices may be up to 10 seconds old.
 - More than 150 due pools in one scan are deferred; if scans stop, deferred outcomes still become `missed` when their windows close.
 - The scan lock expires after 60 seconds; an overlapping scan cannot duplicate signals (IDs) or outcomes (primary key).
-- Signals and outcomes grow without a retention policy until Stage 03C.
+- Signals and outcomes still grow without a retention policy; a policy is proposed, not implemented (section 6b.2).
+- No automated scan actually runs yet: `POST /api/goldmine/scheduled` (section 6b) exists and is tested, but nothing triggers it periodically in production (section 6b.1). Evaluation still runs only when someone scans manually.
