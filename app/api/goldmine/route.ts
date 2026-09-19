@@ -8,7 +8,7 @@ import {discoverSolanaPairs} from '@/lib/market';
 import {acquireLock, db, releaseLock, sameOrigin} from '@/lib/research-db';
 import {DISCLAIMER, MODEL_VERSION, scoreCandidate, type Assessment} from '@/lib/goldmine/score';
 import {attachSocialEvidence, evaluateOutcomes, readTracking, recordSignals} from '@/lib/goldmine/signals';
-import {bestPoolSnapshots} from '@/lib/goldmine/snapshot';
+import {bestPoolSnapshots, contractSafetySummary} from '@/lib/goldmine/snapshot';
 import {withContractSafety} from '@/lib/goldmine/contract-safety';
 
 const noStore = {'Cache-Control': 'no-store'};
@@ -58,7 +58,14 @@ export async function POST(request: Request) {
     const prescored = snapshots.map(snapshot => ({snapshot, assessment: scoreCandidate(snapshot)}));
     const scored = await withContractSafety(prescored, now);
     const newSignals = await recordSignals(database, scored, now);
-    const candidates = scored.sort((a, b) => byRank(a.assessment, b.assessment)).map(({snapshot, assessment}) => ({...assessment, snapshot}));
+    // Response-shaping only: storage above (recordSignals) still gets the full scored snapshot, including
+    // the raw contractSafety facts. Here, for the client, contractSafety is reduced to the same minimal
+    // shape GET already returns (lib/goldmine/snapshot.ts contractSafetySummary), so POST never leaks
+    // provider facts/scores/risk text that GET withholds. Defensive against malformed/legacy values.
+    const candidates = scored.sort((a, b) => byRank(a.assessment, b.assessment)).map(({snapshot, assessment}) => ({
+      ...assessment,
+      snapshot: {...snapshot, contractSafety: contractSafetySummary(snapshot.contractSafety)},
+    }));
     return Response.json({
       status: 'checked', modelVersion: MODEL_VERSION, asOf: new Date(now).toISOString(), candidates,
       opportunities: candidates.filter(candidate => candidate.opportunity).length,
