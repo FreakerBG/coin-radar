@@ -8,8 +8,12 @@ export type FailureLevel = 'error' | 'warn';
 const MAX_MESSAGE_LENGTH = 300;
 
 export function redact(text: string): string {
-  const token = (env as unknown as {X_BEARER_TOKEN?: string}).X_BEARER_TOKEN;
-  return (token ? text.split(token).join('[redacted]') : text)
+  const secrets = env as unknown as {X_BEARER_TOKEN?: string; GOLDMINE_CRON_SECRET?: string};
+  let redacted = text;
+  for (const secret of [secrets.X_BEARER_TOKEN, secrets.GOLDMINE_CRON_SECRET]) {
+    if (secret) redacted = redacted.split(secret).join('[redacted]');
+  }
+  return redacted
     .replace(/Bearer\s+\S+/gi, 'Bearer [redacted]')
     .replace(/[^\s@"'<>()]+@[^\s@"'<>()]+\.[a-z]{2,}/gi, '[email]')
     .slice(0, MAX_MESSAGE_LENGTH);

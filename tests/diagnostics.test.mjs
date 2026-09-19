@@ -14,6 +14,7 @@ const market = await import('../app/api/market/route.ts');
 const news = await import('../app/api/news/route.ts');
 
 const CREDENTIAL = 'offline-test-credential-0123456789';
+const CRON_SECRET = 'offline-test-cron-secret-9876543210';
 const USER = 'user-diagnostics-7f3a';
 const EMAIL = `${USER}@example.test`;
 
@@ -23,6 +24,7 @@ beforeEach(() => {
   d1 = createD1();
   runtime.env.DB = d1;
   runtime.env.X_BEARER_TOKEN = CREDENTIAL;
+  runtime.env.GOLDMINE_CRON_SECRET = CRON_SECRET;
   failures.length = 0;
   signIn(USER);
 });
@@ -39,6 +41,10 @@ describe('failure records', () => {
     assert.match(redacted, /^Bearer \[redacted\] failed for \[email\] using \[redacted\] x+$/);
     assert.equal(redacted.length, 300);
     assert.equal(redact('BEARER abc, bearer def; Authorization: Bearer ghi'), 'Bearer [redacted] Bearer [redacted] Authorization: Bearer [redacted]');
+  });
+
+  test('redact also removes the configured Goldmine scheduled-scan secret', () => {
+    assert.equal(redact(`rejected header value ${CRON_SECRET} for scheduled scan`), 'rejected header value [redacted] for scheduled scan');
   });
 
   test('one JSON line per failure, at the requested level, including a redacted cause', () => {
