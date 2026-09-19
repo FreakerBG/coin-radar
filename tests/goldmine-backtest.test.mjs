@@ -272,6 +272,30 @@ describe('performanceReport', () => {
     performanceReport(signals, outcomes);
     assert.equal(JSON.stringify([signals, outcomes]), before);
   });
+
+  // --- Non-finite returns are excluded, never an Infinity mean next to a positive count (Opus nit) --------
+  test('an extreme-value pair that produces a non-finite return is excluded from the distribution, not an Infinity mean', () => {
+    // price 1e300 / detectedPrice 1e-300 overflows to Infinity in JS arithmetic - the review's exact
+    // reproduction. Coverage still counts the outcome as observed (the row itself is well-formed and
+    // stamped 'observed'); only the unusable, non-finite derived return is excluded.
+    const signals = [signal('BREAKOUT', 's1', 1e-300)];
+    const outcomes = [{signalId: 's1', horizon: '15m', status: 'observed', dueAt: NOW, observedAt: NOW, price: 1e300, liquidity: 1}];
+    const report = performanceReport(signals, outcomes);
+    const bucket = report.find(b => b.horizon === '15m');
+    assert.equal(bucket.coverage.observed, 1, 'the stamped observed status is still counted');
+    assert.equal(bucket.returnsPct.count, 0, 'no usable finite return was produced');
+    assert.equal(bucket.returnsPct.mean, null, 'never an Infinity mean serialized as null next to a positive count - mean is null exactly because count is 0');
+    assert.equal(bucket.positiveShare, null, 'never converted to zero or any other fabricated value');
+  });
+
+  test('a normal finite return is unaffected by the non-finite guard', () => {
+    const signals = [signal('BREAKOUT', 's1', 1)];
+    const outcomes = [{signalId: 's1', horizon: '15m', status: 'observed', dueAt: NOW, observedAt: NOW, price: 1.25, liquidity: 1}];
+    const report = performanceReport(signals, outcomes);
+    const bucket = report.find(b => b.horizon === '15m');
+    assert.equal(bucket.returnsPct.count, 1);
+    assert.equal(bucket.returnsPct.mean, 25);
+  });
 });
 
 describe('wouldBeOpportunityAt', () => {

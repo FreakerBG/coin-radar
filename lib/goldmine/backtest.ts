@@ -189,8 +189,17 @@ export function performanceReport(signals: StoredSignalRow[], outcomes: StoredOu
     if (outcome.status === 'pending' || outcome.status === 'observed' || outcome.status === 'unavailable' || outcome.status === 'missed') bucket.coverage[outcome.status]++;
     if (outcome.status === 'observed' && outcome.price !== null && signal.detectedPrice > 0) {
       const returnPct = (outcome.price / signal.detectedPrice - 1) * 100;
-      bucket.returns.push(returnPct);
-      if (outcome.price > signal.detectedPrice) bucket.positive++;
+      // Only a finite return ever enters the distribution - consistent with calibrationSweep below. An
+      // extreme-but-technically-finite-at-write-time stored price (or one that overflows here) must never
+      // let a non-finite value into `distribution()`, where it would produce an Infinity mean that
+      // serializes as `null` next to a positive sample count - implying a real, if extreme, measured mean
+      // when none exists. Never converted to zero either: it is simply excluded, the same treatment as a
+      // pending/unavailable/missed outcome (no usable return), so `returnsPct.count` always describes
+      // exactly the samples actually used.
+      if (Number.isFinite(returnPct)) {
+        bucket.returns.push(returnPct);
+        if (outcome.price > signal.detectedPrice) bucket.positive++;
+      }
     }
     buckets.set(key, bucket);
   }
