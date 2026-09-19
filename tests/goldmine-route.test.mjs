@@ -385,6 +385,19 @@ describe('POST contractSafety: candidates[].snapshot.contractSafety matches GET\
     }
     assert.deepEqual(contractSafetySummary({status: 'unsafe', failedChecks: ['Mint authority is still active.']}), {status: 'unsafe', reason: 'Mint authority is still active.'});
   });
+
+  test('no ContractSafety-only field leaks anywhere in the full serialized POST body, not just inside snapshot.contractSafety', async () => {
+    // Matched as JSON object keys ("key":), not substrings: snapshot.source ('dexscreener') and
+    // assessment evidence text naming the provider ("rugcheck") are legitimate and unrelated to this
+    // check, which targets only field names unique to the stored ContractSafety/ContractSafetyFacts
+    // shape (lib/goldmine/snapshot.ts). A future change that spreads or nests the raw object anywhere in
+    // the response - not only into candidates[].snapshot.contractSafety - would be caught here.
+    feeds.safety = () => Response.json(safetyReport({rugged: true}));
+    const raw = await (await scan()).text();
+    for (const key of ['facts', 'providerRisks', 'providerScoreNormalized', 'checkedAt', 'failedChecks', 'mintAuthorityRenounced', 'freezeAuthorityRenounced', 'lpLockedPct', 'totalMarketLiquidityUsd', 'topHolderPct', 'topHoldersPct', 'creatorHoldingsPct', 'insiderNetworksDetected', 'rugged']) {
+      assert.equal(raw.includes(`"${key}"`), false, key);
+    }
+  });
 });
 
 describe('outcome batches', () => {
