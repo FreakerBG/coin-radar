@@ -10,6 +10,7 @@ import {pair} from './helpers/goldmine-fixtures.mjs';
 const {isValidStoredSnapshot, isValidStoredAssessment, isValidStoredOutcomeRow, readAllSignalsWithOutcomes} = await import('../lib/goldmine/signals.ts');
 const {MODEL_VERSION, scoreCandidate} = await import('../lib/goldmine/score.ts');
 const {snapshotFromPair} = await import('../lib/goldmine/snapshot.ts');
+const {extractFacts, deriveContractSafety} = await import('../lib/goldmine/contract-safety.ts');
 
 const MINUTE = 60000;
 const validSnapshot = () => snapshotFromPair(pair(), Date.UTC(2026, 8, 18, 12));
@@ -74,6 +75,74 @@ describe('isValidStoredSnapshot', () => {
     test('accepts unavailable only with source: null', () => {
       assert.equal(isValidStoredSnapshot({...validSnapshot(), contractSafety: {status: 'unavailable', source: null}}), true);
       assert.equal(isValidStoredSnapshot({...validSnapshot(), contractSafety: {status: 'unavailable', source: 'x'}}), false);
+    });
+  });
+
+  // --- Reader/writer alignment for insiderNetworksDetected and totalMarketLiquidityUsd (Opus nit) ---------
+  // The real writer (lib/goldmine/contract-safety.ts extractFacts) persists both facts as
+  // `numberOrNull(...)`: any finite number RugCheck's report happens to contain, with no sign or integer
+  // constraint of its own. A validator stricter than that (e.g. requiring non-negative, or a non-negative
+  // integer) would reject a row the writer can legitimately have persisted. These tests go through the
+  // real writer/extractor (extractFacts, deriveContractSafety), not a hand-built fixture, so a value the
+  // reader rejects here is by definition a value the actual writer can produce.
+  describe('insiderNetworksDetected / totalMarketLiquidityUsd: reader accepts every value the real writer can persist', () => {
+    const NOW_MS = Date.UTC(2026, 8, 18, 12);
+    // Shaped exactly like a live RugCheck GET /v1/tokens/{mint}/report response (topHolders[].pct,
+    // markets[].lp.lpLockedPct, creatorBalance as a raw token amount, graphInsidersDetected as a plain
+    // number) - the same fixture shape used in tests/goldmine-contract-safety.test.mjs.
+    function rugCheckReport(overrides = {}) {
+      return {
+        token: {mintAuthority: null, freezeAuthority: null, supply: 1_000_000_000, decimals: 6},
+        rugged: false,
+        totalMarketLiquidity: 250000,
+        topHolders: [{pct: 8}, {pct: 5}, {pct: 3}],
+        creatorBalance: 10_000_000,
+        graphInsidersDetected: 0,
+        score_normalised: 5,
+        risks: [],
+        markets: [{lp: {quoteUSD: 50000, baseUSD: 50000, lpLockedPct: 95}}],
+        ...overrides,
+      };
+    }
+    function snapshotWithSafety(report) {
+      return {...validSnapshot(), contractSafety: deriveContractSafety(report, NOW_MS, NOW_MS)};
+    }
+
+    test('a fractional graphInsidersDetected (no integer constraint in the writer) round-trips through the reader', () => {
+      const report = rugCheckReport({graphInsidersDetected: 2.5});
+      assert.equal(extractFacts(report).insiderNetworksDetected, 2.5, 'the writer itself accepts a fractional value unchanged');
+      assert.equal(isValidStoredSnapshot(snapshotWithSafety(report)), true);
+    });
+
+    test('a negative graphInsidersDetected (no sign constraint in the writer) round-trips through the reader', () => {
+      const report = rugCheckReport({graphInsidersDetected: -3});
+      assert.equal(extractFacts(report).insiderNetworksDetected, -3);
+      assert.equal(isValidStoredSnapshot(snapshotWithSafety(report)), true);
+    });
+
+    test('a negative totalMarketLiquidity (no sign constraint in the writer) round-trips through the reader', () => {
+      const report = rugCheckReport({totalMarketLiquidity: -500});
+      assert.equal(extractFacts(report).totalMarketLiquidityUsd, -500);
+      assert.equal(isValidStoredSnapshot(snapshotWithSafety(report)), true);
+    });
+
+    test('every value the writer can persist for these two facts is accepted, whatever the resulting contractSafety status', () => {
+      for (const overrides of [{graphInsidersDetected: 0}, {graphInsidersDetected: 7}, {graphInsidersDetected: 1.25}, {totalMarketLiquidity: 0}, {totalMarketLiquidity: -1}]) {
+        const report = rugCheckReport(overrides);
+        const snapshot = snapshotWithSafety(report);
+        assert.ok(['unavailable', 'unsafe', 'verified'].includes(snapshot.contractSafety.status));
+        assert.equal(isValidStoredSnapshot(snapshot), true, `rejected a snapshot the real writer produced for ${JSON.stringify(overrides)}`);
+      }
+    });
+
+    test('still rejects a non-finite value (NaN/Infinity), which the writer itself can never persist (numberOrNull excludes them)', () => {
+      const facts = {
+        mintAuthorityRenounced: true, freezeAuthorityRenounced: true, lpLockedPct: 100, totalMarketLiquidityUsd: NaN,
+        topHolderPct: 5, topHoldersPct: 20, creatorHoldingsPct: 1, insiderNetworksDetected: 0, rugged: false,
+        providerScoreNormalized: 90, providerRisks: [],
+      };
+      const snapshot = {...validSnapshot(), contractSafety: {status: 'verified', source: 'rugcheck', checkedAt: 1, facts}};
+      assert.equal(isValidStoredSnapshot(snapshot), false, 'NaN is not a value numberOrNull ever writes, and must still be rejected');
     });
   });
 

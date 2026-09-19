@@ -157,8 +157,16 @@ function isValidContractSafetyFacts(value: unknown): value is ContractSafetyFact
   const pctOrNull = (v: unknown) => v === null || (typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= 100);
   if (!boolOrNull(value.mintAuthorityRenounced) || !boolOrNull(value.freezeAuthorityRenounced) || !boolOrNull(value.rugged)) return false;
   if (!pctOrNull(value.lpLockedPct) || !pctOrNull(value.topHolderPct) || !pctOrNull(value.topHoldersPct) || !pctOrNull(value.creatorHoldingsPct)) return false;
-  if (!isNonNegativeOrNull(value.totalMarketLiquidityUsd)) return false;
-  if (!isNonNegativeIntOrNull(value.insiderNetworksDetected)) return false;
+  // The writer (lib/goldmine/contract-safety.ts extractFacts) persists both of these as
+  // `numberOrNull(...)` - any finite number RugCheck reports, with no additional sign/integer
+  // constraint - not the non-negative (and, for insiderNetworksDetected, non-negative-integer) shape an
+  // earlier version of this validator assumed. A reader stricter than the actual writer would reject a
+  // row the writer can legitimately persist (e.g. a fractional or negative graphInsidersDetected/
+  // totalMarketLiquidity RugCheck happens to report); neither field is read by scoring beyond an equality
+  // check against 0 (lib/goldmine/contract-safety.ts safetyChecks), so relaxing this to match the real
+  // persisted contract changes no scoring behavior.
+  if (!isFiniteOrNull(value.totalMarketLiquidityUsd)) return false;
+  if (!isFiniteOrNull(value.insiderNetworksDetected)) return false;
   if (!isFiniteOrNull(value.providerScoreNormalized)) return false;
   if (!Array.isArray(value.providerRisks) || !value.providerRisks.every(risk => isPlainObject(risk) && typeof risk.name === 'string' && typeof risk.level === 'string' && typeof risk.description === 'string')) return false;
   return true;
@@ -285,11 +293,14 @@ export const SIGNAL_READ_BATCH_SIZE = 200;
 export const MAX_SIGNAL_READ_BATCHES = 10;
 // The largest number of signal rows (each holding a full snapshot + assessment, ~4 KB of JSON per the
 // SIGNALS_PER_INSERT comment above) any one call ever holds in memory at once. At the current constants
-// (200 * 10) that is 2,000 rows: roughly 8 MB of raw JSON text, and measured in tests/goldmine-backtest-
-// limits.test.mjs at well under 20 MB of parsed JS objects in the Node test harness - a large margin below
-// a Workers isolate's 128 MB memory limit even before accounting for the difference between Node's and
-// V8-on-Workers' per-object overhead (see that test file's comment for the measurement method and why the
-// Node number is treated as an upper *approximation*, not an exact Workers figure).
+// (200 * 10) that is 2,000 rows. tests/goldmine-backtest-limits.test.mjs asserts the deterministic,
+// CI-safe proxy for this: the serialized JSON text size of the returned signals+outcomes stays well under
+// 30 MB (that test measures JSON text size, not retained heap - see its own comment). A separate, one-off
+// diagnostic Node --expose-gc heap measurement (not committed as a test, not run in CI) observed
+// approximately 16.4 MB of retained heap for a comparable dataset. Neither number is a measurement of a
+// Workers isolate's actual V8 memory use - Node's V8 and a Workers isolate's V8 differ in baseline and
+// per-object overhead - so neither is formal proof of peak Workers memory; both leave a wide margin below
+// a Workers isolate's 128 MB limit, which is the basis for treating this cap as safe, not an exact bound.
 export const MAX_RETAINED_SIGNALS = SIGNAL_READ_BATCH_SIZE * MAX_SIGNAL_READ_BATCHES;
 // Outcome lookups are batched by signal id, well under D1's bound statement parameter/payload limits, so
 // one read never binds every signal id ever recorded into a single json_each(?) value.
