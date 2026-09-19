@@ -174,21 +174,109 @@ deliberate stop, not an oversight. Two possible mechanisms were assessed against
    deploy-time configuration to add or test one. Adding an unwired `scheduled()` export on the strength
    of a guess would be exactly the "fake scheduler" this stage must not ship.
 
-Cron frequency itself was still worth assessing in case support is confirmed later: Cloudflare Cron
-Triggers support standard cron expressions down to one-minute resolution, so a `*/15 * * * *` schedule
-would comfortably keep the 15m window's 5-minute slack (and every wider window) covered. **Do not claim
-reliable 15-minute (or any) automated tracking exists in production** until one of these mechanisms is
-confirmed and actually wired; until then, outcome evaluation runs only when someone opens the dashboard
-and scans manually, exactly as in 03A/03B.
+### 6b.1a Scan interval: no fixed cadence guarantees observing the 15m window
 
-**Next step to unblock:** get the Site owner (or whoever administers the Sites publish) to confirm
-whether Cron Triggers are supported and how to declare one for this Worker. If yes, add a `scheduled()`
-export that calls `runGoldmineScan` under the same lock and wire the trigger; `POST
-/api/goldmine/scheduled` can then be retired or kept as a manual-override/backfill path. If Sites cannot
-support this, the alternative is a separate, approved external caller (for example, another Cloudflare
-Worker with its own confirmed Cron Trigger performing a fetch to this Site's production URL with the
-configured secret) — but only after confirming Sites' private-Site gate does not itself block that
-request before it reaches the Worker.
+An earlier draft of this section claimed a `*/15 * * * *` schedule "comfortably" covers the 15m outcome
+window (15-20 minutes after detection, 5 minutes wide) "with slack." That claim was wrong and has been
+replaced by the analysis below, encoded as regression tests in
+`tests/goldmine-scheduled.test.mjs` (`describe('corrected scan-interval analysis...')`).
+
+**Why a 15-minute interval has no real slack.** Detection happens at whatever instant a scan actually
+runs, not at a fixed offset from a schedule - a signal's `detected_at` is that scan's own clock reading.
+So if any one scan (the detecting scan, or the scan(s) after it) drifts off its nominal grid mark by even
+a minute - ordinary scheduler dispatch jitter, a cold start, or the previous invocation overrunning its
+slot - the window computed from the *actual* detection time no longer lines up with the *nominal* grid the
+following scans still run on. Concretely: a cron fires at :00, :15, :30, but the :00 firing is dispatched a
+minute late and actually runs at :01. The signal it detects has `due_at` = :16 and `deadline_at` = :21. The
+next firing, exactly on time at :15, is one minute too early (`due_at` has not passed) and evaluates
+nothing; the one after that, at :30, is nine minutes too late (past `deadline_at`) and the outcome is
+marked `missed`. One minute of jitter was enough to turn a 15-minute interval - three times wider than the
+window it needs to hit - into a total miss, because the interval itself, not just the jitter, exceeds the
+window width. This is reproduced deterministically (fake clock, no real timers) in
+`tests/goldmine-scheduled.test.mjs`.
+
+**What actually reduces the miss risk.** A grid point lands inside a window of width `W` only if the
+interval `T` and the accumulated jitter/drift between the detecting scan and the catching scan satisfy
+`T + jitter ≲ W`. For the 15m horizon, `W` is 5 minutes, so `T` must be a fraction of that - not a fraction
+of the horizon itself (15 minutes) - to leave any room for jitter, execution duration, provider retries or
+a lock-busy skip (below) at all. A 5-minute interval (`*/5 * * * *`) is the smallest round-number cadence
+that: (a) still lands a grid point inside a 5-minute window after the same one-minute jitter that breaks a
+15-minute cadence (verified by the second test in the same describe block); (b) stays far enough below the
+60-second scan lock (`lib/research-db.ts`) and this pipeline's typical run time (low single-digit seconds;
+worst case bounded by `SCAN_BUDGET_MS` = 20s in `lib/goldmine/contract-safety.ts`) that back-to-back
+overlap and lock-busy skips should be rare in normal operation; and (c) keeps per-scan RugCheck volume
+unchanged (`MAX_CHECKS_PER_SCAN` = 12, already sized to this stage's ~15-request unauthenticated-window
+observation regardless of call frequency) while relying on its 10-minute contract-safety cache
+(`CACHE_TTL_MS`) to absorb most of the added call frequency for candidates that keep reappearing across
+scans a few minutes apart - only genuinely new actionable candidates cost a fresh RugCheck request. At 12
+scans/hour (288/day) this is a real, sustained increase in DEX Screener and (for new candidates) RugCheck
+request volume over the current ad hoc manual cadence, and that cost has not been validated against either
+provider's actual production rate limits from this repository - only estimated against the documented,
+observed ones (section 3b).
+
+**This is a reduction of risk, not a guarantee, and must not be described as one.** Even a 5-minute
+cadence can still miss a 15m window if: the scheduler itself skips or delays several consecutive firings
+(an outage on the caller's side, not this app's); a scan is skipped entirely because the `goldmine:scan`
+lock is held by a concurrent manual or scheduled scan (the busy response is intentional and correct, but it
+means that slot contributes nothing to coverage); or jitter on two consecutive firings compounds beyond the
+margin above. The 1h (15-minute-wide), 6h (1-hour-wide) and 24h (3-hour-wide) windows are all wide enough
+that either a 15-minute or a 5-minute cadence covers them with real margin; the fragility above is specific
+to the 15m horizon's narrow, 5-minute window.
+
+Cloudflare Cron Triggers support standard cron expressions down to one-minute resolution, so a 5-minute
+interval (or, if a chosen platform can be shown to keep jitter and execution time small enough relative to
+5 minutes, a finer one) is mechanically expressible once a trigger mechanism is confirmed (section 6b.1b).
+**Do not claim reliable 15-minute (or any) automated tracking exists in production** until one of the
+mechanisms below is confirmed and actually wired; until then, outcome evaluation runs only when someone
+opens the dashboard and scans manually, exactly as in 03A/03B.
+
+### 6b.1b Trigger mechanism
+
+Two production targets exist and must not be confused (docs/deployment-runbook.md section 1):
+
+- **The OpenAI Sites-hosted Worker** is the real production deployment: it owns the real D1 database and
+  is the only place a scan can ever write a real signal. A native Cloudflare Cron Trigger, invoking the
+  Worker's `scheduled(event, env, ctx)` export directly, is the correct primitive here — it bypasses HTTP
+  and, with it, Sites' private-Site sign-in gate entirely, so it needs no secret and cannot be affected by
+  whether that gate would otherwise block an automated caller.
+- **The separate Vercel preview** (docs/deployment-runbook.md section 1) has no D1 binding by design and
+  can never run a scan successfully. **Do not point any scheduler — Vercel Cron or otherwise — at the
+  Vercel deployment's `/api/goldmine/scheduled`.** It would authenticate correctly (if `GOLDMINE_CRON_SECRET`
+  were ever set there, which it should not be) and then fail every single time with a guaranteed 503,
+  because `db()` throws before any provider call. No interval or retry policy fixes this; the blocker is
+  the missing database, not the schedule.
+
+**The exact question for the Site owner (or whoever administers the Sites publish):** *Does Sites' publish
+tooling support Cloudflare Cron Triggers for this Worker, and if so, what is the exact way to declare one
+for this project (a config field, a plugin setting, a separate provisioning step) so it is safe to add a
+`triggers.crons` entry and a `scheduled()` export in this repository?* `.openai/hosting.json` has no field
+for it today and this repository has no access to Sites' deploy-time configuration, so this cannot be
+answered by more repository investigation - it is answerable only by the platform's own tooling or
+documentation, which is unconfirmed from here.
+
+**Minimum configuration to unblock, by answer:**
+
+- **If yes (Cron Triggers are supported):** the platform owner supplies the exact declaration mechanism.
+  This repository then needs: (1) a `scheduled()` export that calls `runGoldmineScan` under the same
+  `goldmine:scan` lock as both HTTP routes; (2) the confirmed trigger declaration, at a 5-minute interval
+  per section 6b.1a (not 15 minutes); (3) `POST /api/goldmine/scheduled` kept as a manual-override/backfill
+  path, or retired once the native trigger is verified working in production. No `GOLDMINE_CRON_SECRET` is
+  needed for this path — the trigger invokes the Worker directly, not through the private-Site HTTP gate.
+- **If no (Cron Triggers are not supported, or cannot be confirmed):** the only remaining option is a
+  separate, explicitly approved external caller (for example, another Cloudflare Worker with its own
+  confirmed Cron Trigger) performing an HTTP `fetch` to this Site's production URL with the configured
+  `GOLDMINE_CRON_SECRET`, at the same 5-minute interval. This is viable **only after** a second, separate
+  confirmation: that Sites' private-Site sign-in gate lets an unauthenticated request carrying only the
+  cron header through to `POST /api/goldmine/scheduled` at all, rather than intercepting and rejecting it
+  before the Worker's own routing ever sees it (the gate's behavior for a request with no `oai-authenticated-user-*`
+  headers and no interactive sign-in is not established anywhere in this repository). Do not configure or
+  activate such a caller on the assumption that the gate passes it through — verify first, for example by
+  making one manual, logged request with the header from outside a signed-in browser session and observing
+  whether it reaches `POST /api/goldmine/scheduled` (and gets a real 401/200 from the route) or is stopped
+  earlier by the gate (a different status or body, e.g. a sign-in redirect or the gate's own error page).
+
+Until one of these two paths is confirmed and actually wired, no scheduler should be created or activated
+for this project, on either target.
 
 ### 6b.2 Signal retention (proposed, not implemented)
 

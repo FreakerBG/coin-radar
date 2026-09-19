@@ -4,7 +4,7 @@
 // automated scan can never run concurrently, and the same idempotent signal/outcome handling.
 import assert from 'node:assert/strict';
 import {beforeEach, describe, test} from 'node:test';
-import {addresses, body, createD1, failures, installFetch, jsonRequest, runtime, signIn, startClock} from './helpers/harness.mjs';
+import {addresses, body, createD1, failures, installFetch, jsonRequest, runtime, signIn, signOut, startClock} from './helpers/harness.mjs';
 import {pair} from './helpers/goldmine-fixtures.mjs';
 
 const {POST: scheduledPost} = await import('../app/api/goldmine/scheduled/route.ts');
@@ -36,7 +36,10 @@ beforeEach(() => {
   runtime.env.DB = d1;
   runtime.env.GOLDMINE_CRON_SECRET = 'topsecret';
   failures.length = 0;
-  signIn('user-a');
+  // No ChatGPT session by default: the scheduled route has no session or Origin check at all, so every
+  // test in this file must prove the secret alone is doing the authorizing, not a coincidentally signed-in
+  // fixture. Tests that also exercise the manual route (which does require a session) sign in explicitly.
+  signOut();
   feeds = {
     profiles: () => Response.json([{chainId: 'solana', tokenAddress: addresses.tokenA}]),
     boosts: () => Response.json([]),
@@ -88,8 +91,17 @@ describe('authorization', () => {
   test('no Origin header and no ChatGPT session are required - the secret alone authorizes', async () => {
     const request = scheduledRequest();
     assert.equal(request.headers.get('origin'), null);
+    assert.equal(runtime.headers.get('oai-authenticated-user-id'), null, 'precondition: signed out');
     const response = await scheduledPost(request);
     assert.equal(response.status, 200);
+    assert.equal((await body(response)).status, 'checked');
+  });
+
+  test('a signed-in session does not substitute for the secret: a wrong secret is still rejected', async () => {
+    signIn('user-a');
+    const response = await scheduled({secret: 'wrong'});
+    assert.equal(response.status, 401);
+    assert.deepEqual([d1.queries.length, calls.length], [0, 0]);
   });
 });
 
@@ -108,12 +120,14 @@ describe('shared lock and pipeline', () => {
     d1.sqlite.prepare('DELETE FROM research_locks').run();
 
     d1.sqlite.prepare('INSERT INTO research_locks (id, owner, expires) VALUES (?, ?, ?)').run('goldmine:scan', 'scheduled-scan', clock.now() + 30000);
+    signIn('user-a'); // the manual route still requires a session; the scheduled route under test does not
     assert.deepEqual(await body(await manualScan()), {status: 'busy', candidates: []});
   });
 
   test('a signal recorded by a scheduled scan is not recorded again by a manual scan in the same bucket', async () => {
     await scheduled();
     clock.advance(2 * MINUTE);
+    signIn('user-a'); // the manual route still requires a session; the scheduled route under test does not
     const data = await body(await manualScan());
     assert.equal(data.tracking.newSignals, 0);
     assert.equal(signals().length, 1);
@@ -158,5 +172,55 @@ describe('missed outcome windows without a scan in between', () => {
     assert.deepEqual([late.tracking.outcomes.missed, late.tracking.outcomes.observed], [2, 0]);
     const statuses = d1.rows("SELECT horizon, status FROM goldmine_outcomes o JOIN goldmine_signals s ON s.id = o.signal_id WHERE s.detected_at = ? ORDER BY horizon", detected);
     assert.deepEqual(statuses.map(row => [row.horizon, row.status]), [['15m', 'missed'], ['1h', 'missed'], ['24h', 'pending'], ['6h', 'pending']]);
+  });
+});
+
+// Corrected scan-interval analysis (docs/goldmine-intelligence.md section 6b.1). A fixed cron interval
+// does not guarantee observing the 15m outcome window (15-20 minutes after detection, 5 minutes wide):
+// it only bounds the gap between scans, and any scheduler jitter or execution delay that shifts a scan
+// off its nominal grid can shift the *next* detection off that same grid too, since detection happens at
+// whatever instant a scan actually runs - not at a fixed offset from the schedule. The two tests below
+// are the concrete counterexample and its fix, at the same fidelity as the schedule doc claims: the first
+// reproduces the exact scenario used to reject the original "15-minute cadence comfortably covers a 5
+// minute window" claim (a single 1-minute-late detecting scan is already enough to make a 15-minute
+// cadence miss entirely, even with every later scan perfectly on time); the second shows a materially
+// smaller interval (5 minutes, a third of the 15-minute one) tolerates the same jitter.
+describe('corrected scan-interval analysis: a 15-minute cadence has no real slack against the 15m window', () => {
+  test('one minute of jitter on the detecting scan makes an otherwise-perfect 15-minute cadence miss the 15m window entirely', async () => {
+    clock.advance(MINUTE); // the detecting scan itself fires a minute late - ordinary scheduler jitter, not an outage
+    const detected = clock.now();
+    await scheduled();
+
+    clock.advance(14 * MINUTE); // next scan lands exactly on the nominal 15-minute grid mark (:15), one minute before due_at
+    let data = await body(await scheduled());
+    assert.equal(data.tracking.outcomes.observed, 0, 'due_at has not passed yet - the window has not opened');
+
+    clock.advance(15 * MINUTE); // following scan lands exactly on the next grid mark (:30), nine minutes after the window closed
+    data = await body(await scheduled());
+    assert.equal(data.tracking.outcomes.missed, 1, 'deadline_at already passed - the window closed before either scan landed inside it');
+
+    const outcome = d1.rows("SELECT status FROM goldmine_outcomes o JOIN goldmine_signals s ON s.id = o.signal_id WHERE s.detected_at = ? AND o.horizon = '15m'", detected)[0];
+    assert.equal(outcome.status, 'missed');
+  });
+
+  test('the same one-minute jitter is absorbed by a 5-minute cadence, which lands a scan inside the window', async () => {
+    clock.advance(MINUTE); // identical jitter on the detecting scan
+    const detected = clock.now();
+    await scheduled();
+
+    // Nominal 5-minute grid marks after detection (:05, :10, :15), each one minute before the window
+    // opens (due_at = detected + 16m) or still short of it - none observes yet.
+    for (const step of [4 * MINUTE, 5 * MINUTE, 5 * MINUTE]) {
+      clock.advance(step);
+      const data = await body(await scheduled());
+      assert.equal(data.tracking.outcomes.observed, 0);
+    }
+
+    clock.advance(5 * MINUTE); // next grid mark (:20) falls inside [detected+15, detected+20] - the interval's own slack, not luck
+    const data = await body(await scheduled());
+    assert.equal(data.tracking.outcomes.observed, 1);
+
+    const outcome = d1.rows("SELECT status FROM goldmine_outcomes o JOIN goldmine_signals s ON s.id = o.signal_id WHERE s.detected_at = ? AND o.horizon = '15m'", detected)[0];
+    assert.equal(outcome.status, 'observed');
   });
 });
