@@ -7,6 +7,24 @@ import {pair} from './helpers/goldmine-fixtures.mjs';
 
 const {GET, POST} = await import('../app/api/goldmine/route.ts');
 const {MODEL_VERSION} = await import('../lib/goldmine/score.ts');
+const {contractSafetySummary} = await import('../lib/goldmine/snapshot.ts');
+
+// A realistic populated RugCheck report that verifies cleanly (same shape as the Stage 03B provider
+// preflight and tests/goldmine-contract-safety.test.mjs's own `report()`), and a rugged variant of it.
+function safetyReport(overrides = {}) {
+  return {
+    token: {mintAuthority: null, freezeAuthority: null, supply: 1_000_000_000, decimals: 6},
+    rugged: false,
+    totalMarketLiquidity: 250000,
+    topHolders: [{pct: 8}, {pct: 5}, {pct: 3}],
+    creatorBalance: 10_000_000,
+    graphInsidersDetected: 0,
+    score_normalised: 5,
+    risks: [{name: 'Mutable metadata', level: 'warn', description: 'Token metadata can be changed by the owner'}],
+    markets: [{lp: {quoteUSD: 50000, baseUSD: 50000, lpLockedPct: 95}}],
+    ...overrides,
+  };
+}
 
 const MINUTE = 60000, HOUR = 60 * MINUTE;
 let d1, clock, calls, feeds, outcomePools;
@@ -96,7 +114,12 @@ describe('scanning', () => {
     ]);
     const [stored] = d1.rows('SELECT snapshot, assessment FROM goldmine_signals WHERE address = ?', addresses.tokenA);
     const {snapshot, ...assessment} = a;
-    assert.deepEqual([JSON.parse(stored.snapshot), JSON.parse(stored.assessment)], [snapshot, assessment], 'the stored evidence is exactly what was served');
+    const storedSnapshot = JSON.parse(stored.snapshot);
+    // Storage (recordSignals) keeps the full scored snapshot, including raw contractSafety facts, so a
+    // later model version can re-score exactly what was observed; only the served response reduces
+    // contractSafety to the minimal client-facing shape. Everything else is exactly what was served.
+    assert.deepEqual({...storedSnapshot, contractSafety: contractSafetySummary(storedSnapshot.contractSafety)}, snapshot, 'served snapshot matches storage except contractSafety, minimized for the client');
+    assert.deepEqual(JSON.parse(stored.assessment), assessment);
     assert.deepEqual(d1.rows('SELECT id FROM research_locks'), [], 'the scan lock is released');
   });
 
@@ -298,6 +321,69 @@ describe('GET contractSafety: minimal client shape, defensive against malformed 
     seedSignal('sig-unknown-status', JSON.stringify({contractSafety: {status: 'pending-review'}}));
     const data = await body(await read());
     assert.deepEqual(data.signals[0].contractSafety, {status: 'unavailable'});
+  });
+});
+
+describe('POST contractSafety: candidates[].snapshot.contractSafety matches GET\'s minimal client shape', () => {
+  test('verified: minimal {status} only, nothing from facts, source, checkedAt or provider score/risks', async () => {
+    feeds.safety = () => Response.json(safetyReport());
+    const data = await body(await scan());
+    const a = data.candidates.find(c => c.address === addresses.tokenA);
+    assert.deepEqual(a.snapshot.contractSafety, {status: 'verified'});
+    assert.deepEqual(Object.keys(a.snapshot.contractSafety), ['status']);
+    // Scope the leak check to the contractSafety value itself, not the whole payload: the assessment's
+    // own scoring evidence legitimately names "rugcheck" as the check performed (lib/goldmine/score.ts) -
+    // that is unrelated to this fix, which is only about candidates[].snapshot.contractSafety's shape.
+    const json = JSON.stringify(a.snapshot.contractSafety);
+    for (const leak of ['facts', 'providerRisks', 'providerScoreNormalized', 'checkedAt', 'mintAuthorityRenounced', 'source', 'rugcheck']) {
+      assert.equal(json.includes(leak), false, leak);
+    }
+  });
+
+  test('unsafe: minimal {status, reason} built only from our own check messages, never RugCheck facts or provider risk text', async () => {
+    feeds.safety = () => Response.json(safetyReport({rugged: true}));
+    const data = await body(await scan());
+    const a = data.candidates.find(c => c.address === addresses.tokenA);
+    assert.deepEqual(a.snapshot.contractSafety.status, 'unsafe');
+    assert.ok(a.snapshot.contractSafety.reason.includes('recorded this contract as rugged'));
+    assert.deepEqual(Object.keys(a.snapshot.contractSafety).sort(), ['reason', 'status']);
+    const json = JSON.stringify(a.snapshot.contractSafety);
+    for (const leak of ['facts', 'providerRisks', 'providerScoreNormalized', 'checkedAt', 'mintAuthorityRenounced', 'source', 'rugcheck']) {
+      assert.equal(json.includes(leak), false, leak);
+    }
+  });
+
+  test('unavailable: the default when RugCheck has no usable facts yet (a REJECTED candidate never even reaches it)', async () => {
+    // The default beforeEach `feeds.safety` (an incomplete report) already covers the actionable
+    // candidate; token B is REJECTED (thin_liquidity) and so never sent to RugCheck at all.
+    const data = await body(await scan());
+    const [a, b] = data.candidates;
+    assert.deepEqual(a.snapshot.contractSafety, {status: 'unavailable'});
+    assert.deepEqual(b.snapshot.contractSafety, {status: 'unavailable'});
+    assert.deepEqual(Object.keys(a.snapshot.contractSafety), ['status']);
+  });
+
+  test('GET and POST agree on the minimal contractSafety shape for the same recorded signal', async () => {
+    feeds.safety = () => Response.json(safetyReport());
+    const posted = await body(await scan());
+    const candidate = posted.candidates.find(c => c.address === addresses.tokenA);
+    const got = await body(await read());
+    const signal = got.signals.find(s => s.address === addresses.tokenA);
+    assert.deepEqual(signal.contractSafety, candidate.snapshot.contractSafety);
+    assert.deepEqual(candidate.snapshot.contractSafety, {status: 'verified'});
+  });
+
+  test('the shared reducer fails closed on missing/malformed/legacy contractSafety values without crashing, the same defense POST relies on', () => {
+    // Never recognizable as verified or unsafe: always the safe 'unavailable' default, never a crash.
+    for (const malformed of [undefined, null, {}, {status: 'pending-review'}, '{not json', 42, []]) {
+      assert.deepEqual(contractSafetySummary(malformed), {status: 'unavailable'}, JSON.stringify(malformed));
+    }
+    // Recognizable as 'unsafe' but with a malformed/missing failedChecks list: still status 'unsafe' (never
+    // silently downgraded to safe), with a generic fallback reason instead of crashing on the bad shape.
+    for (const malformed of [{status: 'unsafe', failedChecks: 'not-an-array'}, {status: 'unsafe', failedChecks: [1, 2]}, {status: 'unsafe'}]) {
+      assert.deepEqual(contractSafetySummary(malformed), {status: 'unsafe', reason: 'Contract safety checks failed.'}, JSON.stringify(malformed));
+    }
+    assert.deepEqual(contractSafetySummary({status: 'unsafe', failedChecks: ['Mint authority is still active.']}), {status: 'unsafe', reason: 'Mint authority is still active.'});
   });
 });
 
