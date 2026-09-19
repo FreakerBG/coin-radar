@@ -1,15 +1,18 @@
 // Pure logic for Goldmine backtesting/calibration (lib/goldmine/backtest.ts): deterministic replay,
 // distribution stats, per-bucket outcome coverage and the calibration threshold sweep. No D1, no network.
 import assert from 'node:assert/strict';
-import {describe, test} from 'node:test';
+import {beforeEach, describe, test} from 'node:test';
+import {failures} from './helpers/harness.mjs';
 import {pair} from './helpers/goldmine-fixtures.mjs';
 
-const {replaySignal, replayAll, distribution, performanceReport, wouldBeOpportunityAt, calibrationSweep, defaultCutoff, MIN_EVALUATION_SIGNALS, MIN_OBSERVED_RETURN_SAMPLES, CALIBRATION_THRESHOLDS} = await import('../lib/goldmine/backtest.ts');
+const {replaySignal, replayAll, distribution, performanceReport, wouldBeOpportunityAt, calibrationSweep, defaultCutoff, MIN_EVALUATION_SIGNALS, MIN_OBSERVED_RETURN_SAMPLES, CALIBRATION_THRESHOLDS, MAX_REPLAY_EXCEPTION_DIAGNOSTICS} = await import('../lib/goldmine/backtest.ts');
 const {scoreCandidate, MODEL_VERSION} = await import('../lib/goldmine/score.ts');
 const {snapshotFromPair} = await import('../lib/goldmine/snapshot.ts');
 
 const NOW = Date.UTC(2026, 8, 18, 12);
 const MINUTE = 60000, HOUR = 60 * MINUTE;
+
+beforeEach(() => { failures.length = 0; });
 
 function makeSignal(overrides = {}, {detectedAt = NOW, id, modelVersion = MODEL_VERSION, snapshotOverrides = {}} = {}) {
   const snapshot = {...snapshotFromPair(pair(snapshotOverrides), detectedAt), ...overrides.snapshotExtra};
@@ -120,6 +123,76 @@ describe('replaySignal: defense-in-depth against a bad row', () => {
     assert.equal(result.supported, false);
     assert.equal(result.invalid, true);
     assert.match(result.reason, /failed replay scoring/);
+  });
+});
+
+// --- Unexpected replay exceptions go through diagnostics, bounded (Opus finding #2, Low) -----------------
+describe('replaySignal/replayAll: unexpected replay exceptions are reported, bounded, never silent', () => {
+  test('an unexpected exception during replay scoring is reported through the redacted diagnostics mechanism', () => {
+    const signal = makeSignal();
+    signal.snapshot = {...signal.snapshot, txns: null}; // makes scoreCandidate throw
+    replaySignal(signal);
+    assert.equal(failures.length, 1);
+    assert.equal(failures[0].route, 'goldmine');
+    assert.equal(failures[0].operation, 'backtest-replay');
+    assert.equal(failures[0].level, 'warn');
+  });
+
+  test('an expected validation failure (unsupported model version) never reports a diagnostic - only unanticipated exceptions do', () => {
+    const signal = makeSignal({}, {modelVersion: 'momentum-v1.0.0'});
+    replaySignal(signal);
+    assert.equal(failures.length, 0, 'a signal from an unimplemented model version is a quiet, expected outcome, not a diagnostic');
+  });
+
+  test('diagnostics never include the raw snapshot/assessment payload, only the (redacted) thrown error', () => {
+    const signal = makeSignal();
+    // A recognizable marker that would appear in the snapshot/assessment JSON if it ever leaked whole.
+    signal.snapshot = {...signal.snapshot, symbol: 'SECRET_MARKER_TOKEN', txns: null};
+    replaySignal(signal);
+    assert.equal(failures.length, 1);
+    const text = JSON.stringify(failures);
+    assert.equal(text.includes('SECRET_MARKER_TOKEN'), false, 'the diagnostic must never carry the raw stored snapshot');
+  });
+
+  test('replayAll: one unexpected exception among otherwise-valid signals is reported once; every valid signal still completes', () => {
+    const good1 = makeSignal({}, {id: 'good-1'});
+    const good2 = makeSignal({}, {id: 'good-2'});
+    const bad = makeSignal({}, {id: 'bad-1'});
+    bad.snapshot = {...bad.snapshot, txns: null};
+    const summary = replayAll([good1, bad, good2]);
+    assert.equal(failures.length, 1);
+    assert.equal(summary.totalSignals, 3);
+    assert.equal(summary.invalidCount, 1);
+    assert.equal(summary.currentVersionSignals, 2, 'the two valid signals still replayed successfully');
+    assert.equal(summary.matched, 2);
+  });
+
+  test('replayAll: expected malformed-model-version rows produce no diagnostic noise at all', () => {
+    const legacy1 = makeSignal({}, {id: 'legacy-1', modelVersion: 'momentum-v1.0.0'});
+    const legacy2 = makeSignal({}, {id: 'legacy-2', modelVersion: 'momentum-v1.0.0'});
+    const summary = replayAll([legacy1, legacy2]);
+    assert.equal(summary.unsupportedCount, 2);
+    assert.equal(failures.length, 0);
+  });
+
+  test('replayAll: repeated failures across a large corrupted history cannot create unbounded diagnostics', () => {
+    const corrupted = Array.from({length: 50}, (_, i) => {
+      const s = makeSignal({}, {id: `corrupt-${i}`});
+      s.snapshot = {...s.snapshot, txns: null};
+      return s;
+    });
+    const summary = replayAll(corrupted);
+    assert.equal(summary.invalidCount, 50, 'the true total is never bounded, only the diagnostics emitted for it');
+    assert.equal(failures.length, MAX_REPLAY_EXCEPTION_DIAGNOSTICS, `expected exactly ${MAX_REPLAY_EXCEPTION_DIAGNOSTICS} diagnostics, not one per corrupted row`);
+  });
+
+  test('a genuine D1/storage failure is never reported under the replay operation label (distinguishable from a replay failure)', () => {
+    // replaySignal/replayAll never touch D1 at all; this documents that the 'backtest-replay' operation
+    // label is exclusively for scoreCandidate exceptions, never storage failures (those are reported
+    // separately, with operation 'backtest', by app/api/goldmine/backtest/route.ts's own catch).
+    const signal = makeSignal();
+    replaySignal(signal);
+    assert.equal(failures.length, 0);
   });
 });
 

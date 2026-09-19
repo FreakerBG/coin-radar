@@ -9,6 +9,7 @@
 // v2.2.0+ would use to re-score v2.1.0 history once it exists). A signal recorded under any other
 // model_version has no implementation of that version in this codebase; it is never run through the
 // current scoreCandidate and relabeled as its historical result - it is marked unsupported instead.
+import {reportFailure} from '../diagnostics';
 import {HORIZONS, type StoredOutcomeRow, type StoredSignalRow} from './signals';
 import {MODEL_VERSION, scoreCandidate, type Assessment} from './score';
 
@@ -36,7 +37,20 @@ export type ReplayUnsupported = {supported: false; signalId: string; modelVersio
 export type ReplayInvalid = {supported: false; signalId: string; modelVersion: string; reason: string; invalid: true};
 export type ReplayResult = ReplaySupported | ReplayUnsupported | ReplayInvalid;
 
-export function replaySignal(signal: StoredSignalRow): ReplayResult {
+// The default unexpected-exception reporter for a standalone replaySignal call: goes straight through
+// the redacted diagnostics mechanism (lib/diagnostics.ts), never console output of its own, and never
+// includes the raw snapshot/assessment - only whatever scoreCandidate's thrown Error carries (name,
+// message, cause), already redacted and length-bounded by reportFailure/redact.
+function reportUnexpectedReplayFailure(error: unknown) {
+  reportFailure('goldmine', 'backtest-replay', error, 'warn');
+}
+
+// An expected validation failure (an unsupported model version) is counted quietly, no diagnostic - see
+// the modelVersion branch above/below. Only an exception scoreCandidate itself throws on a
+// structurally-valid-looking row is "unexpected" and worth a diagnostic; `onUnexpectedException` lets
+// replayAll (below) bound how many of those are ever reported for one request, so a corrupted history of
+// up to MAX_RETAINED_SIGNALS (2,000) rows can never emit one diagnostic per row.
+export function replaySignal(signal: StoredSignalRow, onUnexpectedException: (error: unknown) => void = reportUnexpectedReplayFailure): ReplayResult {
   if (signal.modelVersion !== MODEL_VERSION) {
     return {
       supported: false,
@@ -48,11 +62,14 @@ export function replaySignal(signal: StoredSignalRow): ReplayResult {
   try {
     const recomputed = scoreCandidate(signal.snapshot);
     return {supported: true, signalId: signal.id, modelVersion: signal.modelVersion, matchesStored: deepEqual(recomputed, signal.assessment), recomputed};
-  } catch {
+  } catch (error) {
     // Structural validation (isValidStoredSnapshot) already rejects every shape known to make
     // scoreCandidate throw; this catch is defense-in-depth for the unknown case, so one unexpected bad
     // historical row is skipped and counted rather than throwing out of replayAll and failing the whole
-    // GET /api/goldmine/backtest report for every other signal.
+    // GET /api/goldmine/backtest report for every other signal. Unlike an expected validation failure,
+    // this is unanticipated, so it is also reported through diagnostics (bounded - see replayAll) instead
+    // of becoming invisible behind a generic "row skipped" count.
+    onUnexpectedException(error);
     return {supported: false, signalId: signal.id, modelVersion: signal.modelVersion, reason: 'Stored snapshot failed replay scoring; row skipped.', invalid: true};
   }
 }
@@ -79,11 +96,26 @@ export type ReplaySummary = {
   invalidCount: number;
 };
 
+// A hard cap on how many unexpected-replay-exception diagnostics one replayAll call ever emits. Bounded
+// deliberately, the same reasoning as MISMATCHED_SAMPLE_LIMIT: a single corrupted or adversarial history
+// of up to MAX_RETAINED_SIGNALS (2,000, lib/goldmine/signals.ts) rows that all throw during replay must
+// never become 2,000 Workers log lines for one request - the first few are enough to diagnose the issue,
+// and `invalidCount` (never bounded) is still the true total of every row this happened to.
+export const MAX_REPLAY_EXCEPTION_DIAGNOSTICS = 5;
+
 // Replays every signal and summarizes the result. Never mutates the input rows; each ReplayResult is a
 // freshly computed value, and the stored assessment is only read for comparison, never written back.
 export function replayAll(signals: StoredSignalRow[]): ReplaySummary {
   const byId = new Map(signals.map(signal => [signal.id, signal]));
-  const results = signals.map(replaySignal);
+  let diagnosticsEmitted = 0;
+  // Shared across every signal in this one replayAll call (closed over below), not per-signal - see
+  // MAX_REPLAY_EXCEPTION_DIAGNOSTICS.
+  const boundedUnexpectedExceptionReporter = (error: unknown) => {
+    if (diagnosticsEmitted >= MAX_REPLAY_EXCEPTION_DIAGNOSTICS) return;
+    diagnosticsEmitted++;
+    reportUnexpectedReplayFailure(error);
+  };
+  const results = signals.map(signal => replaySignal(signal, boundedUnexpectedExceptionReporter));
   const supported = results.filter((result): result is ReplaySupported => result.supported);
   const unsupported = results.filter((result): result is ReplayUnsupported | ReplayInvalid => !result.supported);
   const invalid = unsupported.filter((result): result is ReplayInvalid => result.invalid === true);
