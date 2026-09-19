@@ -2,7 +2,7 @@
 import assert from 'node:assert/strict';
 import {describe, test} from 'node:test';
 
-const {hasEnoughData, performanceRowsWithData, coverageTotal, coverageLabel, hasDataQualityWarning, dataQualityWarning, cellStatusLabel, MIN_SIGNALS_FOR_REPORT} = await import('../lib/goldmine/backtest-view.ts');
+const {hasEnoughData, performanceRowsWithData, coverageTotal, coverageLabel, hasDataQualityWarning, dataQualityWarning, signalsSummaryLabel, cellStatusLabel, MIN_SIGNALS_FOR_REPORT} = await import('../lib/goldmine/backtest-view.ts');
 
 describe('hasEnoughData', () => {
   test('null report: not enough data', () => assert.equal(hasEnoughData(null), false));
@@ -55,7 +55,7 @@ describe('hasDataQualityWarning / dataQualityWarning (truncation and malformed-d
     const warning = dataQualityWarning(report);
     assert.match(warning, /Partial analysis/);
     assert.match(warning, /20/);
-    assert.match(warning, /most recently detected/, 'must say the newest part of history was retained, not silently imply completeness');
+    assert.match(warning, /newest valid signals/, 'must say the newest part of history was retained, not silently imply completeness');
   });
   test('skippedMalformedRows > 0 triggers a warning naming the excluded row count', () => {
     const report = {...clean, skippedMalformedRows: 3};
@@ -70,6 +70,18 @@ describe('hasDataQualityWarning / dataQualityWarning (truncation and malformed-d
   test('a report must never show an unqualified "N signals recorded" style total when truncated', () => {
     const warning = dataQualityWarning({...clean, totalSignals: 20000, truncated: true});
     assert.doesNotMatch(warning, /^20000 signals recorded\.?$/, 'a truncated total must be qualified as partial, not stated as if complete');
+  });
+});
+
+describe('signalsSummaryLabel (Opus nit: the main summary must never say a bare "N signals recorded" when truncated)', () => {
+  test('null report: empty string', () => assert.equal(signalsSummaryLabel(null), ''));
+  test('non-truncated: simple wording, "valid signals analyzed"', () => {
+    assert.equal(signalsSummaryLabel({totalSignals: 20, truncated: false}), '20 valid signals analyzed.');
+  });
+  test('truncated: names the bounded history explicitly, never bare "signals recorded"', () => {
+    const label = signalsSummaryLabel({totalSignals: 2000, truncated: true});
+    assert.equal(label, '2000 newest valid signals analyzed from the bounded history.');
+    assert.doesNotMatch(label, /recorded/, 'a truncated total must never read as "recorded" (implying the complete stored history)');
   });
 });
 

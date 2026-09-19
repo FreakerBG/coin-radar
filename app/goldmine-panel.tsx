@@ -3,7 +3,7 @@ import {useCallback,useEffect,useRef,useState} from 'react';
 import {Gem,RefreshCw,ShieldCheck,ShieldAlert,ArrowUpRight,Radio} from 'lucide-react';
 import {toast} from 'sonner';
 import {isStale,opportunitiesOf,scanState,type PostedCandidate} from '@/lib/goldmine/dashboard-view';
-import {cellStatusLabel,coverageLabel,dataQualityWarning,hasDataQualityWarning,hasEnoughData,performanceRowsWithData,type BacktestReport} from '@/lib/goldmine/backtest-view';
+import {cellStatusLabel,coverageLabel,dataQualityWarning,hasDataQualityWarning,hasEnoughData,performanceRowsWithData,signalsSummaryLabel,type BacktestReport} from '@/lib/goldmine/backtest-view';
 import type {ContractSafetySummary} from '@/lib/goldmine/snapshot';
 
 type ScanResponse = {
@@ -103,16 +103,20 @@ function BacktestingSection({report, error, onRetry}: {report: BacktestReport | 
           <button className="btn" style={{marginLeft: 12}} onClick={onRetry}>Retry</button>
         </div>
       )}
+      {/* Shown whenever it applies - truncation, skipped malformed rows/outcomes, or both - independent of
+          hasEnoughData below. This is exactly the case (few or zero valid signals survive validation, or a
+          corrupted history) where visibility matters most, so it must never hide behind the "not enough
+          data" branch. Rendered once, here; the populated-report branch below never renders it again. */}
+      {!error && hasDataQualityWarning(report) && (
+        <div className="banner" role="status" style={{margin: '16px 22px 0'}}>{dataQualityWarning(report)}</div>
+      )}
       {!error && !hasEnoughData(report) && (
         <div className="empty"><h3>Not enough recorded signals yet</h3><span>Backtesting needs a history of tracked signals to report on. Run scans over time and check back here.</span></div>
       )}
       {!error && hasEnoughData(report) && report && (
         <div style={{padding: '0 22px 22px'}}>
-          {hasDataQualityWarning(report) && (
-            <div className="banner" role="status" style={{margin: '0 0 12px'}}>{dataQualityWarning(report)}</div>
-          )}
           <p className="muted" style={{fontSize: 13}}>
-            {report.totalSignals} signals recorded. Replay (model {report.modelVersion}): {report.replay.matched}/{report.replay.currentVersionSignals} current-version signals reproduce their stored assessment exactly
+            {signalsSummaryLabel(report)} Replay (model {report.modelVersion}): {report.replay.matched}/{report.replay.currentVersionSignals} current-version signals reproduce their stored assessment exactly
             {report.replay.mismatchedCount > 0 ? `, ${report.replay.mismatchedCount} mismatched${report.replay.mismatchedSampleTruncated ? ` (showing ${report.replay.mismatchedSample.length})` : ''}` : ''}.
             {report.replay.unsupportedCount > 0 && ` ${report.replay.unsupportedCount} signals from other model versions (${report.replay.unsupportedModelVersions.join(', ')}) have no supported replay.`}
             {report.replay.invalidCount > 0 && ` ${report.replay.invalidCount} signal${report.replay.invalidCount === 1 ? '' : 's'} could not be replayed and ${report.replay.invalidCount === 1 ? 'was' : 'were'} skipped.`}

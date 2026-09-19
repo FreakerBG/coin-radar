@@ -95,11 +95,24 @@ export function dataQualityWarning(report: {totalSignals: number; truncated: boo
   if (!hasDataQualityWarning(report) || !report) return '';
   const parts: string[] = [];
   parts.push(report.truncated
-    ? `Partial analysis: only the ${report.totalSignals} most recently detected signals within this request's bound were analyzed, not the full stored history.`
-    : `${report.totalSignals} signals analyzed.`);
+    ? `Partial analysis: only the ${report.totalSignals} newest valid signals within this request's bound were analyzed, not the full stored history.`
+    : `${report.totalSignals} valid signals analyzed.`);
   if (report.skippedMalformedRows > 0) parts.push(`${report.skippedMalformedRows} stored signal row${report.skippedMalformedRows === 1 ? '' : 's'} failed validation and ${report.skippedMalformedRows === 1 ? 'was' : 'were'} excluded.`);
   if (report.skippedMalformedOutcomes > 0) parts.push(`${report.skippedMalformedOutcomes} stored outcome row${report.skippedMalformedOutcomes === 1 ? '' : 's'} failed validation and ${report.skippedMalformedOutcomes === 1 ? 'was' : 'were'} excluded.`);
   return parts.join(' ');
+}
+
+// The main report body's own truthful summary of how many signals it covers - distinct from, and shown
+// alongside, dataQualityWarning above. Never says "N signals recorded" for a truncated read: `totalSignals`
+// is always the count of valid rows this request actually analyzed (after excluding malformed rows and
+// applying the read bound), never a claim about how many rows are stored in total. A truncated read is
+// called out here too (not only in the data-quality banner) so this line can never read as if it covered
+// the complete stored history while a truncation banner sits right above it saying otherwise.
+export function signalsSummaryLabel(report: {totalSignals: number; truncated: boolean} | null): string {
+  if (!report) return '';
+  return report.truncated
+    ? `${report.totalSignals} newest valid signals analyzed from the bounded history.`
+    : `${report.totalSignals} valid signals analyzed.`;
 }
 
 // A short, honest label for a calibration cell's evidence status - never implies a claim the cell's own

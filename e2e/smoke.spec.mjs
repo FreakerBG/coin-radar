@@ -121,7 +121,7 @@ test('Goldmine: backtesting section shows a performance and calibration report o
   await openDashboard(page);
   await tab(page, 'Goldmine').click();
   await expect(page.getByRole('heading', {name: 'Backtesting & calibration'})).toBeVisible();
-  await expect(page.getByText('12 signals recorded.')).toBeVisible();
+  await expect(page.getByText('12 valid signals analyzed.')).toBeVisible();
   await expect(page.getByText('BREAKOUT')).toBeVisible();
   await expect(page.getByText('momentum-v2.1.0').first()).toBeVisible();
   await expect(page.getByText('Score threshold sweep (descriptive only) - model momentum-v2.1.0')).toBeVisible();
@@ -136,9 +136,76 @@ test('Goldmine: a truncated/malformed-data report shows an explicit data-quality
   await tab(page, 'Goldmine').click();
   await expect(page.getByRole('heading', {name: 'Backtesting & calibration'})).toBeVisible();
   await expect(page.getByText('Partial analysis', {exact: false})).toBeVisible();
-  await expect(page.getByText('most recently detected', {exact: false})).toBeVisible();
+  await expect(page.getByText('newest valid signals', {exact: false}).first()).toBeVisible();
   await expect(page.getByText('2 stored signal rows failed validation', {exact: false})).toBeVisible();
   await expect(page.getByText('1 stored outcome row failed validation', {exact: false})).toBeVisible();
+  // The main summary paragraph must never say a bare "N signals recorded" under a partial-analysis banner.
+  await expect(page.getByText('signals recorded.', {exact: false})).toHaveCount(0);
+  await expect(page.getByText('12 newest valid signals analyzed from the bounded history.')).toBeVisible();
+});
+
+test('Goldmine: complete (non-truncated) report copy stays simple - "N valid signals analyzed", no partial-analysis wording', async ({page}) => {
+  await mockApis(page, {'goldmine:backtest': {status: 200, json: populatedBacktest()}});
+  await openDashboard(page);
+  await tab(page, 'Goldmine').click();
+  await expect(page.getByText('12 valid signals analyzed.')).toBeVisible();
+  await expect(page.getByText('Partial analysis', {exact: false})).toHaveCount(0);
+});
+
+// --- Data-quality warning visibility, independent of hasEnoughData (Opus Medium finding) ------------------
+// The banner must render whenever it applies - even when fewer than MIN_SIGNALS_FOR_REPORT (10) valid
+// signals remain, even at zero valid signals, and it must never render twice in the populated state.
+test.describe('Goldmine: data-quality warning renders in every applicable UI state, not just the populated one', () => {
+  test('(a) 3 valid signals + 40 skipped malformed signals + 7 skipped malformed outcomes: warning shows even though there is not enough data for a full report', async ({page}) => {
+    const report = goldmineBacktest({totalSignals: 3, skippedMalformedRows: 40, skippedMalformedOutcomes: 7});
+    await mockApis(page, {'goldmine:backtest': {status: 200, json: report}});
+    await openDashboard(page);
+    await tab(page, 'Goldmine').click();
+    await expect(page.getByText('failed validation', {exact: false})).toBeVisible();
+    await expect(page.getByText('40 stored signal rows failed validation', {exact: false})).toBeVisible();
+    await expect(page.getByText('7 stored outcome rows failed validation', {exact: false})).toBeVisible();
+    // The "not enough data" message still renders alongside the warning; it does not hide it.
+    await expect(page.getByRole('heading', {name: 'Not enough recorded signals yet'})).toBeVisible();
+  });
+
+  test('(b) fewer than 10 valid signals, with truncation: warning shows alongside the "not enough data" message', async ({page}) => {
+    const report = goldmineBacktest({totalSignals: 4, truncated: true});
+    await mockApis(page, {'goldmine:backtest': {status: 200, json: report}});
+    await openDashboard(page);
+    await tab(page, 'Goldmine').click();
+    await expect(page.getByText('Partial analysis', {exact: false})).toBeVisible();
+    await expect(page.getByRole('heading', {name: 'Not enough recorded signals yet'})).toBeVisible();
+  });
+
+  test('(c) enough valid signals, with a data-quality warning: the warning appears exactly once, not doubled', async ({page}) => {
+    const report = populatedBacktest({totalSignals: 12, truncated: true, skippedMalformedRows: 2, skippedMalformedOutcomes: 1});
+    await mockApis(page, {'goldmine:backtest': {status: 200, json: report}});
+    await openDashboard(page);
+    await tab(page, 'Goldmine').click();
+    await expect(page.getByRole('status').filter({hasText: 'Partial analysis'})).toHaveCount(1);
+  });
+
+  test('(d) enough valid signals, no truncation and no excluded data: no data-quality warning at all', async ({page}) => {
+    await mockApis(page, {'goldmine:backtest': {status: 200, json: populatedBacktest()}});
+    await openDashboard(page);
+    await tab(page, 'Goldmine').click();
+    await expect(page.getByRole('heading', {name: 'Backtesting & calibration'})).toBeVisible();
+    await expect(page.getByText('Partial analysis', {exact: false})).toHaveCount(0);
+    await expect(page.getByText('failed validation', {exact: false})).toHaveCount(0);
+  });
+
+  for (const [label, width, height] of [['narrow mobile', 320, 800], ['narrow mobile', 360, 800], ['narrow mobile', 390, 800], ['tablet', 768, 1024], ['desktop', 1440, 900]]) {
+    test(`${label} viewport (${width}px): data-quality warning below the "not enough data" threshold has no horizontal page overflow`, async ({page}) => {
+      await page.setViewportSize({width, height});
+      const report = goldmineBacktest({totalSignals: 3, skippedMalformedRows: 40, skippedMalformedOutcomes: 7});
+      await mockApis(page, {'goldmine:backtest': {status: 200, json: report}});
+      await openDashboard(page);
+      await tab(page, 'Goldmine').click();
+      await expect(page.getByText('40 stored signal rows failed validation', {exact: false})).toBeVisible();
+      const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+      expect(overflow, `Goldmine tab with a below-threshold data-quality warning overflows horizontally by ${overflow}px`).toBeLessThanOrEqual(0);
+    });
+  }
 });
 
 test('Goldmine: idle state before any scan, distinct from an empty result', async ({page}) => {
