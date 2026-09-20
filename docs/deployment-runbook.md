@@ -232,3 +232,38 @@ Migrations earlier in the same publish may already be applied; they stay immutab
 - **Undocumented platform internals:** the Sites migration record table, per-migration transaction scope, and version-rollback behavior after schema changes.
 - **Local engine differences:** the tests use `node:sqlite` (SQLite bundled with Node), not D1. `npm run db:migrate:local` runs the migrations in Miniflare's local D1, but neither engine proves production D1 behavior for `PRAGMA foreign_keys` during table rebuilds.
 - **Diagnostics depend on log access:** routes write redacted `coin_radar.failure` records, but whether the Site owner can read production Worker logs through Sites is unverified. `/api/health` works without log access.
+
+## 10. Vercel + Turso deployment (Stage 04)
+
+A second, **independent** production deployment, alongside - not replacing - the Sites/D1 deployment described in sections 1-9, which this stage never touches or weakens. The Vercel project (`coin-radar`, team `wwwfraps-9580s-projects`) already exists; this section describes only the application code's side of making it deployable.
+
+**Architecture.** `next.config.ts` aliases `cloudflare:workers` to `lib/vercel-cloudflare-workers.ts` whenever `process.env.VERCEL` is set (Vercel sets this automatically on every build and runtime invocation). That module builds an `env` object shaped like Cloudflare's:
+
+- `env.DB` resolves to a Turso (libSQL) adapter (`lib/turso-db.ts`, backed by `@libsql/client`) only when both `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN` are set. If either is missing, `env.DB` stays absent and every D1-backed route answers 503 exactly as it always has on an unconfigured Vercel preview - **never** a silent degrade or a faked success.
+- `env.X_BEARER_TOKEN` and `env.GOLDMINE_CRON_SECRET` pass through from `process.env` the same way, so route code that reads them via `env` needs no platform branching.
+
+Turso is SQLite-wire-compatible, so every hand-written SQL statement and the D1-shaped `.prepare(sql).bind(...args).first()/.all()/.run()` call pattern run completely unchanged - only the client differs.
+
+**Identity.** Sites' `oai-authenticated-user-*` headers are never trusted off Sites (`app/chatgpt-auth.ts`'s `runsOutsideSites()`, unchanged from before this stage). On Vercel, identity instead comes from a signed owner-auth session cookie (`app/owner-auth.ts`): `POST /api/auth/login` verifies a password against `OWNER_PASSWORD_HASH` (salted scrypt, constant-time compare) and, on success, sets an HMAC-signed, httpOnly, Secure, `SameSite=Strict` cookie (`AUTH_SECRET` signs it); a valid cookie resolves to the fixed synthetic user id `"owner"`, so existing per-user storage (`research_accounts` etc.) keeps working unchanged for a single owner. `POST /api/auth/logout` clears the cookie. `app/login/page.tsx` is the sign-in form. Both secrets fail closed if unset - no cookie can ever be issued or verified, and login answers 503 rather than operate insecurely.
+
+**Goldmine scheduling.** `app/api/goldmine/scheduled/route.ts` (`GET` and `POST`) runs the same pipeline and the same shared `goldmine:scan` lock as the interactive `POST /api/goldmine` (`lib/goldmine/scan.ts`). `vercel.json` schedules `GET /api/goldmine/scheduled` every 5 minutes via Vercel Cron. Authorization is a shared secret only (`lib/goldmine/scheduled-auth.ts`): either the `x-goldmine-cron-secret` custom header (`GOLDMINE_CRON_SECRET`) or Vercel Cron's native `Authorization: Bearer <CRON_SECRET>` convention - **the latter is implemented per Vercel's published documentation and was not independently verified against a live deployment**; both conventions are supported specifically because of that uncertainty. See docs/goldmine-intelligence.md section 4 for detail. It is now safe to point a scheduler at this deployment; the previous blanket warning against doing so applied only to the (still-unscheduled) Sites/D1 path.
+
+**Env vars required for this deployment to work** (set as Vercel project environment variables for `coin-radar` / `wwwfraps-9580s-projects`):
+
+| Variable | Purpose | Generate with |
+| --- | --- | --- |
+| `TURSO_DATABASE_URL` | Turso database connection URL. | Provisioned by creating a Turso database (`turso db create`/Turso dashboard). |
+| `TURSO_AUTH_TOKEN` | Turso database auth token. | Provisioned alongside the database. |
+| `AUTH_SECRET` | HMAC key signing the owner session cookie. | `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"` |
+| `OWNER_PASSWORD_HASH` | Salted-scrypt hash of the owner's login password, `"<saltHex>:<hashHex>"`. | `node -e "const c=require('crypto');const s=c.randomBytes(16).toString('hex');console.log(s+':'+c.scryptSync(process.argv[1],s,64).toString('hex'))" '<password>'` |
+| `GOLDMINE_CRON_SECRET` | Custom-header Goldmine scheduler secret (optional if relying only on `CRON_SECRET`). | `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"` |
+| `CRON_SECRET` | Vercel Cron's native bearer secret; setting this project env var makes Vercel automatically send it as `Authorization: Bearer <value>` on cron requests (per Vercel's documentation, not independently verified here). | `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"` |
+| `X_BEARER_TOKEN` | X (Twitter) API bearer token, same purpose as on Sites. Optional; social research stays disabled without it. | Obtained from the X developer portal. |
+
+**Migrating the schema.** `npm run db:migrate:turso` (`scripts/migrate-turso.mjs`) applies `drizzle/*.sql` to a Turso database in journal order, tracked in a `_turso_migrations` table, mirroring how migrations are applied locally (`tests/helpers/migration-db.mjs`) and on D1. It requires `TURSO_DATABASE_URL`/`TURSO_AUTH_TOKEN` to run for real and is proven correct in `tests/migrate-turso.test.mjs` against `@libsql/client`'s local `":memory:"` mode, since no real Turso credentials exist for this project yet.
+
+**No data migration from D1 to Turso.** D1 is reachable only from inside Sites/Cloudflare; nothing in this repository can read it from outside that environment, and no such migration is implemented anywhere. **A fresh Turso database starts completely empty.** This is a known, accepted limitation of running two independent production databases, not a bug: the Sites/D1 deployment remains the original, authoritative deployment with all existing data; the Vercel/Turso deployment is a new deployment that begins with no signals, no accounts and no positions.
+
+**Build.** `npm run build:vercel` (`scripts/build-vercel.mjs`) builds successfully with no Turso credentials present at all - the Turso client is only ever constructed at runtime (inside route handlers, via `env.DB`), never at build time, so a missing `TURSO_DATABASE_URL`/`TURSO_AUTH_TOKEN` cannot fail the build; it only makes every D1-backed route answer 503 once deployed, exactly as intended.
+
+**Remaining blocker before this deployment can go live:** no real Turso account or database exists yet, and no value has been chosen yet for `AUTH_SECRET`/`OWNER_PASSWORD_HASH`. The project owner must provision a Turso database and choose an owner password, then set all of the env vars above as Vercel project environment variables, before the Vercel deployment serves real traffic.

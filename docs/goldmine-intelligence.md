@@ -12,7 +12,7 @@ DEX Screener discovery (lib/market.ts discoverSolanaPairs, shared with GET /api/
   -> goldmine_signals + goldmine_outcomes                   (lib/goldmine/signals.ts)
 ```
 
-`POST /api/goldmine` (signed in, same origin, one shared lock `goldmine:scan`) first settles due outcomes, then discovers, scores, attaches contract safety (lib/goldmine/contract-safety.ts, Stage 03B) for actionable candidates, then re-scores and records. `GET /api/goldmine` reads recent signals and statistics. Without the D1 binding (the Vercel preview) both answer 503 before any provider call.
+`POST /api/goldmine` (signed in, same origin, one shared lock `goldmine:scan`) first settles due outcomes, then discovers, scores, attaches contract safety (lib/goldmine/contract-safety.ts, Stage 03B) for actionable candidates, then re-scores and records. `GET /api/goldmine` reads recent signals and statistics. Without a working `DB` binding - D1 on Sites, or Turso on Vercel when `TURSO_DATABASE_URL`/`TURSO_AUTH_TOKEN` are unset (docs/deployment-runbook.md) - both answer 503 before any provider call.
 
 ## 2. Candidate snapshot
 
@@ -107,6 +107,17 @@ RugCheck's own score or verdict is never read. Instead its facts feed our own de
 - Due outcomes are grouped by recorded pool and read in batches of at most 30 pools, earliest-closing window first (then pool and token), with at most 5 requests per scan, sent in parallel. A failed batch leaves only its own outcomes pending; pools beyond the cap are reported as `deferred` and read by the next scan while their windows are open.
 - Evaluation runs only when someone scans, so without a scheduler many outcomes will be `missed`. Prices are provider quotes, not executable prices; returns ignore fees, slippage and liquidity.
 
+### Scheduled scans
+
+`app/api/goldmine/scheduled/route.ts` (`GET` and `POST`, both run `lib/goldmine/scan.ts`'s `runGoldmineScan`, the same pipeline and the same shared `goldmine:scan` lock as the interactive `POST /api/goldmine`) is the unattended entry point. There is no signed-in user and no browser origin for a scheduler, so it never uses `getChatGPTUser()`/`sameOrigin()`; authorization is entirely `lib/goldmine/scheduled-auth.ts`'s shared-secret check, which accepts either:
+
+- `x-goldmine-cron-secret: <GOLDMINE_CRON_SECRET>` - a custom header, for any scheduler that can set an arbitrary header (a future Cloudflare Worker cron trigger once Sites supports it, or a manual/curl trigger).
+- `Authorization: Bearer <CRON_SECRET>` - Vercel Cron's native convention: Vercel automatically sends a project's `CRON_SECRET` env var as this header on requests it makes to a `crons` entry in `vercel.json`. **This could not be independently verified against a live Vercel deployment** (no Vercel cron job has been run yet for this project); it is implemented per Vercel's current published documentation. Both conventions are supported side by side specifically because of this uncertainty - a misunderstanding of Vercel's exact request format degrades to "cron secret rejected", never to a silently unauthenticated endpoint.
+
+Both env vars fail closed like every other secret check in this codebase: if unset, that path can never authorize a request, however it is called.
+
+`vercel.json` schedules `GET /api/goldmine/scheduled` every 5 minutes (`*/5 * * * *`), matching the cadence recommended above. This is the Vercel+Turso deployment's scheduler; it is independent of, and does not replace, a possible future Cloudflare Worker cron trigger for the Sites/D1 deployment (03C in the roadmap below).
+
 ## 5. Extension points
 
 - **Contract safety dashboard:** built (section 6, 03B). `GET /api/goldmine`'s `signals[]` now includes each signal's `contractSafety`, reduced to the client-facing `ContractSafetySummary` shape (`{status}` for verified/unavailable, `{status, reason}` for unsafe) - never the stored `facts`, `failedChecks` wording beyond that reason, or RugCheck's own `providerRisks`/`providerScoreNormalized`, which stay server-side only. A deeper view would need a new, deliberately-scoped field, not widening this one.
@@ -121,7 +132,7 @@ RugCheck's own score or verdict is never read. Instead its facts feed our own de
 | --- | --- | --- |
 | 03A (this) | Snapshot model, Momentum Score v2, hard gates, states, signal and outcome tracking, explanations. | No |
 | 03B | Contract safety evidence (mint and freeze authority, top-holder concentration, LP status), so opportunities can exist (done, section 3b); Goldmine dashboard panel with explanations and outcome history (done, app/goldmine-panel.tsx). | Safety provider — approved and implemented: RugCheck's public API (section 3b) |
-| 03C | Scheduled scans and outcome evaluation, and retention of old signals. | Confirm Sites supports Worker cron triggers |
+| 03C | Scheduled scans and outcome evaluation, and retention of old signals. | Confirm Sites supports Worker cron triggers. Done for the **Vercel+Turso** deployment (Stage 04, see docs/deployment-runbook.md) via Vercel Cron (section 4 above); the Sites/D1 deployment still has no scheduler until Sites supports Worker cron triggers. |
 | 03D (this) | Backtesting and calibration: re-score stored snapshots, per-state and per-version outcome reports, threshold review (done, section 3c). | No |
 | 03E | Paper trading from signals, with simulated fees and slippage. No real funds. | No |
 | 03F | Smart-wallet tracking. | Paid or keyed provider |
