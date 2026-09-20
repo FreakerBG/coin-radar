@@ -116,7 +116,7 @@ RugCheck's own score or verdict is never read. Instead its facts feed our own de
 
 Both env vars fail closed like every other secret check in this codebase: if unset, that path can never authorize a request, however it is called.
 
-`vercel.json` schedules `GET /api/goldmine/scheduled` every 5 minutes (`*/5 * * * *`), matching the cadence recommended above. This is the Vercel+Turso deployment's scheduler; it is independent of, and does not replace, a possible future Cloudflare Worker cron trigger for the Sites/D1 deployment (03C in the roadmap below).
+`vercel.json` currently schedules `GET /api/goldmine/scheduled` once a day (`0 0 * * *`), **not** the 5-minute cadence recommended above, because Vercel restricts cron frequency by plan and this account's plan was not confirmed to support sub-daily schedules at migration time — shipping `*/5 * * * *` unconditionally risked a silently-rejected or misbehaving cron. Once the plan is confirmed (or upgraded) to support it, change `vercel.json`'s `schedule` to `*/5 * * * *`. This is the Vercel+Turso deployment's scheduler; it is independent of, and does not replace, a possible future Cloudflare Worker cron trigger for the Sites/D1 deployment (03C in the roadmap below).
 
 ## 5. Extension points
 
