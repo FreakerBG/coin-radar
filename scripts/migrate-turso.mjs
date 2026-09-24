@@ -16,7 +16,7 @@
 // owner provisions one and sets those two env vars. It is proven correct in tests/migrate-turso.test.mjs
 // against @libsql/client's local ":memory:" mode, which needs no network or credentials.
 import { fileURLToPath } from "node:url";
-import { readMigrations } from "./migrations.mjs";
+import { readMigrations, verifyMigrations } from "./migrations.mjs";
 
 export const TRACKING_TABLE = "_turso_migrations";
 
@@ -66,7 +66,12 @@ async function main() {
     process.exit(64);
   }
 
-  const migrations = readMigrations();
+  // verifyMigrations(), not readMigrations(): this command applies migrations to a real production
+  // database, so it must enforce db/migrations.lock.json exactly as the build does
+  // (scripts/run-framework.mjs, scripts/build-vercel.mjs). readMigrations() alone only proves the
+  // journal is internally consistent; it would happily apply a locked migration whose SQL was edited
+  // after it had already been applied elsewhere.
+  const migrations = verifyMigrations();
   const client = createClient({ url, authToken });
   try {
     const applied = await applyTursoMigrations(client, migrations);

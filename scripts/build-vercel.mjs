@@ -1,5 +1,18 @@
 import { spawn } from "node:child_process";
 import { rm } from "node:fs/promises";
+import { MigrationCheckError, verifyMigrations } from "./migrations.mjs";
+
+// The Vercel deployment applies these same migrations to Turso (scripts/migrate-turso.mjs), so this
+// build refuses a malformed migration history or a rewritten locked migration for exactly the reason
+// the Cloudflare build does (scripts/run-framework.mjs). Files only - no database, no network, and
+// nothing here reaches Turso: it reads drizzle/ and db/migrations.lock.json and compares hashes.
+try {
+  verifyMigrations();
+} catch (error) {
+  if (!(error instanceof MigrationCheckError)) throw error;
+  console.error(error.message);
+  process.exit(1);
+}
 
 // vinext and Next.js both use `.next` for generated metadata, but their
 // contents are not interchangeable when developers run both builds locally.
