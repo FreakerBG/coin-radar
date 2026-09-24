@@ -24,7 +24,8 @@
     "db:migrations:check": "node scripts/db-migrations.mjs check",
     "db:migrate:local": "node scripts/db-migrations.mjs apply-local",
     "db:migrations:list:local": "node scripts/db-migrations.mjs list-local",
-    "db:migrate:turso": "node scripts/migrate-turso.mjs"
+    "db:migrate:turso": "node scripts/migrate-turso.mjs",
+    "owner:hash": "node --experimental-strip-types scripts/owner-password-hash.mjs"
   },
   "dependencies": {
     "@base-ui/react": "^1.7.0",

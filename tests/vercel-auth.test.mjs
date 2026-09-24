@@ -4,7 +4,7 @@
 // front door and is publicly reachable, so these headers must never be trusted there, however
 // they are forged. Public market data must keep working regardless.
 import assert from 'node:assert/strict';
-import {randomBytes, scryptSync} from 'node:crypto';
+
 import {afterEach, beforeEach, describe, test} from 'node:test';
 import {addresses, body, createD1, installFetch, jsonRequest, offlineFetch, runtime, signIn, signOut, startClock} from './helpers/harness.mjs';
 
@@ -12,16 +12,16 @@ const {getChatGPTUser, requireChatGPTUser} = await import('../app/chatgpt-auth.t
 const {GET: portfolioGet} = await import('../app/api/portfolio/route.ts');
 const {GET: socialGet} = await import('../app/api/social/route.ts');
 const {GET: marketGet} = await import('../app/api/market/route.ts');
-const {SESSION_COOKIE, createOwnerSession} = await import('../app/owner-auth.ts');
+const {SESSION_COOKIE, createOwnerSession, hashOwnerPassword} = await import('../app/owner-auth.ts');
 const {POST: loginPost} = await import('../app/api/auth/login/route.ts');
 const {POST: logoutPost} = await import('../app/api/auth/logout/route.ts');
 
 const ORIGINAL_AUTH_SECRET = process.env.AUTH_SECRET;
 const ORIGINAL_OWNER_PASSWORD_HASH = process.env.OWNER_PASSWORD_HASH;
-function ownerPasswordHash(password) {
-  const salt = randomBytes(16).toString('hex');
-  return `${salt}:${scryptSync(password, Buffer.from(salt, 'hex'), 64).toString('hex')}`;
-}
+// The hash the supported operator workflow produces. `npm run owner:hash` calls this exact
+// function, so these tests exercise the credential an operator would really configure - not a
+// lookalike built to match the verifier, which is how the salt-encoding mismatch went unnoticed.
+const ownerPasswordHash = password => hashOwnerPassword(password);
 
 let d1;
 beforeEach(() => {
@@ -53,7 +53,9 @@ describe('off Sites (Vercel), forged oai-authenticated-user-* headers grant noth
 
   test('requireChatGPTUser redirects to sign-in instead of trusting forged headers', async () => {
     process.env.VERCEL = '1';
-    await assert.rejects(() => requireChatGPTUser('/'), /Unexpected redirect to \/signin-with-chatgpt/);
+    // Off Sites the redirect goes to /login: /signin-with-chatgpt is served by the Sites front door,
+    // outside this application, so sending a Vercel visitor there 404s. See tests/owner-login-flow.test.mjs.
+    await assert.rejects(() => requireChatGPTUser('/'), /Unexpected redirect to \/login/);
   });
 
   test('a storage-backed, authenticated route fails closed (401) without touching storage', async () => {
