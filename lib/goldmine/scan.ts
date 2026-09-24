@@ -11,6 +11,26 @@ import {attachSocialEvidence, evaluateOutcomes, recordSignals} from './signals';
 import {bestPoolSnapshots, contractSafetySummary} from './snapshot';
 import {withContractSafety} from './contract-safety';
 
+// Lease length for the shared `goldmine:scan` lock (lib/research-db.ts). It must exceed the worst
+// case runtime of runGoldmineScan(), because acquireLock() hands out a lease, not a mutex: a scan
+// that outlives its lease has it expire underneath it, and a second scan then legitimately acquires
+// and runs concurrently. Two concurrent scans call Date.now() at different instants, so the signal
+// ids they derive differ, the INSERT OR IGNORE in recordSignals() does not collapse them, and the
+// same token is recorded twice for one window - which then skews every outcome and backtest
+// statistic computed over those rows.
+//
+// The previous 60s default was already below the pipeline’s own provider budgets, which alone come
+// to roughly: 10s settling outcomes (5 parallel batches, lib/goldmine/signals.ts), up to ~24s
+// discovery (lib/market.ts, 12s per request), and up to 28s of contract safety (SCAN_BUDGET_MS plus
+// one in-flight 8s request, lib/goldmine/contract-safety.ts) - before a single database round trip,
+// which on Turso crosses the network rather than staying in-process as it does on D1.
+//
+// 300s is the ceiling the platform itself enforces: Vercel terminates a function at its max duration,
+// 300s on this account’s plan (Hobby; vercel.com/docs/functions/limitations). A scan cannot still be
+// running when this lease expires, because the platform will have killed it first. The cost of the
+// longer lease is that a scan killed mid-flight blocks the next one for up to 5 minutes; for a
+// once-a-day cron plus occasional manual scans that is the right trade against duplicate signals.
+export const SCAN_LOCK_TTL_MS = 300_000;
 const COVERAGE = 'Latest DEX Screener profiles and promoted tokens; up to 30 Solana tokens, highest-liquidity pool per token. Not a whole-market scan.';
 
 // Opportunities first, rejected last, then by score; the address breaks ties so the order is deterministic.

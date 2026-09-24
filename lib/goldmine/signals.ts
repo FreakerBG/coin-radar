@@ -19,7 +19,8 @@ export const HORIZONS = [
 // create a signal per scan.
 export const SIGNAL_BUCKET_MS = 6 * HOUR;
 // DEX Screener's pairs endpoint accepts up to 30 pair addresses per request. A scan sends at most
-// MAX_OUTCOME_BATCHES requests (150 pairs), in parallel so it stays well inside the 60-second scan lock.
+// MAX_OUTCOME_BATCHES requests (150 pairs), in parallel so it stays well inside the scan lock lease
+// (lib/goldmine/scan.ts SCAN_LOCK_TTL_MS).
 export const MAX_PAIRS_PER_REQUEST = 30;
 export const MAX_OUTCOME_BATCHES = 5;
 // Signals written per INSERT. A signal with its snapshot and assessment is about 4 KB of JSON, so ten keep

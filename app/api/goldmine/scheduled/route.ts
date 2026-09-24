@@ -13,7 +13,7 @@
 // method just because it uses the "other" convention.
 import { reportFailure } from '@/lib/diagnostics';
 import { acquireLock, db, releaseLock } from '@/lib/research-db';
-import { runGoldmineScan } from '@/lib/goldmine/scan';
+import { runGoldmineScan, SCAN_LOCK_TTL_MS } from '@/lib/goldmine/scan';
 import { isAuthorizedScheduledScan } from '@/lib/goldmine/scheduled-auth';
 
 const noStore = { 'Cache-Control': 'no-store' };
@@ -26,7 +26,7 @@ async function scan(request: Request): Promise<Response> {
   let lock: string | null = null;
   try {
     const database = db();
-    lock = await acquireLock(LOCK_ID);
+    lock = await acquireLock(LOCK_ID, SCAN_LOCK_TTL_MS);
     if (!lock) return Response.json({ status: 'busy', candidates: [] }, { headers: noStore });
     const result = await runGoldmineScan(database, Date.now());
     return Response.json(result, { headers: noStore });
