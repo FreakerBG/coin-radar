@@ -8,12 +8,12 @@
 //      docs/goldmine-intelligence.md, or a manual/curl trigger).
 //   2. `Authorization: Bearer <CRON_SECRET>` - Vercel Cron's native convention: when a `CRON_SECRET`
 //      project environment variable is set, Vercel automatically sends it as this header on requests
-//      it makes to a `crons` entry in vercel.json. This repository could not independently verify that
-//      behavior against a live Vercel deployment (no Vercel account/cron job exists yet to observe);
-//      it is implemented here per Vercel's current published documentation and is intentionally kept
-//      alongside the custom-header path rather than assumed to be the only mechanism, so a
-//      misunderstanding of Vercel's exact request format degrades to "cron secret rejected", not to a
-//      silently unauthenticated endpoint.
+//      it makes to a `crons` entry in vercel.json, and Vercel's documentation shows handlers comparing
+//      exactly that (vercel.com/docs/cron-jobs/manage-cron-jobs). No platform-triggered run has been
+//      observed for this project yet: crons register from a production deployment and none carrying the
+//      `crons` entry exists, so only a manual authenticated request has ever exercised this. The
+//      custom-header path is kept alongside it so that a misunderstanding of Vercel's exact request
+//      format degrades to "cron secret rejected", not to a silently unauthenticated endpoint.
 //
 // Fails closed like every check in this codebase (lib/diagnostics.ts, the CSRF check): if the relevant
 // env var is unset, that path can never authorize a request, however it is called. Comparisons are
