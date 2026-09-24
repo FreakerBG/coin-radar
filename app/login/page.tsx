@@ -5,6 +5,27 @@ import { Radar, Lock } from 'lucide-react';
 
 // Owner-secret sign-in for the Vercel+Turso deployment (app/owner-auth.ts). This page only matters
 // off Sites: on Sites, Sign in with ChatGPT is handled entirely outside this app (app/chatgpt-auth.ts).
+
+// Where to go after a successful sign-in. `return_to` arrives in the URL from
+// chatGPTSignInPath() (app/chatgpt-auth.ts), which already sanitized it - but it is still a value
+// from the address bar, so it is re-checked here rather than trusted. Anything that is not a plain
+// path on this origin becomes "/": in particular "//evil.com" and "/..//evil.com" both normalize to
+// a pathname starting with "//", which a browser resolves as another origin.
+function safeReturnTo(): string {
+  if (typeof window === 'undefined') return '/';
+  const raw = new URLSearchParams(window.location.search).get('return_to');
+  if (!raw || !raw.startsWith('/')) return '/';
+  let url: URL;
+  try {
+    url = new URL(raw, window.location.origin);
+  } catch {
+    return '/';
+  }
+  if (url.origin !== window.location.origin) return '/';
+  if (url.pathname.startsWith('//') || url.pathname === '/login' || url.pathname.startsWith('/api/auth/')) return '/';
+  return `${url.pathname}${url.search}${url.hash}`;
+}
+
 export default function LoginPage() {
   const router = useRouter();
   const [password, setPassword] = useState('');
@@ -33,7 +54,7 @@ export default function LoginPage() {
         setError(message);
         return;
       }
-      router.push('/');
+      router.replace(safeReturnTo());
       router.refresh();
     } catch {
       setError('Could not reach the server. Check your connection and try again.');

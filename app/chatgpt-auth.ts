@@ -18,6 +18,10 @@ const PERCENT_ENCODED_UTF8 = "percent-encoded-utf-8";
 const SIGN_IN_PATH = "/signin-with-chatgpt";
 const SIGN_OUT_PATH = "/signout-with-chatgpt";
 const CALLBACK_PATH = "/callback";
+// Off Sites there is no ChatGPT front door and no /signin-with-chatgpt route: that path is served by
+// Sites itself, outside this application, so sending a Vercel visitor there produces a 404 and no way
+// to sign in at all. The owner-secret form (app/login/page.tsx) is the sign-in surface there.
+export const OWNER_SIGN_IN_PATH = "/login";
 
 // oai-authenticated-user-* headers are trustworthy only because OpenAI Sites' private front door
 // sets them itself, after Sign in with ChatGPT, and the Site cannot be reached without it. The
@@ -90,9 +94,13 @@ export async function requireChatGPTUser(
   redirect(chatGPTSignInPath(returnTo));
 }
 
+// Where an unauthenticated visitor is sent to sign in. On Sites that is the front door's own
+// /signin-with-chatgpt; off Sites (Vercel) it is this application's /login, because the Sites path
+// does not exist there.
 export function chatGPTSignInPath(returnTo: string): string {
   const safeReturnTo = safeRelativeReturnPath(returnTo);
-  return `${SIGN_IN_PATH}?return_to=${encodeURIComponent(safeReturnTo)}`;
+  const path = runsOutsideSites() ? OWNER_SIGN_IN_PATH : SIGN_IN_PATH;
+  return `${path}?return_to=${encodeURIComponent(safeReturnTo)}`;
 }
 
 export function chatGPTSignOutPath(returnTo = "/"): string {
@@ -100,8 +108,17 @@ export function chatGPTSignOutPath(returnTo = "/"): string {
   return `${SIGN_OUT_PATH}?return_to=${encodeURIComponent(safeReturnTo)}`;
 }
 
+// Reduces an untrusted `return_to` to a path on this origin, or "/" if it cannot.
+//
+// The result must be safe to put in a Location header or router.push(), which means it must not be
+// able to name another origin. Checking the *input* for a leading "//" is not enough, because URL
+// parsing normalizes: "/..//evil.com" has origin https://app.local (so it passes an origin check) but
+// its pathname is "//evil.com", and a browser resolves that as https://evil.com/. So the check is
+// applied to the normalized pathname that is actually returned, not to the raw input. Backslash and
+// tab variants ("/\evil.com", "/\t/evil.com") are already caught by the origin comparison, because
+// WHATWG parsing treats those as authority separators.
 function safeRelativeReturnPath(value: string): string {
-  if (!value.startsWith("/") || value.startsWith("//")) return "/";
+  if (typeof value !== "string" || !value.startsWith("/")) return "/";
 
   let url: URL;
   try {
@@ -110,16 +127,22 @@ function safeRelativeReturnPath(value: string): string {
     return "/";
   }
   if (url.origin !== "https://app.local") return "/";
+  // Checked after normalization: this is the value that is handed back and acted on.
+  if (!url.pathname.startsWith("/") || url.pathname.startsWith("//")) return "/";
   if (isReservedAuthPath(url.pathname)) return "/";
 
   return `${url.pathname}${url.search}${url.hash}`;
 }
 
+// Paths that must never be a return destination: bouncing back to a sign-in, sign-out or callback
+// route after signing in either loops or immediately undoes the sign-in.
 function isReservedAuthPath(pathname: string): boolean {
   return (
     pathname === SIGN_IN_PATH ||
     pathname === SIGN_OUT_PATH ||
-    pathname === CALLBACK_PATH
+    pathname === CALLBACK_PATH ||
+    pathname === OWNER_SIGN_IN_PATH ||
+    pathname.startsWith("/api/auth/")
   );
 }
 

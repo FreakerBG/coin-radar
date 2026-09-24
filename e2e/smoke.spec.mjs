@@ -42,6 +42,8 @@ async function mockApis(page, overrides = {}) {
     portfolio: {status: 401, json: {error: 'Sign in to load your research account.'}},
     advisor: {status: 401, json: {error: 'Sign in required.'}},
     monitor: {status: 401, json: {error: 'Sign in required.'}},
+    // The topbar sign-in control reads this. Anonymous by default, matching the other fixtures.
+    'auth:session': {status: 200, json: {signedIn: false, signInPath: '/login?return_to=%2F'}},
     goldmine: {status: 200, json: goldmineTracking()},
     'goldmine:backtest': {status: 200, json: goldmineBacktest()},
     ...overrides,
@@ -412,3 +414,40 @@ for (const [label, width, height] of [['narrow mobile', 320, 800], ['narrow mobi
     expect(overflow, `Goldmine tab with a data-quality warning overflows horizontally by ${overflow}px`).toBeLessThanOrEqual(0);
   });
 }
+
+// The Vercel deployment shipped app/login/page.tsx with nothing linking to it and no way to sign
+// out: every data route answered 401 and the page offered no affordance to fix that. These cover
+// the control that makes sign-in reachable and sign-out possible.
+test('an anonymous visitor gets a sign-in link in the topbar that points at /login', async ({page}) => {
+  await mockApis(page);
+  await openDashboard(page);
+  const signIn = page.getByRole('link', {name: 'Sign in'});
+  await expect(signIn).toBeVisible();
+  await expect(signIn).toHaveAttribute('href', /^\/login\?return_to=/);
+  await expect(page.getByRole('button', {name: 'Sign out'})).toHaveCount(0);
+});
+
+test('a signed-in owner gets a sign-out control instead, and no identity is rendered', async ({page}) => {
+  await mockApis(page, {'auth:session': {status: 200, json: {signedIn: true, signInPath: null}}});
+  await openDashboard(page);
+  await expect(page.getByRole('button', {name: 'Sign out'})).toBeVisible();
+  await expect(page.getByRole('link', {name: 'Sign in'})).toHaveCount(0);
+  // Nothing identifying is shown: the session endpoint never returns a user id or email.
+  await expect(page.getByText('owner@vercel.local')).toHaveCount(0);
+});
+
+// Server-rendered content only. The interactive behaviour of this form (typing enables the submit
+// button, a rejected password shows the server's message) is covered against the real Vercel build
+// artifact rather than here: the vinext dev server this suite runs against serves /login's markup but
+// does not hydrate it, so a click here would test the dev server, not the page. The deployed Vercel
+// build does hydrate it - see docs/deployment-runbook.md section 10, "Known limitation".
+test('the sign-in page is served and shows the owner sign-in form', async ({page}) => {
+  await mockApis(page);
+  await page.goto('/login');
+  await expect(page.getByRole('heading', {name: 'Owner sign-in'})).toBeVisible();
+  await expect(page.getByLabel('Password')).toBeVisible();
+  await expect(page.getByRole('button', {name: 'Sign in'})).toBeVisible();
+  // No identity, no hint about whether a password is configured, and nothing private on an
+  // unauthenticated page.
+  await expect(page.getByText('Single-owner private tool.')).toBeVisible();
+});
