@@ -21,28 +21,30 @@ function toPlainRow(row: Row, columns: string[]): PlainRow {
 }
 
 class TursoPreparedStatement {
-  private readonly client: Client;
+  // A function, not a Client: the client is built on first execute() so that importing this module
+  // (which Next.js does during a build) never constructs one. See createTursoDatabase below.
+  private readonly connect: () => Client;
   private readonly sql: string;
   private readonly args: InArgs;
 
-  constructor(client: Client, sql: string, args: InArgs) {
-    this.client = client;
+  constructor(connect: () => Client, sql: string, args: InArgs) {
+    this.connect = connect;
     this.sql = sql;
     this.args = args;
   }
 
   bind(...args: unknown[]): TursoPreparedStatement {
-    return new TursoPreparedStatement(this.client, this.sql, args as InArgs);
+    return new TursoPreparedStatement(this.connect, this.sql, args as InArgs);
   }
 
   async first<T = PlainRow>(): Promise<T | null> {
-    const result = await this.client.execute({sql: this.sql, args: this.args});
+    const result = await this.connect().execute({sql: this.sql, args: this.args});
     const [row] = result.rows;
     return row ? (toPlainRow(row, result.columns) as T) : null;
   }
 
   async all<T = PlainRow>(): Promise<{results: T[]; success: true; meta: Record<string, never>}> {
-    const result = await this.client.execute({sql: this.sql, args: this.args});
+    const result = await this.connect().execute({sql: this.sql, args: this.args});
     return {
       results: result.rows.map(row => toPlainRow(row, result.columns) as T),
       success: true,
@@ -51,7 +53,7 @@ class TursoPreparedStatement {
   }
 
   async run(): Promise<{success: true; meta: {changes: number}}> {
-    const result = await this.client.execute({sql: this.sql, args: this.args});
+    const result = await this.connect().execute({sql: this.sql, args: this.args});
     return {success: true, meta: {changes: Number(result.rowsAffected)}};
   }
 }
@@ -60,11 +62,22 @@ export type TursoDatabase = {
   prepare(sql: string): TursoPreparedStatement;
 };
 
+// The libSQL client is created on first use, not here. Next.js evaluates module scope during the
+// build to prerender and collect page data, and lib/vercel-cloudflare-workers.ts (which calls this)
+// is module scope reached by every D1-backed route. Constructing eagerly meant a build with a
+// malformed or unreachable TURSO_DATABASE_URL could fail at build time rather than at request time,
+// and made "the client is never constructed during a build" untrue. Deferring it keeps a build
+// independent of database configuration, which is what the runbook promises.
+//
+// One client per module instance, reused across invocations: on serverless that means one per warm
+// instance, which is what @libsql/client's HTTP transport expects. Nothing here opens a connection
+// until a statement actually runs.
 export function createTursoDatabase(config: {url: string; authToken: string}): TursoDatabase {
-  const client = createClient(config);
+  let client: Client | undefined;
+  const connect = () => (client ??= createClient(config));
   return {
     prepare(sql: string) {
-      return new TursoPreparedStatement(client, sql, []);
+      return new TursoPreparedStatement(connect, sql, []);
     },
   };
 }
