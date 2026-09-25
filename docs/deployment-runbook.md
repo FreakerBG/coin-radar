@@ -428,3 +428,19 @@ So the scheduler needs **no** bypass secret, no protection exception and no cust
 | Automation bypass secret | Automated probes stop working until re-issued. The application and the cron are unaffected. |
 
 **Rollback.** Promote `dpl_2REUsqZydVvTGaicc9YJWJyPXRi7` (`4ea346af`) in the Vercel dashboard, or `vercel rollback <deployment> --scope vibe-code22`. Migrations are forward-only and additive, so the older build runs against the migrated Turso schema without change. Rolling back does **not** unset environment variables and does **not** revert the database; it only moves the production aliases back.
+
+### 10.10 Authenticated production verification (2026-09-25)
+
+Distinct from 10.5's cron-specific observation table: this records the owner-authenticated application checks, run once against the live production deployment (`dpl_B6UfwzPpmqCUb4T9ZPLVcQdpkS4H`) through the Protection Bypass for Automation (10.9), with the owner entering the real password directly into a real terminal - never captured, logged or stored by anything automated.
+
+All of the following passed (15 checks, 0 failures):
+
+- Owner login succeeds; the session cookie is `HttpOnly`, `Secure`, and `SameSite=Strict`.
+- The dashboard loads authenticated; `GET /api/health` reports `{status: 'ok', storage: 'ok', schema: 'compatible'}`.
+- A minimal, uniquely identified position write (`POST /api/portfolio`, action `position`) persists and is readable back across two independent, separate requests.
+- The written row's `user_id` is `owner` in Turso - confirmed directly against the database, since `GET /api/auth/session` deliberately never names who is signed in (10.3).
+- Logout returns a `Set-Cookie` that actually clears the cookie (`Max-Age=0`), which is what makes a real browser tab lose access. Replaying the raw, already-issued token afterward still authenticates - this is documented, deliberate behaviour (10.3: sessions are self-contained; only `AUTH_SECRET` rotation or the token's own 7-day expiry revokes one already issued), not a defect, and was verified to match that documentation rather than assumed.
+- `/` and `/login` both serve a mobile viewport meta tag under a mobile User-Agent.
+- No open redirect and no redirect loop: `app/login/page.tsx`'s `safeReturnTo()` rejects `/login`, off-origin and `//`-prefixed targets outright (source-verified), and the same class of value was independently rejected over HTTP in the anonymous suite (10.9's bypass-based checks).
+
+**Cleanup.** The synthetic position was closed through the supported application action (`POST /api/portfolio`, action `close`) immediately after verification - confirmed in Turso with `closed_at` non-null, which removes it from every place the app shows positions (`getPositions()` filters `WHERE closed_at IS NULL`). It was not deleted from the table; closing is the real, supported reversal this action provides, and is indistinguishable from the app's own "close a position" behaviour.
