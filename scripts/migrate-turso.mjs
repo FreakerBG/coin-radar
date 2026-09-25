@@ -14,10 +14,11 @@
 // Usage: TURSO_DATABASE_URL=... TURSO_AUTH_TOKEN=... npm run db:migrate:turso
 // This is the command that applies migrations to a real production database, so it enforces
 // db/migrations.lock.json via verifyMigrations() - an already-applied migration that was later
-// rewritten is refused here exactly as it is by the builds. No Turso database has been provisioned for
-// this project yet, so it has never been run against a real one; it is proven correct in
-// tests/migrate-turso.test.mjs and tests/migrate-turso-safety.test.mjs against @libsql/client's local
-// ":memory:" and file: modes, which need no network or credentials.
+// rewritten is refused here exactly as it is by the builds. It was first run against the real
+// production database on 2026-09-25 (coin-radar-prod, aws-us-east-1), applying 0000_rare_terror and
+// 0001_goldmine_signals to an empty database; an immediate second run reported no work to do. It is
+// additionally proven correct in tests/migrate-turso.test.mjs and tests/migrate-turso-safety.test.mjs
+// against @libsql/client's local ":memory:" and file: modes, which need no network or credentials.
 import { fileURLToPath } from "node:url";
 import { readMigrations, verifyMigrations } from "./migrations.mjs";
 
@@ -65,7 +66,7 @@ async function main() {
   const url = process.env.TURSO_DATABASE_URL;
   const authToken = process.env.TURSO_AUTH_TOKEN;
   if (!url || !authToken) {
-    console.error("Set TURSO_DATABASE_URL and TURSO_AUTH_TOKEN before running scripts/migrate-turso.mjs. No real Turso database is configured for this project yet.");
+    console.error("Set TURSO_DATABASE_URL and TURSO_AUTH_TOKEN before running scripts/migrate-turso.mjs. See docs/deployment-runbook.md section 10.8 for the provisioned production database.");
     process.exit(64);
   }
 
