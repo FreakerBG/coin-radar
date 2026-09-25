@@ -13,6 +13,7 @@ process.env.TURSO_DATABASE_URL = ':memory:';
 process.env.TURSO_AUTH_TOKEN = 'unused-for-local-mode';
 process.env.X_BEARER_TOKEN = 'x-token-value';
 process.env.GOLDMINE_CRON_SECRET = 'cron-secret-value';
+process.env.CRON_SECRET = 'bearer-secret-value';
 
 const { env } = await import('../lib/vercel-cloudflare-workers.ts');
 
@@ -27,6 +28,7 @@ test('env.DB is present and is a working D1-shaped database when Turso credentia
 test('provider secrets flow through from process.env, the same shape Cloudflare exposes on env', () => {
   assert.equal(env.X_BEARER_TOKEN, 'x-token-value');
   assert.equal(env.GOLDMINE_CRON_SECRET, 'cron-secret-value');
+  assert.equal(env.CRON_SECRET, 'bearer-secret-value');
 });
 
 test('env is frozen, like the Cloudflare-side env object', () => {

@@ -16,6 +16,8 @@ const news = await import('../app/api/news/route.ts');
 const CREDENTIAL = 'offline-test-credential-0123456789';
 const USER = 'user-diagnostics-7f3a';
 const EMAIL = `${USER}@example.test`;
+const GOLDMINE_HEADER_SECRET = 'offline-goldmine-cron-secret-9c1f';
+const VERCEL_BEARER_SECRET = 'offline-vercel-cron-secret-4b2e';
 
 let d1;
 beforeEach(() => {
@@ -23,6 +25,8 @@ beforeEach(() => {
   d1 = createD1();
   runtime.env.DB = d1;
   runtime.env.X_BEARER_TOKEN = CREDENTIAL;
+  runtime.env.GOLDMINE_CRON_SECRET = GOLDMINE_HEADER_SECRET;
+  runtime.env.CRON_SECRET = VERCEL_BEARER_SECRET;
   failures.length = 0;
   signIn(USER);
 });
@@ -30,7 +34,9 @@ beforeEach(() => {
 const summary = () => failures.map(failure => [failure.route, failure.operation, failure.level, failure.error.message]);
 function assertPrivate() {
   const text = JSON.stringify(failures);
-  for (const value of [CREDENTIAL, USER, EMAIL]) assert.equal(text.includes(value), false, `a failure record contains ${value}`);
+  for (const value of [CREDENTIAL, USER, EMAIL, GOLDMINE_HEADER_SECRET, VERCEL_BEARER_SECRET]) {
+    assert.equal(text.includes(value), false, `a failure record contains ${value}`);
+  }
 }
 
 describe('failure records', () => {
@@ -39,6 +45,18 @@ describe('failure records', () => {
     assert.match(redacted, /^Bearer \[redacted\] failed for \[email\] using \[redacted\] x+$/);
     assert.equal(redacted.length, 300);
     assert.equal(redact('BEARER abc, bearer def; Authorization: Bearer ghi'), 'Bearer [redacted] Bearer [redacted] Authorization: Bearer [redacted]');
+  });
+
+  // The generic `Bearer <token>` pattern above already catches CRON_SECRET wherever it is sent with
+  // that prefix (Vercel Cron's own convention). GOLDMINE_CRON_SECRET travels as a bare header value
+  // with no prefix (lib/goldmine/scheduled-auth.ts), so it needs its own exact-value redaction, same as
+  // X_BEARER_TOKEN gets - otherwise a message that echoes a rejected header value verbatim would leak
+  // it. CRON_SECRET is redacted the same explicit way too, as defense-in-depth beyond the generic
+  // Bearer pattern, for a message that might one day echo it without that prefix.
+  test('redact also removes the configured Goldmine scheduled-scan secrets, with or without the Bearer prefix', () => {
+    assert.equal(redact(`rejected header value ${GOLDMINE_HEADER_SECRET} for scheduled scan`), 'rejected header value [redacted] for scheduled scan');
+    assert.equal(redact(`rejected raw secret ${VERCEL_BEARER_SECRET} for scheduled scan`), 'rejected raw secret [redacted] for scheduled scan');
+    assert.equal(redact(`Authorization: Bearer ${VERCEL_BEARER_SECRET}`), 'Authorization: Bearer [redacted]');
   });
 
   test('one JSON line per failure, at the requested level, including a redacted cause', () => {
