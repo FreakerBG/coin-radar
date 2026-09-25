@@ -288,7 +288,7 @@ That is ordinary signed-cookie behaviour, not a defect, and both halves are asse
 
 ### 10.4 Environment variables
 
-Set these as Vercel project environment variables on `vibe-code22` / `coin-radar`. **None of them is set today**, so a deployment made right now would serve 503 from every storage-backed route and refuse every sign-in.
+Set these as Vercel project environment variables on `vibe-code22` / `coin-radar`. **The five required variables were provisioned on 2026-09-25** (Production scope, encrypted; see 10.8). `GOLDMINE_CRON_SECRET` and `X_BEARER_TOKEN` remain deliberately unset, so social research stays disabled and the custom-header scheduler path stays closed.
 
 | Variable | Required? | Purpose | Generate with |
 | --- | --- | --- | --- |
@@ -312,13 +312,14 @@ Each secret fails closed when unset: no cookie can be issued or verified, no log
 
 **What the lock does and does not guarantee.** `acquireLock()` writes a row with an expiry. It excludes a second caller *for the length of the lease*. A holder that runs past its lease has the lease expire underneath it, and a second caller then legitimately acquires - so the lease must exceed the worst-case runtime of the work. The scan takes a 300s lease (`SCAN_LOCK_TTL_MS`), which is the maximum duration Vercel allows a function on this plan, so a scan cannot still be running when its lease expires. It is **not** exactly-once execution: a scan killed mid-flight blocks the next one for up to five minutes, and nothing resumes its partial work - the next scan simply starts over.
 
-**Observation status.** A registered production cron configuration and an observed platform-triggered execution are different things, and neither has happened yet:
+**Observation status.** A registered cron configuration, a platform-triggered execution and an *automatic* schedule-driven execution are three different things. As of 2026-09-25 the first two are observed and the third is not:
 
 | Claim | Status |
 | --- | --- |
 | `vercel.json` declares a daily cron | Verified in the repository. |
-| Vercel has registered the cron job | **No.** Crons register from a production deployment; `main` does not yet contain this branch, and the project's cron definition list is empty. |
-| A platform-triggered scheduled run has been observed | **No.** Nothing to observe yet. After the first production deployment this needs a check on the following day - a manual authenticated request to the endpoint proves the handler works, not that the platform is calling it. |
+| Vercel has registered the cron job | **Yes.** Registered by production deployment `dpl_B6UfwzPpmqCUb4T9ZPLVcQdpkS4H`. `vercel crons ls` reports `/api/goldmine/scheduled` on `0 0 * * *`, and the project's `crons.definitions` names the same pair. |
+| A platform-triggered scheduled run has been observed | **Yes.** `vercel crons run /api/goldmine/scheduled` was triggered at `2026-09-25T08:17:27.111Z`; the runtime log records `GET /api/goldmine/scheduled` returning `200` at `08:17:27.397Z` against the internal deployment domain. See 10.9. |
+| An *automatic* schedule-driven run has been observed | **No - pending observation.** The first automatic execution is expected between **00:00-00:59 UTC on 2026-09-26** (03:00-03:59 Europe/Sofia). A manually triggered run does not substitute for this. |
 
 ### 10.6 Migrations
 
@@ -353,5 +354,77 @@ Running migrations before the deployment exists is safe: the migration command t
 - **No data migration from D1 to Turso.** D1 is reachable only from inside Sites/Cloudflare; nothing in this repository can read it from outside, and no such migration is implemented. **A fresh Turso database starts completely empty.** This is accepted, not a bug: Sites/D1 remains the original deployment with all existing data, and Vercel/Turso is a new deployment that begins with no signals, no accounts and no positions. An empty dashboard on a fresh deployment is expected and must not be read as a broken application.
 - **Daily scanning changes what the signals mean.** `docs/goldmine-intelligence.md` section 4 sizes the outcome windows for frequent scanning. With one scan a day, short-horizon outcomes whose windows close between scans settle as `missed` rather than observed, and results are a once-daily sample - not live intelligence. Do not present them as a five-minute view of the market.
 - **The vinext dev server does not hydrate `/login`.** It serves the markup but the form is not interactive there. The deployed Vercel build does hydrate it (verified against `next build` + `next start`). The browser smoke suite therefore asserts only `/login`'s server-rendered content; the interactive path is covered by the route-level tests in `tests/owner-login-flow.test.mjs`.
-- **Deployment protection blocks anonymous checks.** Vercel SSO covers every `.vercel.app` URL for this project, so an unauthenticated HTTP probe of a preview or production URL gets Vercel's login page rather than the application. Verifying anonymous behaviour over HTTP needs a protection bypass token, which is not configured.
+- **Deployment protection blocks anonymous checks.** Vercel SSO covers every `.vercel.app` URL for this project, so an unauthenticated HTTP probe of a preview or production URL gets Vercel's login page rather than the application. A **Protection Bypass for Automation** secret is now configured (see 10.9), which makes anonymous behaviour verifiable over HTTP without weakening protection. Vercel Authentication remains **enabled** for production.
 - **Rate limiting.** There is none on `POST /api/auth/login`. Password length is bounded and scrypt is deliberately expensive, but a public login endpoint on serverless has no shared counter to rate-limit against - an in-memory counter would be per-instance and would not limit anything. The mitigation that is actually in place is a long, randomly generated owner password.
+
+### 10.8 As provisioned (2026-09-25)
+
+Stage 04A executed the 10.6 order of operations against the real project. This section records what exists, so a later reader does not have to infer it. **No credential value appears here or anywhere else in this repository.**
+
+**Turso production database**
+
+| Property | Value |
+| --- | --- |
+| Database name | `coin-radar-prod` |
+| Host (identity) | `coin-radar-prod-freakerbg.aws-us-east-1.turso.io` |
+| Organisation | `freakerbg` |
+| Region | `aws-us-east-1` (US East), chosen to match the project's Vercel region `iad1` |
+| Plan | Turso free tier |
+| Created | 2026-09-25, empty - see 10.7 on the absence of any D1 import |
+| Migrations applied | `0000_rare_terror`, `0001_goldmine_signals`, both recorded in `_turso_migrations` |
+| Re-run behaviour | A second `npm run db:migrate:turso` reports "already up to date (2 migration(s))" and writes nothing |
+
+**No preview database was created.** Preview deployments therefore have no Turso configuration and every storage-backed route answers 503 there, which is the documented unconfigured behaviour rather than a regression. This keeps the 10.4 preview-isolation rule trivially satisfied: no preview deployment can reach production Turso because no preview deployment has any Turso credential at all. Create `coin-radar-preview` before any preview test that needs to write.
+
+**Vercel production environment variables** - all five Production scope only, stored encrypted, values never displayed or decrypted:
+
+| Variable | Scope | Type |
+| --- | --- | --- |
+| `TURSO_DATABASE_URL` | Production | Encrypted |
+| `TURSO_AUTH_TOKEN` | Production | Encrypted |
+| `AUTH_SECRET` | Production | Encrypted, 32 random bytes |
+| `OWNER_PASSWORD_HASH` | Production | Encrypted, canonical `scrypt$16384$8$1$<salt>$<key>` |
+| `CRON_SECRET` | Production | Encrypted, 32 random bytes |
+
+**Production deployment**
+
+| Property | Value |
+| --- | --- |
+| Deployment | `dpl_B6UfwzPpmqCUb4T9ZPLVcQdpkS4H` |
+| Commit | `5058dc3` (merge of PR #14 into `main`) |
+| State | `READY` |
+| Aliases | `coin-radar-vibe-code22.vercel.app`, `coin-radar-rosy.vercel.app`, `coin-radar-git-main-vibe-code22.vercel.app` |
+| Previous production | `dpl_2REUsqZydVvTGaicc9YJWJyPXRi7` (commit `4ea346af`) - the rollback target |
+
+### 10.9 Deployment protection, the automation bypass, and Vercel Cron
+
+**Protection posture is unchanged and remains strict.** `ssoProtection.deploymentType` is still `all_except_custom_domains`; Vercel Authentication was **not** disabled, and no domain was bought or attached.
+
+**Protection Bypass for Automation is configured** on the project (one entry, scope `automation-bypass`). It is available on this Hobby project. Use it only through the official mechanisms:
+
+```
+vercel curl /api/health --scope vibe-code22            # CLI, generates and attaches the secret
+curl -H "x-vercel-protection-bypass: $SECRET" ...      # explicit header
+```
+
+Add `x-vercel-set-bypass-cookie: false` for one-off probes so the bypass is not persisted as a cookie. The secret is a credential: keep it out of logs, commits and screenshots, and rotate it with `PATCH /v1/projects/{id}/protection-bypass` if it leaks. Rotating it breaks nothing in the application - it only affects automated probes.
+
+**Vercel Cron is not blocked by deployment protection.** This was the open question before Stage 04A, and it is now answered empirically rather than assumed:
+
+- `vercel crons run /api/goldmine/scheduled` was triggered at `2026-09-25T08:17:27.111Z`.
+- The runtime log records `GET /api/goldmine/scheduled` returning **`200`** at `08:17:27.397Z`, against the internal deployment domain `coin-radar-e5rdzfy52-vibe-code22.vercel.app` rather than a public alias.
+- A `200` means the request reached the application handler and passed `lib/goldmine/scheduled-auth.ts`, which only accepts `Authorization: Bearer <CRON_SECRET>`. Had deployment protection intercepted it, the platform would have answered with the SSO page instead.
+
+So the scheduler needs **no** bypass secret, no protection exception and no custom domain. Setting `CRON_SECRET` as a production variable is sufficient, because Vercel attaches it as a bearer token to its own cron requests.
+
+**Secret rotation effects**
+
+| Rotate | Effect |
+| --- | --- |
+| `AUTH_SECRET` | Every existing owner session is revoked immediately; the next request must sign in again. No data is affected. |
+| `OWNER_PASSWORD_HASH` | The old password stops working. Existing sessions survive, because they are verified against `AUTH_SECRET`, not the hash - rotate `AUTH_SECRET` too to force a re-login. |
+| `CRON_SECRET` | Vercel Cron picks up the new value on the next deployment. Between rotation and redeploy the scheduled route rejects the platform's requests with 401; nothing is lost, the next run simply starts over. |
+| `TURSO_AUTH_TOKEN` | Redeploy after updating it. The database URL alone grants nothing. |
+| Automation bypass secret | Automated probes stop working until re-issued. The application and the cron are unaffected. |
+
+**Rollback.** Promote `dpl_2REUsqZydVvTGaicc9YJWJyPXRi7` (`4ea346af`) in the Vercel dashboard, or `vercel rollback <deployment> --scope vibe-code22`. Migrations are forward-only and additive, so the older build runs against the migrated Turso schema without change. Rolling back does **not** unset environment variables and does **not** revert the database; it only moves the production aliases back.
