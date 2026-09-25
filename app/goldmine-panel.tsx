@@ -1,8 +1,8 @@
 'use client';
 import {useCallback,useEffect,useRef,useState} from 'react';
-import {Gem,RefreshCw,ShieldCheck,ShieldAlert,ArrowUpRight,Radio} from 'lucide-react';
+import {Gem,RefreshCw,ShieldCheck,ShieldAlert,ArrowUpRight,Radio,History} from 'lucide-react';
 import {toast} from 'sonner';
-import {isStale,opportunitiesOf,scanState,type PostedCandidate} from '@/lib/goldmine/dashboard-view';
+import {isStale,latestBatchCountsLabel,latestBatchStalenessNote,latestBatchStatesLabel,opportunitiesOf,scanState,type LatestBatch,type PostedCandidate} from '@/lib/goldmine/dashboard-view';
 import {cellStatusLabel,coverageLabel,dataQualityWarning,hasDataQualityWarning,hasEnoughData,performanceRowsWithData,signalsSummaryLabel,type BacktestReport} from '@/lib/goldmine/backtest-view';
 import type {ContractSafetySummary} from '@/lib/goldmine/snapshot';
 
@@ -23,7 +23,7 @@ type TrackedSignal = {
   assessment: {summary: string};
   outcomes: {horizon: string; status: string; returnPct: number | null}[];
 };
-type Tracking = {signals: TrackedSignal[]; disclaimer?: string};
+type Tracking = {signals: TrackedSignal[]; latest?: LatestBatch | null; disclaimer?: string};
 
 const money = (n: number | null) => n === null ? '—' : new Intl.NumberFormat('en-US', {style: 'currency', currency: 'USD', maximumFractionDigits: n < 0.01 ? 9 : n < 1 ? 5 : 2}).format(n);
 const smallAddress = (a: string) => a.slice(0, 5) + '…' + a.slice(-5);
@@ -238,6 +238,13 @@ export default function GoldminePanel() {
     }
   }, [retryHistory]);
 
+  // The last batch anything recorded, from storage - not from this session's scan. This is the only
+  // thing on the panel that reflects an unattended scheduled scan (Vercel Cron runs once a day), so it
+  // renders on load, before and independently of any "Scan now" the viewer presses.
+  const latest = tracking?.latest ?? null;
+  const latestStates = latestBatchStatesLabel(latest);
+  const latestStaleness = latestBatchStalenessNote(latest, now);
+
   const opportunities = scan?.candidates ? opportunitiesOf(scan.candidates) : [];
   const status = scanState({loading, error: scanError, status: scan?.status ?? null, opportunityCount: opportunities.length});
   const stale = scan?.asOf ? isStale(scan.asOf, now) : false;
@@ -269,6 +276,20 @@ export default function GoldminePanel() {
         <Radio size={12} />
         <span>{statusText[status]}</span>
         {scan?.asOf && status !== 'loading' && <span className="muted" style={{marginLeft: 8}}>· Last scan {new Date(scan.asOf).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})}{stale ? ' · stale, scan again for current data' : ''}</span>}
+      </div>
+      {/* Storage-backed, so it is the same whether this session has scanned or not - and so a scan run by
+          the scheduler rather than by the viewer is visible at all. Deliberately worded as "recorded",
+          never "scanned": readLatestBatch() cannot see a scan that recorded nothing, and cannot tell an
+          interactive scan from a scheduled one. Not role="status": it is present from first paint rather
+          than announced on change, and the scan status line above already owns the live region. */}
+      <div className="status-line" style={{padding: '13px 22px', borderBottom: '1px solid var(--border)', flexWrap: 'wrap', alignItems: 'flex-start'}}>
+        <History size={12} style={{flexShrink: 0, marginTop: 3}} />
+        <span>
+          {latest && <>Most recent recorded signals: <time dateTime={latest.detectedAt}>{new Date(latest.detectedAt).toLocaleString()}</time>. </>}
+          {latestBatchCountsLabel(latest)}
+          {latestStates && <span className="muted"> {latestStates}</span>}
+          {latestStaleness && <span className="muted"> {latestStaleness}</span>}
+        </span>
       </div>
       {scan?.warnings?.map(w => <div className="banner" role="alert" key={w} style={{margin: '16px 22px 0'}}>{w}</div>)}
       {status === 'error' && (
@@ -313,7 +334,16 @@ export default function GoldminePanel() {
             <a className="source-link" href={`https://dexscreener.com/solana/${signal.pair}`} target="_blank" rel="noopener noreferrer">Pool data & chart <ArrowUpRight size={13} /></a>
           </div>
         ))}
-        {!history.length && !historyError && <div className="empty"><Gem size={28} /><h3>No opportunities recorded yet</h3><span>Verified opportunities from past scans, with their tracked outcomes, will appear here.</span></div>}
+        {/* Two genuinely different situations that used to render the same sentence, which is how a
+            working scheduler that simply found nothing actionable looked identical to one that had
+            never run at all. `latest` is what tells them apart. */}
+        {!history.length && !historyError && (
+          <div className="empty"><Gem size={28} /><h3>No opportunities recorded yet</h3>
+            <span>{latest
+              ? 'Signals have been recorded, but none of the most recent 50 met every safety and momentum gate. That is a result, not a missing scan.'
+              : 'Verified opportunities from past scans, with their tracked outcomes, will appear here.'}</span>
+          </div>
+        )}
       </div>
       <div className="table-footer">
         {(scan?.disclaimer || tracking?.disclaimer) ?? 'Research signal from provider snapshots, not an executable price, a prediction or financial advice. No outcome or profit is implied.'}
