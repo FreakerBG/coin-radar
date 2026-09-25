@@ -8,8 +8,17 @@ export type FailureLevel = 'error' | 'warn';
 const MAX_MESSAGE_LENGTH = 300;
 
 export function redact(text: string): string {
-  const token = (env as unknown as {X_BEARER_TOKEN?: string}).X_BEARER_TOKEN;
-  return (token ? text.split(token).join('[redacted]') : text)
+  // The generic `Bearer <token>` pattern below already catches CRON_SECRET wherever it appears with
+  // that prefix (Vercel Cron's own convention), but GOLDMINE_CRON_SECRET travels as a bare header
+  // value with no prefix (lib/goldmine/scheduled-auth.ts), so it needs the same explicit, exact-value
+  // redaction X_BEARER_TOKEN already gets - otherwise a message that echoes a rejected header value
+  // verbatim (e.g. "rejected header value <secret> for scheduled scan") would leak it unredacted.
+  const secrets = env as unknown as {X_BEARER_TOKEN?: string; GOLDMINE_CRON_SECRET?: string; CRON_SECRET?: string};
+  let redacted = text;
+  for (const secret of [secrets.X_BEARER_TOKEN, secrets.GOLDMINE_CRON_SECRET, secrets.CRON_SECRET]) {
+    if (secret) redacted = redacted.split(secret).join('[redacted]');
+  }
+  return redacted
     .replace(/Bearer\s+\S+/gi, 'Bearer [redacted]')
     .replace(/[^\s@"'<>()]+@[^\s@"'<>()]+\.[a-z]{2,}/gi, '[email]')
     .slice(0, MAX_MESSAGE_LENGTH);

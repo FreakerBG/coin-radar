@@ -75,6 +75,10 @@ describe('authorization', () => {
     assert.equal((await GET(request('GET', { authorization: 'Bearer anything' }))).status, 401);
     assert.equal((await GET(request('GET', { 'x-goldmine-cron-secret': 'anything' }))).status, 401);
   });
+  // A real owner session cookie not substituting for the secret is already covered, more precisely
+  // than a hand-rolled test here could, by tests/vercel-runtime-boundaries.test.mjs's
+  // "a valid owner session cookie does not authorize a scheduled scan" - it signs a genuine cookie
+  // with createOwnerSession() rather than mocking generic sign-in state.
 });
 
 describe('pipeline and lock, once authorized', () => {
@@ -87,6 +91,11 @@ describe('pipeline and lock, once authorized', () => {
     assert.deepEqual(d1.rows('SELECT id FROM research_locks'), [], 'the shared lock is released');
   });
 
+  // The reverse direction (a scheduled scan blocking the interactive route) is proven by
+  // tests/goldmine-route.test.mjs's "another scan holding the lock makes this one busy" test:
+  // acquireLock() (lib/research-db.ts) is a plain lease keyed only by lock id, indifferent to which
+  // caller took it, so a pre-seeded row is equally valid evidence regardless of which route's test
+  // file plants it or what it names the owner.
   test('shares the goldmine:scan lock with the interactive route: a scan already holding it makes this one busy', async () => {
     d1.sqlite.prepare('INSERT INTO research_locks (id, owner, expires) VALUES (?, ?, ?)').run('goldmine:scan', 'interactive-scan', Date.now() + 30000);
     const response = await GET(request('GET', { authorization: 'Bearer bearer-secret' }));

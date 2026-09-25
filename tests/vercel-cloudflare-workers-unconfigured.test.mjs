@@ -9,6 +9,7 @@ delete process.env.TURSO_DATABASE_URL;
 delete process.env.TURSO_AUTH_TOKEN;
 delete process.env.X_BEARER_TOKEN;
 delete process.env.GOLDMINE_CRON_SECRET;
+delete process.env.CRON_SECRET;
 
 const { env } = await import('../lib/vercel-cloudflare-workers.ts');
 
@@ -20,7 +21,9 @@ test('env.DB is absent (falsy) with no Turso credentials, so D1-backed routes fa
 test('unset provider secrets are simply absent from env, not empty strings or undefined-but-present keys', () => {
   assert.equal(env.X_BEARER_TOKEN, undefined);
   assert.equal(env.GOLDMINE_CRON_SECRET, undefined);
+  assert.equal(env.CRON_SECRET, undefined);
   assert.equal(Object.hasOwn(env, 'X_BEARER_TOKEN'), false);
+  assert.equal(Object.hasOwn(env, 'CRON_SECRET'), false);
 });
 
 test('env is frozen and empty', () => {
