@@ -232,3 +232,126 @@ Migrations earlier in the same publish may already be applied; they stay immutab
 - **Undocumented platform internals:** the Sites migration record table, per-migration transaction scope, and version-rollback behavior after schema changes.
 - **Local engine differences:** the tests use `node:sqlite` (SQLite bundled with Node), not D1. `npm run db:migrate:local` runs the migrations in Miniflare's local D1, but neither engine proves production D1 behavior for `PRAGMA foreign_keys` during table rebuilds.
 - **Diagnostics depend on log access:** routes write redacted `coin_radar.failure` records, but whether the Site owner can read production Worker logs through Sites is unverified. `/api/health` works without log access.
+
+## 10. Vercel + Turso deployment (Stage 04)
+
+A second, **independent** production deployment, alongside - not replacing - the Sites/D1 deployment described in sections 1-9, which this stage never touches or weakens.
+
+Every fact in this section that could be checked against the live Vercel account was checked on 2026-09-24 and is labelled with what was observed. Anything that could not be observed is marked **Unverified** and says why.
+
+### 10.1 Where this deploys
+
+| Topic | Verified state (2026-09-24) |
+| --- | --- |
+| Vercel team | `vibe-code22`, id `team_YQTrJ7kDN2Dzb3AJ67wBHO6V`. |
+| Vercel project | `coin-radar`, id `prj_r6DIyrqTSdEkVOVt7uYuMiCawcII`. |
+| Git connection | GitHub `FreakerBG/coin-radar`, production branch `main`. |
+| Production alias | `coin-radar-vibe-code22.vercel.app` (also `coin-radar-rosy.vercel.app`, `coin-radar-git-main-vibe-code22.vercel.app`). |
+| Plan | **Hobby.** This decides the cron cadence; see 10.5. |
+| Deployment protection | Vercel SSO on all `.vercel.app` URLs (`all_except_custom_domains`), so preview and production URLs are not anonymously reachable without a protection bypass. |
+| Environment variables | **None set, in any environment.** Nothing in 10.4 is configured yet. |
+| Registered cron jobs | **None.** `main` has no `crons` entry yet, so the project's cron definition list is empty. |
+
+An earlier version of this section named the team `wwwfraps-9580s-projects`. That was wrong. A *second*, unrelated `coin-radar` project does exist under that other account (`prj_HSzPwKTc81Gr7XevMj89uIRoLjF2`); its only deployment failed with `git_info_fail` and it is not the deployment target. Do not deploy to it, and do not delete it as part of this work.
+
+### 10.2 Architecture
+
+`next.config.ts` aliases `cloudflare:workers` to `lib/vercel-cloudflare-workers.ts` whenever `process.env.VERCEL` is set (Vercel sets this on every build and every runtime invocation). That module builds an `env` object shaped like Cloudflare's:
+
+- `env.DB` resolves to a Turso (libSQL) adapter (`lib/turso-db.ts`, backed by `@libsql/client`) only when both `TURSO_DATABASE_URL` and `TURSO_AUTH_TOKEN` are set. If either is missing, `env.DB` stays absent and every D1-backed route answers 503 exactly as it always has on an unconfigured deployment - never a silent degrade or a faked success.
+- `env.X_BEARER_TOKEN` and `env.GOLDMINE_CRON_SECRET` pass through from `process.env` the same way, so route code that reads them via `env` needs no platform branching.
+
+Turso is SQLite-wire-compatible, so every hand-written SQL statement and the D1-shaped `.prepare(sql).bind(...args).first()/.all()/.run()` call pattern run unchanged; only the client differs. `tests/migrate-turso-safety.test.mjs` runs the application's own `research_locks` and `json_each` statements against a really-migrated libSQL database rather than asserting this in prose.
+
+**The libSQL client is created on the first statement execution, not at module import.** This matters because `lib/vercel-cloudflare-workers.ts` runs at module scope and Next.js evaluates module scope during `next build`. An earlier version of this section claimed the client was never constructed during a build while the code constructed it eagerly; with `TURSO_DATABASE_URL=not-a-url` the build failed with `LibsqlError: URL_INVALID` while collecting page data. Verified after the fix: `npm run build:vercel` succeeds both with no Turso configuration at all and with a malformed `TURSO_DATABASE_URL`.
+
+### 10.3 Identity, sign-in and revocation
+
+Sites' `oai-authenticated-user-*` headers are never trusted off Sites (`runsOutsideSites()` in `app/chatgpt-auth.ts`). On Vercel, identity comes from a signed owner-auth session cookie (`app/owner-auth.ts`):
+
+- `POST /api/auth/login` verifies a password against `OWNER_PASSWORD_HASH` and, on success, sets an HMAC-signed, httpOnly, Secure, `SameSite=Strict` cookie signed with `AUTH_SECRET`. A valid cookie resolves to the fixed synthetic user id `owner`, so per-user storage (`research_accounts` and friends) works unchanged for a single owner.
+- `GET /api/auth/session` reports only whether the request is signed in, and where to sign in if not. It never reports who.
+- `POST /api/auth/logout` clears the cookie. The topbar control (`app/auth-control.tsx`) renders Sign in or Sign out from the session endpoint. Both are same-origin only, like every mutating route here.
+
+**Generating `OWNER_PASSWORD_HASH`.** Run `npm run owner:hash` in a terminal. It reads the password without echoing it, asks for it twice, and prints only the hash on stdout. It deliberately refuses a password given as a command-line argument, so the password cannot reach shell history, `ps` output or a CI log. Never put the password itself in a file, an environment variable or a commit.
+
+The hash format is exactly `scrypt$<N>$<r>$<p>$<saltHex>$<keyHex>` and nothing else is accepted - no second encoding, no lenient parsing. The cost parameters travel with the hash so that changing the defaults later cannot invalidate a deployed credential. A mistyped or truncated value is rejected outright at login rather than silently weakening the comparison.
+
+**Revoking access.** The two secrets do different jobs, and it is worth being precise because the previous version of this section implied both were required to verify a session:
+
+| Goal | Do this | Why |
+| --- | --- | --- |
+| Stop new sign-ins | Clear or replace `OWNER_PASSWORD_HASH` | `verifyOwnerPassword()` reads it; `verifyOwnerSession()` does not. |
+| Revoke sessions already in a browser | **Rotate `AUTH_SECRET`** | The cookie is a self-contained signed token. Verifying it consults `AUTH_SECRET` only, so clearing `OWNER_PASSWORD_HASH` leaves an issued cookie working until it expires (7 days). |
+
+That is ordinary signed-cookie behaviour, not a defect, and both halves are asserted in `tests/owner-login-flow.test.mjs`.
+
+### 10.4 Environment variables
+
+Set these as Vercel project environment variables on `vibe-code22` / `coin-radar`. **None of them is set today**, so a deployment made right now would serve 503 from every storage-backed route and refuse every sign-in.
+
+| Variable | Required? | Purpose | Generate with |
+| --- | --- | --- | --- |
+| `TURSO_DATABASE_URL` | Yes | Turso database connection URL. | Provisioned with the database (`turso db create` or the Turso dashboard). |
+| `TURSO_AUTH_TOKEN` | Yes | Turso database auth token. | Provisioned alongside the database. |
+| `AUTH_SECRET` | Yes | HMAC key signing the owner session cookie. Rotating it revokes every existing session. | `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"` |
+| `OWNER_PASSWORD_HASH` | Yes | scrypt hash of the owner's login password. | `npm run owner:hash` (see 10.3). Never the password itself. |
+| `CRON_SECRET` | Yes, for the Vercel cron | Vercel sends this as `Authorization: Bearer <value>` on requests to a `crons` entry. | `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"` |
+| `GOLDMINE_CRON_SECRET` | Only if used | Custom-header scheduler secret (`x-goldmine-cron-secret`), for a scheduler that is not Vercel Cron. Leave unset if only Vercel Cron triggers scans. | `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"` |
+| `X_BEARER_TOKEN` | No | X (Twitter) API bearer token, same purpose as on Sites. Social research stays disabled without it. | X developer portal. |
+
+Each secret fails closed when unset: no cookie can be issued or verified, no login can succeed, and no scheduled scan can be authorized.
+
+**Preview isolation.** Preview deployments must never point at the production Turso database. Give preview-scoped `TURSO_DATABASE_URL`/`TURSO_AUTH_TOKEN` a separate Turso database, and preview-scoped `AUTH_SECRET`/`OWNER_PASSWORD_HASH`/`CRON_SECRET` separate values, so a preview cannot read production research data, cannot accept a production session cookie, and cannot trigger a scan that writes production signals.
+
+### 10.5 Scheduling
+
+`app/api/goldmine/scheduled/route.ts` (`GET` and `POST`) runs the same pipeline and the same shared `goldmine:scan` lock as the interactive `POST /api/goldmine` (`lib/goldmine/scan.ts`). Authorization is a shared secret only (`lib/goldmine/scheduled-auth.ts`): `Authorization: Bearer <CRON_SECRET>`, which is Vercel Cron's own convention, or the `x-goldmine-cron-secret` custom header. Neither a session cookie nor a forged identity header nor anything in the request body or query string can authorize it.
+
+**The cadence is once a day, and on this account it cannot be anything else.** Vercel's Hobby plan is limited to cron jobs that run once per day; a more frequent expression **fails at deployment** with "Hobby accounts are limited to daily cron jobs", and timing is only accurate to the hour (a `0 0 * * *` job fires somewhere between 00:00 and 00:59 UTC). This account is on Hobby, so `vercel.json` keeps `0 0 * * *`. Sources: <https://vercel.com/docs/cron-jobs/usage-and-pricing>. Moving to `*/5 * * * *` requires the Pro plan, which is a paid upgrade and is not authorized here.
+
+**What the lock does and does not guarantee.** `acquireLock()` writes a row with an expiry. It excludes a second caller *for the length of the lease*. A holder that runs past its lease has the lease expire underneath it, and a second caller then legitimately acquires - so the lease must exceed the worst-case runtime of the work. The scan takes a 300s lease (`SCAN_LOCK_TTL_MS`), which is the maximum duration Vercel allows a function on this plan, so a scan cannot still be running when its lease expires. It is **not** exactly-once execution: a scan killed mid-flight blocks the next one for up to five minutes, and nothing resumes its partial work - the next scan simply starts over.
+
+**Observation status.** A registered production cron configuration and an observed platform-triggered execution are different things, and neither has happened yet:
+
+| Claim | Status |
+| --- | --- |
+| `vercel.json` declares a daily cron | Verified in the repository. |
+| Vercel has registered the cron job | **No.** Crons register from a production deployment; `main` does not yet contain this branch, and the project's cron definition list is empty. |
+| A platform-triggered scheduled run has been observed | **No.** Nothing to observe yet. After the first production deployment this needs a check on the following day - a manual authenticated request to the endpoint proves the handler works, not that the platform is calling it. |
+
+### 10.6 Migrations
+
+`npm run db:migrate:turso` (`scripts/migrate-turso.mjs`) applies `drizzle/*.sql` to a Turso database in journal order, tracked in a `_turso_migrations` table. It requires `TURSO_DATABASE_URL`/`TURSO_AUTH_TOKEN`.
+
+It enforces `db/migrations.lock.json` through `verifyMigrations()`, so a migration that was already applied somewhere and then rewritten is refused - the same gate the Cloudflare build applies. `npm run build:vercel` applies the same gate. Previously neither did: the Turso runner selected migrations with `readMigrations()`, which only checks that the journal is internally consistent, and the Vercel build did not check at all.
+
+**Order of operations for a first production deployment.** The cron must not fire against an unprepared database:
+
+1. Create the Turso database and get its URL and auth token.
+2. Run `npm run db:migrate:turso` against it, from a machine with those two variables set. Confirm it reports the migrations it applied.
+3. Set every variable in 10.4 on the Vercel project, production scope.
+4. Merge to `main` and let the GitHub integration deploy.
+5. Confirm the production deployment is `READY` and aliased, then check sign-in, an authenticated route, and `GET /api/health`.
+6. The cron is registered by that production deployment. Because the schedule is daily and Hobby timing drifts up to 59 minutes, do not expect a run before the next 00:00-00:59 UTC window.
+
+Running migrations before the deployment exists is safe: the migration command talks to Turso directly and never touches the application.
+
+**Recovery.**
+
+| Situation | Action |
+| --- | --- |
+| Deployment is broken | Roll back to the previous production deployment in the Vercel dashboard. Migrations are forward-only and additive, so an older build runs against the migrated schema. |
+| A migration failed partway | Each migration runs in its own transaction: the failed one is rolled back entirely and earlier ones stay applied and recorded. Fix the migration as a *new* migration - never rewrite an applied one, which the lock refuses - and re-run. |
+| Owner locked out | Re-run `npm run owner:hash`, set the new `OWNER_PASSWORD_HASH`, redeploy or redeploy-from-cache so the new value is picked up. |
+| Session cookie needs revoking | Rotate `AUTH_SECRET` (see 10.3). |
+| Scheduler misbehaving | Rotate `CRON_SECRET`, or remove the `crons` entry from `vercel.json` and deploy. Removing the secret alone makes the endpoint reject every request, including Vercel's. |
+| Turso credentials leaked | Rotate the Turso auth token, update `TURSO_AUTH_TOKEN`, redeploy. The database URL alone grants nothing. |
+
+### 10.7 Known limitations
+
+- **No data migration from D1 to Turso.** D1 is reachable only from inside Sites/Cloudflare; nothing in this repository can read it from outside, and no such migration is implemented. **A fresh Turso database starts completely empty.** This is accepted, not a bug: Sites/D1 remains the original deployment with all existing data, and Vercel/Turso is a new deployment that begins with no signals, no accounts and no positions. An empty dashboard on a fresh deployment is expected and must not be read as a broken application.
+- **Daily scanning changes what the signals mean.** `docs/goldmine-intelligence.md` section 4 sizes the outcome windows for frequent scanning. With one scan a day, short-horizon outcomes whose windows close between scans settle as `missed` rather than observed, and results are a once-daily sample - not live intelligence. Do not present them as a five-minute view of the market.
+- **The vinext dev server does not hydrate `/login`.** It serves the markup but the form is not interactive there. The deployed Vercel build does hydrate it (verified against `next build` + `next start`). The browser smoke suite therefore asserts only `/login`'s server-rendered content; the interactive path is covered by the route-level tests in `tests/owner-login-flow.test.mjs`.
+- **Deployment protection blocks anonymous checks.** Vercel SSO covers every `.vercel.app` URL for this project, so an unauthenticated HTTP probe of a preview or production URL gets Vercel's login page rather than the application. Verifying anonymous behaviour over HTTP needs a protection bypass token, which is not configured.
+- **Rate limiting.** There is none on `POST /api/auth/login`. Password length is bounded and scrypt is deliberately expensive, but a public login endpoint on serverless has no shared counter to rate-limit against - an in-memory counter would be per-instance and would not limit anything. The mitigation that is actually in place is a long, randomly generated owner password.

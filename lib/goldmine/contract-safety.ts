@@ -26,7 +26,7 @@ const REQUEST_TIMEOUT_MS = 8000;
 export const MAX_CHECKS_PER_SCAN = 12;
 // Wall-clock budget for the whole attachContractSafety call, measured against the real clock (not the
 // `now` parameter, which callers can fix for deterministic scoring/cache math). goldmine:scan's own lock
-// (lib/research-db.ts, acquireLock) expires 60s after it is taken, and discovery alone (lib/market.ts)
+// (lib/research-db.ts, acquireLock) expires SCAN_LOCK_TTL_MS after it is taken, and discovery alone (lib/market.ts)
 // can already take up to ~24s in the worst case before this stage even starts; without its own ceiling, a
 // slow or degraded RugCheck could let this stage alone run past the lock's expiry (MAX_CHECKS_PER_SCAN
 // requests at REQUEST_TIMEOUT_MS each is, worst case, 96s), letting a second scan acquire the lock while
