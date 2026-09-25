@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict';
 import {describe, test} from 'node:test';
 
-const {isStale, opportunitiesOf, scanState, STALE_AFTER_MS} = await import('../lib/goldmine/dashboard-view.ts');
+const {BATCH_OVERDUE_AFTER_MS, isLatestBatchOverdue, isStale, latestBatchAgeMs, latestBatchCountsLabel, latestBatchStalenessNote, latestBatchStatesLabel, opportunitiesOf, scanState, STALE_AFTER_MS} = await import('../lib/goldmine/dashboard-view.ts');
 
 const NOW = Date.UTC(2026, 8, 18, 12, 0, 0);
 
@@ -77,5 +77,87 @@ describe('scanState: one classification, in a fixed precedence order', () => {
   });
   test('a completed scan with qualifying opportunities reports them', () => {
     assert.equal(scanState({loading: false, error: null, status: 'checked', opportunityCount: 3}), 'opportunities');
+  });
+});
+
+function batch(overrides = {}) {
+  return {
+    detectedAt: new Date(NOW - 60 * 60 * 1000).toISOString(),
+    signalCount: 28,
+    opportunityCount: 0,
+    byState: [{state: 'EARLY', count: 5}, {state: 'BUILDING', count: 3}, {state: 'REJECTED', count: 20}],
+    ...overrides,
+  };
+}
+
+describe('latestBatchAgeMs', () => {
+  test('measures the gap from the recorded batch to now', () => {
+    assert.equal(latestBatchAgeMs(batch(), NOW), 60 * 60 * 1000);
+  });
+  test('no batch at all has no age', () => {
+    assert.equal(latestBatchAgeMs(null, NOW), null);
+  });
+  test('an unparseable timestamp has an unknown age, never a guessed one', () => {
+    assert.equal(latestBatchAgeMs(batch({detectedAt: 'not-a-date'}), NOW), null);
+  });
+});
+
+describe('isLatestBatchOverdue: only a gap longer than the configured daily interval allows', () => {
+  test('exactly at the threshold is not yet overdue; one millisecond past it is', () => {
+    const atThreshold = batch({detectedAt: new Date(NOW - BATCH_OVERDUE_AFTER_MS).toISOString()});
+    assert.equal(isLatestBatchOverdue(atThreshold, NOW), false);
+    const justPast = batch({detectedAt: new Date(NOW - BATCH_OVERDUE_AFTER_MS - 1).toISOString()});
+    assert.equal(isLatestBatchOverdue(justPast, NOW), true);
+  });
+  test('a 25-hour gap is not overdue: a daily Hobby cron legitimately drifts up to 59 minutes', () => {
+    assert.equal(isLatestBatchOverdue(batch({detectedAt: new Date(NOW - 25 * 60 * 60 * 1000).toISOString()}), NOW), false);
+  });
+  test('no batch is not "overdue": nothing has ever been recorded, which is a different statement', () => {
+    assert.equal(isLatestBatchOverdue(null, NOW), false);
+  });
+  test('an unknown age never raises a scheduler alarm', () => {
+    assert.equal(isLatestBatchOverdue(batch({detectedAt: 'not-a-date'}), NOW), false);
+  });
+});
+
+describe('latestBatchCountsLabel: says "recorded", never "scanned"', () => {
+  test('a batch with no opportunities reads as a result, not as an absence', () => {
+    const label = latestBatchCountsLabel(batch());
+    assert.equal(label, '28 signals recorded, none met every safety and momentum gate.');
+    assert.equal(label.includes('scan'), false, 'must not claim anything about when a scan ran');
+  });
+  test('opportunities are counted when there are some', () => {
+    assert.equal(latestBatchCountsLabel(batch({opportunityCount: 2})), '28 signals recorded, 2 met every safety and momentum gate.');
+  });
+  test('a single signal is singular', () => {
+    assert.equal(latestBatchCountsLabel(batch({signalCount: 1})), '1 signal recorded, none met every safety and momentum gate.');
+  });
+  test('nothing recorded says exactly that, and nothing about a scheduler', () => {
+    const label = latestBatchCountsLabel(null);
+    assert.equal(label, 'No signals have been recorded yet on this deployment.');
+    assert.equal(/scheduler|cron/i.test(label), false);
+  });
+});
+
+describe('latestBatchStatesLabel', () => {
+  test('breaks the batch down in the order the API returned it', () => {
+    assert.equal(latestBatchStatesLabel(batch()), '5 EARLY · 3 BUILDING · 20 REJECTED');
+  });
+  test('returns an empty string with nothing to break down, so the caller can omit the element', () => {
+    assert.equal(latestBatchStatesLabel(null), '');
+    assert.equal(latestBatchStatesLabel(batch({byState: []})), '');
+  });
+});
+
+describe('latestBatchStalenessNote', () => {
+  test('silent while the gap is within what a daily schedule allows', () => {
+    assert.equal(latestBatchStalenessNote(batch(), NOW), '');
+    assert.equal(latestBatchStalenessNote(null, NOW), '');
+  });
+  test('names the threshold and the alternative explanation, never asserting the scheduler failed', () => {
+    const note = latestBatchStalenessNote(batch({detectedAt: new Date(NOW - 48 * 60 * 60 * 1000).toISOString()}), NOW);
+    assert.match(note, /over 26 hours/);
+    assert.match(note, /finds nothing new to record/);
+    assert.equal(/broken|failed|stopped|down/i.test(note), false, 'must not assert a cause it cannot observe');
   });
 });

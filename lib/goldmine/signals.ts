@@ -456,3 +456,59 @@ export async function readTracking(database: D1Database) {
     stats: [...summary.values()].sort((a, b) => a.state.localeCompare(b.state) || byHorizon(a, b)),
   };
 }
+
+// One batch of recorded signals: everything one scan wrote. `recordSignals()` binds a single
+// `detectedAt` for the whole batch, so the rows carrying MAX(detected_at) are exactly what the most
+// recent scan that recorded anything recorded - derived from existing columns, needing no new table,
+// column or migration.
+export type LatestBatch = {detectedAt: string; signalCount: number; opportunityCount: number; byState: {state: string; count: number}[]};
+
+// COUNT/SUM come back from D1 and from Turso as driver-shaped values, and one malformed or legacy row
+// must not be able to turn a count into NaN, a negative or a fraction on a dashboard.
+const wholeCount = (value: unknown) => typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+
+// Reads the most recent recorded batch, for the dashboard's "most recent recorded signals" line
+// (lib/goldmine/dashboard-view.ts, app/goldmine-panel.tsx). Read-only and bounded: one grouped query
+// over the `goldmine_signals_detected_at_idx` index, returning at most one row per state.
+//
+// What this is, exactly - and what the dashboard must therefore not claim it is:
+//   - It is NOT "when the last scan ran". A scan that records nothing still ran: every candidate may
+//     already be recorded in the same state and six-hour bucket (signalId()), or discovery may have
+//     failed and returned `provider_unavailable`. In both cases `detected_at` does not advance.
+//   - It does NOT say who scanned. The interactive POST /api/goldmine and the scheduled route
+//     (app/api/goldmine/scheduled/route.ts) run the same pipeline and write identical rows; nothing
+//     stored distinguishes them.
+// Both limits are stated in the UI copy rather than papered over, because the question this answers
+// for the owner - "is anything still scanning, and what did it see?" - is only useful while its exact
+// meaning stays intact.
+//
+// Model version is deliberately not filtered here, unlike readTracking()'s statistics: this reports
+// what was last written, whatever model wrote it, so a version change can never make the dashboard
+// look as though scanning had stopped.
+export async function readLatestBatch(database: D1Database): Promise<LatestBatch | null> {
+  // An empty table makes the subquery NULL, which `detected_at = NULL` never matches, so this returns
+  // no rows and the caller gets null - the "nothing recorded yet" case, not an error.
+  const rows = (await database.prepare('SELECT detected_at, state, COUNT(*) AS count, SUM(opportunity) AS opportunities FROM goldmine_signals WHERE detected_at = (SELECT MAX(detected_at) FROM goldmine_signals) GROUP BY detected_at, state')
+    .all<{detected_at: number; state: string; count: number; opportunities: number | null}>()).results;
+  if (!rows.length) return null;
+  const detectedAt = rows[0].detected_at;
+  if (typeof detectedAt !== 'number' || !Number.isFinite(detectedAt)) return null;
+
+  const order = STATES.map(state => state as string);
+  // Known states in the model's own order first; anything else (a legacy or unexpected stored state)
+  // is kept and sorted after them rather than dropped, so a count shown here always adds up.
+  const byState = rows
+    .map(row => ({state: String(row.state), count: wholeCount(row.count)}))
+    .filter(entry => entry.count > 0)
+    .sort((a, b) => {
+      const rankA = order.indexOf(a.state), rankB = order.indexOf(b.state);
+      if (rankA !== rankB) return (rankA < 0 ? order.length : rankA) - (rankB < 0 ? order.length : rankB);
+      return a.state.localeCompare(b.state);
+    });
+  return {
+    detectedAt: new Date(detectedAt).toISOString(),
+    signalCount: byState.reduce((total, entry) => total + entry.count, 0),
+    opportunityCount: rows.reduce((total, row) => total + wholeCount(row.opportunities), 0),
+    byState,
+  };
+}
