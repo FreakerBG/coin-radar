@@ -435,8 +435,15 @@ export async function readTracking(database: D1Database, now: number = Date.now(
   // The grouped statistic derives the same expired-unswept distinction the per-row read does, in SQL, so a
   // pending row whose window has already closed can never be counted as live pending work here either.
   // This is a SELECT with a bound read timestamp; it writes nothing.
-  const stats = (await database.prepare("SELECT s.state AS state, o.horizon AS horizon, CASE WHEN o.status = 'pending' AND o.deadline_at < ? THEN 'expired_unswept' ELSE o.status END AS status, COUNT(*) AS count, AVG(CASE WHEN o.status = 'observed' THEN o.price / s.detected_price - 1 END) AS mean_return, AVG(CASE WHEN o.status = 'observed' THEN o.observed_at - s.detected_at END) AS mean_observed_elapsed, SUM(CASE WHEN o.status = 'observed' AND o.price > s.detected_price THEN 1 ELSE 0 END) AS positive FROM goldmine_outcomes o JOIN goldmine_signals s ON s.id = o.signal_id WHERE s.model_version = ? GROUP BY s.state, o.horizon, status")
-    .bind(now, MODEL_VERSION).all<{state: string; horizon: string; status: string; count: number; mean_return: number | null; mean_observed_elapsed: number | null; positive: number}>()).results;
+  //
+  // The derived column is aliased `derived_status`, NOT `status`, and the GROUP BY references that alias.
+  // This is load-bearing, not cosmetic: SQLite (and libSQL) resolve a bare name in GROUP BY against the
+  // input tables *first* and only fall back to a result alias when no column matches. `GROUP BY ... status`
+  // would therefore bind to goldmine_outcomes.status - grouping live-pending and expired-unswept rows
+  // together, with the CASE then evaluated against an arbitrary row of the merged group. A name no table
+  // column shares can only resolve to the derived expression, in any SQLite-derived engine.
+  const stats = (await database.prepare("SELECT s.state AS state, o.horizon AS horizon, CASE WHEN o.status = 'pending' AND o.deadline_at < ? THEN 'expired_unswept' ELSE o.status END AS derived_status, COUNT(*) AS count, AVG(CASE WHEN o.status = 'observed' THEN o.price / s.detected_price - 1 END) AS mean_return, AVG(CASE WHEN o.status = 'observed' THEN o.observed_at - s.detected_at END) AS mean_observed_elapsed, SUM(CASE WHEN o.status = 'observed' AND o.price > s.detected_price THEN 1 ELSE 0 END) AS positive FROM goldmine_outcomes o JOIN goldmine_signals s ON s.id = o.signal_id WHERE s.model_version = ? GROUP BY s.state, o.horizon, derived_status")
+    .bind(now, MODEL_VERSION).all<{state: string; horizon: string; derived_status: string; count: number; mean_return: number | null; mean_observed_elapsed: number | null; positive: number}>()).results;
 
   const byHorizon = (a: {horizon: string}, b: {horizon: string}) => horizonOrderIndex(a.horizon) - horizonOrderIndex(b.horizon);
   type StatEntry = {
@@ -461,10 +468,10 @@ export async function readTracking(database: D1Database, now: number = Date.now(
       pending: 0, expiredUnswept: 0, observed: 0, unavailable: 0, missed: 0,
       meanReturnPct: null, meanObservedAfterHours: null, positiveShare: null,
     };
-    if (row.status === 'pending') entry.pending += row.count;
-    else if (row.status === 'expired_unswept') entry.expiredUnswept += row.count;
-    else if (row.status === 'observed' || row.status === 'unavailable' || row.status === 'missed') entry[row.status] += row.count;
-    if (row.status === 'observed') {
+    if (row.derived_status === 'pending') entry.pending += row.count;
+    else if (row.derived_status === 'expired_unswept') entry.expiredUnswept += row.count;
+    else if (row.derived_status === 'observed' || row.derived_status === 'unavailable' || row.derived_status === 'missed') entry[row.derived_status] += row.count;
+    if (row.derived_status === 'observed') {
       entry.meanReturnPct = percent(row.mean_return);
       // The mean *actual* time between detection and observation, never assumed to be the target age: on a
       // daily cadence an observation legitimately lands at the target or about a day past it.
@@ -543,7 +550,13 @@ export type SignalTotals = {signals: number; opportunities: number; control: num
 // One grouped COUNT over goldmine_signals - a single read-only query, whatever the size of history, so it
 // adds exactly one query to the backtest request's budget.
 export async function readSignalTotals(database: D1Database): Promise<SignalTotals> {
-  const row = await database.prepare("SELECT COUNT(*) AS signals, SUM(CASE WHEN opportunity = 1 THEN 1 ELSE 0 END) AS opportunities, SUM(CASE WHEN state = 'REJECTED' THEN 1 ELSE 0 END) AS control FROM goldmine_signals")
+  // `opportunity = 1 AND state <> 'REJECTED'` applies the same hard rule denominatorSplit applies in
+  // JS (lib/goldmine/backtest.ts): scoreCandidate can never produce a REJECTED opportunity, so a stored
+  // row claiming both is corruption, and it must not be counted as an opportunity here while being
+  // counted as control below. Without the state guard such a row would break the invariant this type
+  // documents - opportunities nested inside strategy - and the dashboard would report an opportunity
+  // that no strategy denominator contains.
+  const row = await database.prepare("SELECT COUNT(*) AS signals, SUM(CASE WHEN opportunity = 1 AND state <> 'REJECTED' THEN 1 ELSE 0 END) AS opportunities, SUM(CASE WHEN state = 'REJECTED' THEN 1 ELSE 0 END) AS control FROM goldmine_signals")
     .first<{signals: number | null; opportunities: number | null; control: number | null}>();
   const signals = wholeCount(row?.signals);
   const control = wholeCount(row?.control);

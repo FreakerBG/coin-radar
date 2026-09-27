@@ -262,6 +262,36 @@ describe('expired-unswept rows are never live pending, and never rewritten by a 
     assert.equal((await evaluateOutcomes(d1, clock.now())).observed, 1);
   });
 
+  // A single row per (state, horizon) group cannot distinguish a correct GROUP BY from one that merged the
+  // two pending kinds together, because a merged group of one is still labelled correctly. This is the case
+  // that can: two signals in the same state, same horizon, whose d1 windows close at different times, read
+  // at an instant between the two deadlines. The grouped statistic must split them 1/1, and must agree with
+  // the per-row derivation over the same rows.
+  test('live pending and expired-unswept rows in the SAME state/horizon group are split, never merged', async () => {
+    const older = clock.now();
+    await record(older, {pairCreatedAt: older - 48 * HOUR});
+    // A second signal of the same state and horizon, detected a day later, so its d1 window closes a day
+    // after the first one's. A different token/pair, so it is a separate signal rather than a bucket repeat.
+    const newer = older + DAY;
+    await record(newer, {pairAddress: addresses.pairB, baseToken: {address: addresses.tokenB}, pairCreatedAt: newer - 48 * HOUR});
+    // Between the two d1 deadlines: the older signal's window has closed, the newer one's is still open.
+    const readAt = older + latestObservableAgeMs(horizonById('d1')) + HOUR;
+    assert.ok(readAt > older + latestObservableAgeMs(horizonById('d1')), 'the older window must be closed');
+    assert.ok(readAt < newer + latestObservableAgeMs(horizonById('d1')), 'the newer window must still be open');
+
+    const before = rawSnapshot();
+    const tracking = await readTracking(d1, readAt);
+    const d1Stats = tracking.stats.filter(entry => entry.horizon === 'd1');
+    assert.equal(d1Stats.length, 1, 'both signals share one state, so they share one grouped row');
+    assert.deepEqual([d1Stats[0].pending, d1Stats[0].expiredUnswept], [1, 1],
+      'one window is still open and one has closed: the grouped statistic must not collapse them into a single status');
+    // The grouped counts must reconcile with the per-row derived states over exactly the same rows.
+    const perRow = tracking.signals.flatMap(signal => signal.outcomes.filter(entry => entry.horizon === 'd1')).map(entry => entry.state);
+    assert.deepEqual(perRow.filter(state => state === 'pending').length, d1Stats[0].pending);
+    assert.deepEqual(perRow.filter(state => state === 'expired_unswept').length, d1Stats[0].expiredUnswept);
+    assert.equal(rawSnapshot(), before, 'and none of this writes to storage');
+  });
+
   test('once a scan sweeps it, the row is missed rather than expired-unswept', async () => {
     const detectedAt = clock.now();
     await record(detectedAt);
@@ -413,6 +443,12 @@ describe('control group and strategy have separate denominators', () => {
     const {signals, outcomes} = await readAllSignalsWithOutcomes(d1);
     const split = denominatorSplit(signals, outcomes, clock.now());
     assert.deepEqual([split.control.signals, split.strategy.signals, split.opportunity.signals], [1, 0, 0]);
+    // The all-history counts must apply the same rule, or the two paths disagree about the same row and
+    // the documented nesting (opportunities inside strategy) stops holding.
+    const totals = await readSignalTotals(d1);
+    assert.deepEqual([totals.signals, totals.control, totals.strategy, totals.opportunities], [1, 1, 0, 0],
+      'a REJECTED row claiming opportunity = 1 is control only: never an opportunity outside the strategy denominator');
+    assert.ok(totals.opportunities <= totals.strategy, 'opportunities must stay nested inside strategy');
   });
 });
 
