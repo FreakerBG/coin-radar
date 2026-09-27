@@ -485,3 +485,72 @@ describe('outcome batches', () => {
     assert.deepEqual(statusCounts(), {observed: 170});
   });
 });
+
+// GET's `latest` (lib/goldmine/signals.ts readLatestBatch) is what makes an unattended scheduled scan
+// visible: it reports the most recent recorded batch from storage, so the dashboard no longer depends on
+// the viewer having pressed "Scan now" in this session to show anything at all.
+describe('GET latest: the most recent recorded batch, from storage, independent of any session scan', () => {
+  // Writes one signal row directly, so a batch's exact composition (and rows that recordSignals itself
+  // would never produce) can be set up without driving a whole scan.
+  function seedSignal(id, {state = 'BREAKOUT', opportunity = 0, detectedAt = clock.now()} = {}) {
+    d1.sqlite.prepare('INSERT INTO goldmine_signals (id, address, pair, symbol, model_version, state, score, opportunity, detected_at, detected_price, snapshot, assessment) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(id, addresses.tokenA, addresses.pairA, 'FIX', MODEL_VERSION, state, 81, opportunity, detectedAt, 0.01, '{}', '{"summary":"x"}');
+  }
+
+  test('an empty history reports null, not a zeroed batch that would read as "a scan found nothing"', async () => {
+    assert.equal((await body(await read())).latest, null);
+  });
+
+  test('a real scan is reported without the caller having scanned in this session', async () => {
+    const scanned = await body(await scan());
+    const latest = (await body(await read())).latest;
+    assert.equal(latest.detectedAt, scanned.asOf, 'the batch carries the scan\'s own detection time');
+    assert.equal(latest.signalCount, signals().length);
+    assert.equal(latest.signalCount, latest.byState.reduce((total, entry) => total + entry.count, 0), 'the breakdown must account for every counted signal');
+  });
+
+  test('only the newest batch is reported, never a total across every scan ever recorded', async () => {
+    seedSignal('old-1', {state: 'EARLY', detectedAt: clock.now() - 48 * HOUR});
+    seedSignal('old-2', {state: 'REJECTED', detectedAt: clock.now() - 48 * HOUR});
+    const newest = clock.now();
+    seedSignal('new-1', {state: 'BUILDING', detectedAt: newest});
+    const latest = (await body(await read())).latest;
+    assert.equal(latest.detectedAt, new Date(newest).toISOString());
+    assert.equal(latest.signalCount, 1);
+    assert.deepEqual(latest.byState, [{state: 'BUILDING', count: 1}]);
+  });
+
+  test('opportunities within the batch are counted, and a batch with none is still a reported batch', async () => {
+    const detectedAt = clock.now();
+    seedSignal('a', {state: 'BREAKOUT', opportunity: 1, detectedAt});
+    seedSignal('b', {state: 'BREAKOUT', opportunity: 1, detectedAt});
+    seedSignal('c', {state: 'REJECTED', opportunity: 0, detectedAt});
+    const withOpportunities = (await body(await read())).latest;
+    assert.deepEqual([withOpportunities.signalCount, withOpportunities.opportunityCount], [3, 2]);
+
+    clock.advance(HOUR);
+    seedSignal('d', {state: 'REJECTED', opportunity: 0, detectedAt: clock.now()});
+    const withoutOpportunities = (await body(await read())).latest;
+    assert.deepEqual([withoutOpportunities.signalCount, withoutOpportunities.opportunityCount], [1, 0],
+      'a batch that found nothing actionable is still reported, so it is distinguishable from no scan at all');
+  });
+
+  test('states are listed in the model\'s own order, and an unknown stored state is kept rather than dropped', async () => {
+    const detectedAt = clock.now();
+    seedSignal('r', {state: 'REJECTED', detectedAt});
+    seedSignal('e', {state: 'EARLY', detectedAt});
+    seedSignal('z', {state: 'LEGACY_STATE', detectedAt});
+    const latest = (await body(await read())).latest;
+    assert.deepEqual(latest.byState, [{state: 'EARLY', count: 1}, {state: 'REJECTED', count: 1}, {state: 'LEGACY_STATE', count: 1}]);
+    assert.equal(latest.signalCount, 3, 'an unexpected state must never make the counts stop adding up');
+  });
+
+  test('is read-only and never reaches a provider', async () => {
+    seedSignal('only', {});
+    d1.queries.length = 0;
+    calls.length = 0;
+    assert.notEqual((await body(await read())).latest, null);
+    assert.equal(calls.length, 0, 'no provider request');
+    assert.ok(d1.queries.every(query => /^\s*SELECT/i.test(query)), 'every statement this read issues is a SELECT');
+  });
+});

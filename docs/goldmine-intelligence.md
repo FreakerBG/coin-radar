@@ -107,6 +107,19 @@ RugCheck's own score or verdict is never read. Instead its facts feed our own de
 - Due outcomes are grouped by recorded pool and read in batches of at most 30 pools, earliest-closing window first (then pool and token), with at most 5 requests per scan, sent in parallel. A failed batch leaves only its own outcomes pending; pools beyond the cap are reported as `deferred` and read by the next scan while their windows are open.
 - Evaluation runs only when someone scans, so without a scheduler many outcomes will be `missed`. Prices are provider quotes, not executable prices; returns ignore fees, slippage and liquidity.
 
+### The most recent recorded batch (`GET /api/goldmine` → `latest`)
+
+Every signal one scan writes carries that scan's single `detected_at` (`recordSignals()` binds one value for the whole batch), so the rows holding `MAX(detected_at)` are exactly what the most recent scan that recorded anything recorded. `readLatestBatch()` (`lib/goldmine/signals.ts`) reads them with one grouped, index-backed `SELECT` and returns `{detectedAt, signalCount, opportunityCount, byState[]}`, or `null` when the table is empty. No new column, table or migration is involved.
+
+This exists because the dashboard panel's scan status is session-scoped: it reflects the `POST /api/goldmine` this browser tab ran, and nothing else. On the Vercel+Turso deployment the scan that matters most runs unattended once a day (Vercel Cron, see Scheduled scans below), and before `latest` the panel could not show that it had happened, what it scored, or that it had found nothing actionable - a working scheduler and a broken one rendered the same empty panel. `latest` is the one storage-backed thing the panel shows on load.
+
+Two limits are deliberate, stated in the UI copy rather than papered over, and asserted in `tests/goldmine-dashboard-view.test.mjs`:
+
+- **It is not "when the last scan ran".** A scan that records nothing still ran: every candidate may already be recorded in the same state and six-hour bucket (`signalId()`), or discovery may have failed and returned `provider_unavailable`. `detected_at` does not advance in either case, so the panel says *recorded*, never *scanned*.
+- **It does not say who scanned.** The interactive `POST /api/goldmine` and the scheduled route write identical rows through the same pipeline; nothing stored distinguishes them.
+
+Model version is not filtered, unlike `readTracking()`'s statistics, so a model change can never make the dashboard look as though scanning had stopped. The panel calls the gap out only past 26 hours (`BATCH_OVERDUE_AFTER_MS` in `lib/goldmine/dashboard-view.ts`), which clears the daily schedule plus the Hobby plan's up-to-59-minute timing drift, and the note names the threshold instead of asserting a cause it cannot observe.
+
 ### Scheduled scans
 
 `app/api/goldmine/scheduled/route.ts` (`GET` and `POST`, both run `lib/goldmine/scan.ts`'s `runGoldmineScan`, the same pipeline and the same shared `goldmine:scan` lock as the interactive `POST /api/goldmine`) is the unattended entry point. There is no signed-in user and no browser origin for a scheduler, so it never uses `getChatGPTUser()`/`sameOrigin()`; authorization is entirely `lib/goldmine/scheduled-auth.ts`'s shared-secret check, which accepts either:

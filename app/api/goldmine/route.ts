@@ -6,7 +6,7 @@ import {getChatGPTUser} from '@/app/chatgpt-auth';
 import {reportFailure} from '@/lib/diagnostics';
 import {acquireLock, db, releaseLock, sameOrigin} from '@/lib/research-db';
 import {DISCLAIMER, MODEL_VERSION} from '@/lib/goldmine/score';
-import {readTracking} from '@/lib/goldmine/signals';
+import {readLatestBatch, readTracking} from '@/lib/goldmine/signals';
 import {runGoldmineScan, SCAN_LOCK_TTL_MS} from '@/lib/goldmine/scan';
 
 const noStore = {'Cache-Control': 'no-store'};
@@ -16,8 +16,15 @@ export async function GET() {
   const user = await getChatGPTUser();
   if (!user) return Response.json({error: 'Sign in required.'}, {status: 401, headers: noStore});
   try {
-    const tracking = await readTracking(db());
-    return Response.json({modelVersion: MODEL_VERSION, ...tracking, disclaimer: DISCLAIMER}, {headers: noStore});
+    const database = db();
+    const tracking = await readTracking(database);
+    // The most recent recorded batch, so the dashboard can say what was last scored without the viewer
+    // having to run a scan first. This is what makes an unattended scheduled scan (Vercel Cron, once a
+    // day) visible at all: before it, the panel could only ever show this session's own POST result.
+    // `latest` is null when nothing has ever been recorded. It reports what was written, never who
+    // wrote it or that a scan ran - see readLatestBatch() for exactly what it does and does not mean.
+    const latest = await readLatestBatch(database);
+    return Response.json({modelVersion: MODEL_VERSION, ...tracking, latest, disclaimer: DISCLAIMER}, {headers: noStore});
   } catch (error) {
     reportFailure('goldmine', 'load', error);
     return Response.json({error: 'Signal storage unavailable.'}, {status: 503, headers: noStore});

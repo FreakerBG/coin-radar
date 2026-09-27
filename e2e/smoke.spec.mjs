@@ -451,3 +451,51 @@ test('the sign-in page is served and shows the owner sign-in form', async ({page
   // unauthenticated page.
   await expect(page.getByText('Single-owner private tool.')).toBeVisible();
 });
+
+// The Goldmine panel's scan status reflects only this browser session. Everything below covers the
+// storage-backed "most recent recorded signals" line, which is the only place an unattended scheduled
+// scan (Vercel Cron, once a day) becomes visible to the owner at all.
+test.describe('Goldmine: the most recent recorded batch is visible without running a scan', () => {
+  const recordedBatch = (overrides = {}) => ({
+    detectedAt: new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString(),
+    signalCount: 28, opportunityCount: 0,
+    byState: [{state: 'EARLY', count: 5}, {state: 'BUILDING', count: 3}, {state: 'REJECTED', count: 20}],
+    ...overrides,
+  });
+
+  test('a recorded batch with no opportunities reads as a result, not as "no scan has run"', async ({page}) => {
+    await mockApis(page, {goldmine: {status: 200, json: goldmineTracking({latest: recordedBatch()})}});
+    await openDashboard(page);
+    await tab(page, 'Goldmine').click();
+    // Rendered on load: no "Scan now" was pressed anywhere in this test.
+    await expect(page.getByText('28 signals recorded, none met every safety and momentum gate.')).toBeVisible();
+    await expect(page.getByText('5 EARLY · 3 BUILDING · 20 REJECTED')).toBeVisible();
+    await expect(page.getByText('That is a result, not a missing scan.')).toBeVisible();
+    await expect(page.getByText('No signals have been recorded yet')).toHaveCount(0);
+  });
+
+  test('nothing recorded at all is stated as such, and never as a scheduler failure', async ({page}) => {
+    await mockApis(page, {goldmine: {status: 200, json: goldmineTracking({latest: null})}});
+    await openDashboard(page);
+    await tab(page, 'Goldmine').click();
+    await expect(page.getByText('No signals have been recorded yet on this deployment.')).toBeVisible();
+    await expect(page.getByText('That is a result, not a missing scan.')).toHaveCount(0);
+  });
+
+  test('a gap longer than the daily scan interval is called out, without asserting a cause', async ({page}) => {
+    const stale = recordedBatch({detectedAt: new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString()});
+    await mockApis(page, {goldmine: {status: 200, json: goldmineTracking({latest: stale})}});
+    await openDashboard(page);
+    await tab(page, 'Goldmine').click();
+    await expect(page.getByText(/Nothing new recorded in over 26 hours/)).toBeVisible();
+    await expect(page.getByText(/finds nothing new to record also leaves this unchanged/)).toBeVisible();
+  });
+
+  test('a recent batch is reported without any staleness note', async ({page}) => {
+    await mockApis(page, {goldmine: {status: 200, json: goldmineTracking({latest: recordedBatch()})}});
+    await openDashboard(page);
+    await tab(page, 'Goldmine').click();
+    await expect(page.getByText('28 signals recorded, none met every safety and momentum gate.')).toBeVisible();
+    await expect(page.getByText(/Nothing new recorded in over 26 hours/)).toHaveCount(0);
+  });
+});
