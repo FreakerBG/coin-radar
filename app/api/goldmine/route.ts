@@ -6,6 +6,7 @@ import {getChatGPTUser} from '@/app/chatgpt-auth';
 import {reportFailure} from '@/lib/diagnostics';
 import {acquireLock, db, releaseLock, sameOrigin} from '@/lib/research-db';
 import {DISCLAIMER, MODEL_VERSION} from '@/lib/goldmine/score';
+import {cadenceReport, EVALUATION_SCHEDULE_VERSION} from '@/lib/goldmine/cadence';
 import {readLatestBatch, readTracking} from '@/lib/goldmine/signals';
 import {runGoldmineScan, SCAN_LOCK_TTL_MS} from '@/lib/goldmine/scan';
 
@@ -17,14 +18,18 @@ export async function GET() {
   if (!user) return Response.json({error: 'Sign in required.'}, {status: 401, headers: noStore});
   try {
     const database = db();
-    const tracking = await readTracking(database);
+    // One read timestamp for the whole response, so every derived outcome state in it describes the same
+    // instant. Read-only: a pending outcome past its deadline is *reported* as expired-unswept, and is
+    // still only rewritten to 'missed' by a scan.
+    const now = Date.now();
+    const tracking = await readTracking(database, now);
     // The most recent recorded batch, so the dashboard can say what was last scored without the viewer
     // having to run a scan first. This is what makes an unattended scheduled scan (Vercel Cron, once a
     // day) visible at all: before it, the panel could only ever show this session's own POST result.
     // `latest` is null when nothing has ever been recorded. It reports what was written, never who
     // wrote it or that a scan ran - see readLatestBatch() for exactly what it does and does not mean.
     const latest = await readLatestBatch(database);
-    return Response.json({modelVersion: MODEL_VERSION, ...tracking, latest, disclaimer: DISCLAIMER}, {headers: noStore});
+    return Response.json({modelVersion: MODEL_VERSION, evaluationScheduleVersion: EVALUATION_SCHEDULE_VERSION, cadence: cadenceReport(), ...tracking, latest, disclaimer: DISCLAIMER}, {headers: noStore});
   } catch (error) {
     reportFailure('goldmine', 'load', error);
     return Response.json({error: 'Signal storage unavailable.'}, {status: 503, headers: noStore});

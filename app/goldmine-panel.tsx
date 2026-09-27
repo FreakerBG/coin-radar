@@ -3,7 +3,7 @@ import {useCallback,useEffect,useRef,useState} from 'react';
 import {Gem,RefreshCw,ShieldCheck,ShieldAlert,ArrowUpRight,Radio,History} from 'lucide-react';
 import {toast} from 'sonner';
 import {isStale,latestBatchCountsLabel,latestBatchStalenessNote,latestBatchStatesLabel,opportunitiesOf,scanState,type LatestBatch,type PostedCandidate} from '@/lib/goldmine/dashboard-view';
-import {cellStatusLabel,coverageLabel,dataQualityWarning,hasDataQualityWarning,hasEnoughData,performanceRowsWithData,signalsSummaryLabel,type BacktestReport} from '@/lib/goldmine/backtest-view';
+import {allHistoryOpportunityLabel,cadenceSummary,cellStatusLabel,coverageLabel,dataQualityWarning,denominatorNote,hasDataQualityWarning,hasEnoughData,horizonLabel,horizonScheduleNote,legacyHorizonWarning,observedAfterLabel,performanceRowsWithData,signalsSummaryLabel,type BacktestReport} from '@/lib/goldmine/backtest-view';
 import type {ContractSafetySummary} from '@/lib/goldmine/snapshot';
 
 type ScanResponse = {
@@ -21,7 +21,13 @@ type TrackedSignal = {
   id: string; address: string; pair: string; symbol: string; state: string; score: number; opportunity: boolean;
   detectedAt: string; detectedPrice: number; contractSafety: ContractSafetySummary;
   assessment: {summary: string};
-  outcomes: {horizon: string; status: string; returnPct: number | null}[];
+  // `state` is the derived outcome state as of the read (lib/goldmine/cadence.ts), which is what separates a
+  // live pending outcome from one whose window has already closed. `observedAfterHours` is how long after
+  // detection the price was actually read - never assumed to be the horizon's target age.
+  outcomes: {
+    horizon: string; horizonLabel?: string; status: string; state?: string;
+    returnPct: number | null; observedAfterHours?: number | null; targetHours?: number | null;
+  }[];
 };
 type Tracking = {signals: TrackedSignal[]; latest?: LatestBatch | null; disclaimer?: string};
 
@@ -110,6 +116,24 @@ function BacktestingSection({report, error, onRetry}: {report: BacktestReport | 
       {!error && hasDataQualityWarning(report) && (
         <div className="banner" role="status" style={{margin: '16px 22px 0'}}>{dataQualityWarning(report)}</div>
       )}
+      {/* The cadence facts and the legacy-horizon explanation are rendered whenever this section renders -
+          deliberately outside the hasEnoughData branch below. With little or no history the question "why is
+          everything missed?" is at its most pressing, and answering it only once a report is populated would
+          leave exactly the wrong impression in exactly the case where it matters most. */}
+      {!error && report && (
+        <>
+          <p className="muted" style={{fontSize: 12, margin: '16px 22px 0'}}>{cadenceSummary(report.cadence)}</p>
+          {legacyHorizonWarning(report.cadence) && (
+            <div className="banner" role="status" style={{margin: '10px 22px 0'}}>{legacyHorizonWarning(report.cadence)}</div>
+          )}
+          <p className="muted" style={{fontSize: 12, margin: '10px 22px 0'}}>
+            {allHistoryOpportunityLabel(report.totals)} {denominatorNote(report.totals, report.denominators)}
+          </p>
+          <p className="muted" style={{fontSize: 11, margin: '6px 22px 0'}}>
+            Evaluation schedule {report.evaluationScheduleVersion} (scoring model {report.modelVersion} - the two are versioned separately; this stage changed only when outcomes are observed).
+          </p>
+        </>
+      )}
       {!error && !hasEnoughData(report) && (
         <div className="empty"><h3>Not enough recorded signals yet</h3><span>Backtesting needs a history of tracked signals to report on. Run scans over time and check back here.</span></div>
       )}
@@ -125,23 +149,34 @@ function BacktestingSection({report, error, onRetry}: {report: BacktestReport | 
           <h3 style={{fontSize: 14, margin: '14px 0 6px'}}>Outcome performance by model version, state and horizon</h3>
           <div style={{overflowX: 'auto'}}>
             <table className="mono" style={{fontSize: 12, borderCollapse: 'collapse', width: '100%'}}>
-              <thead><tr><th style={{textAlign: 'left'}}>Model</th><th style={{textAlign: 'left'}}>State</th><th style={{textAlign: 'left'}}>Horizon</th><th style={{textAlign: 'left'}}>Coverage</th><th style={{textAlign: 'right'}}>Mean</th><th style={{textAlign: 'right'}}>Median</th><th style={{textAlign: 'right'}}>Stdev</th></tr></thead>
+              <thead><tr><th style={{textAlign: 'left'}}>Model</th><th style={{textAlign: 'left'}}>State</th><th style={{textAlign: 'left'}}>Horizon</th><th style={{textAlign: 'left'}}>Schedule</th><th style={{textAlign: 'left'}}>Coverage</th><th style={{textAlign: 'left'}}>Observed</th><th style={{textAlign: 'right'}}>Mean</th><th style={{textAlign: 'right'}}>Median</th><th style={{textAlign: 'right'}}>Stdev</th></tr></thead>
               <tbody>
                 {performanceRowsWithData(report.performance).map(bucket => (
                   <tr key={`${bucket.modelVersion}:${bucket.state}:${bucket.horizon}`}>
                     <td className="muted" style={{whiteSpace: 'nowrap'}}>{bucket.modelVersion}</td>
                     <td>{bucket.state}</td>
-                    <td>{bucket.horizon}</td>
+                    <td title={bucket.targetHours === null ? undefined : `${bucket.targetHours}h target`}>{horizonLabel(bucket)}</td>
+                    {/* Says on the row itself whether this horizon belongs to the active daily schedule and
+                        whether the current cadence can observe it, so a legacy row's coverage is never read
+                        as a result about the tokens. */}
+                    <td className="muted" style={{whiteSpace: 'nowrap'}}>{horizonScheduleNote(bucket)}</td>
                     <td className="muted" style={{whiteSpace: 'nowrap'}}>{coverageLabel(bucket.coverage)}</td>
+                    {/* The actual elapsed time between detection and observation - not the horizon's target
+                        age, which a daily snapshot is only ever approximately at. */}
+                    <td className="muted" style={{whiteSpace: 'nowrap'}}>{observedAfterLabel(bucket.observedAfterHours)}</td>
                     <td style={{textAlign: 'right'}}>{bucket.returnsPct.count ? `${pct(bucket.returnsPct.mean)} (n=${bucket.returnsPct.count})${bucket.returnsPct.count === 1 ? ' single sample' : ''}` : '—'}</td>
                     <td style={{textAlign: 'right'}}>{pct(bucket.returnsPct.median)}</td>
                     <td style={{textAlign: 'right'}}>{bucket.returnsPct.stdev === null ? '—' : `${bucket.returnsPct.stdev.toFixed(1)}pp`}</td>
                   </tr>
                 ))}
-                {!performanceRowsWithData(report.performance).length && <tr><td colSpan={7} className="muted">No outcomes recorded yet.</td></tr>}
+                {!performanceRowsWithData(report.performance).length && <tr><td colSpan={9} className="muted">No outcomes recorded yet.</td></tr>}
               </tbody>
             </table>
           </div>
+          <p className="muted" style={{fontSize: 11, margin: '6px 0 0'}}>
+            REJECTED rows are the control group. They are shown so the actionable states have something to be
+            compared against, and are never evidence that the strategy works.
+          </p>
 
           {report.calibration && (
             <>
@@ -154,14 +189,23 @@ function BacktestingSection({report, error, onRetry}: {report: BacktestReport | 
               </p>
               <div style={{overflowX: 'auto'}}>
                 <table className="mono" style={{fontSize: 12, borderCollapse: 'collapse', width: '100%'}}>
-                  <thead><tr><th style={{textAlign: 'left'}}>If threshold were</th><th style={{textAlign: 'right'}}>Eligible</th><th style={{textAlign: 'left'}}>15m mean (n obs/elig)</th><th style={{textAlign: 'left'}}>1h mean (n obs/elig)</th><th style={{textAlign: 'left'}}>6h mean (n obs/elig)</th><th style={{textAlign: 'left'}}>24h mean (n obs/elig)</th></tr></thead>
+                  {/* Columns come from the report's own horizons, never a hardcoded 15m/1h/6h/24h list: the
+                      active and legacy sets both appear here, and a header that named one schedule's ids
+                      would silently mislabel the other's cells. */}
+                  <thead><tr><th style={{textAlign: 'left'}}>If threshold were</th><th style={{textAlign: 'right'}}>Eligible</th>
+                    {(report.calibration.rows[0]?.byHorizon ?? []).map(h => (
+                      <th key={h.horizon} style={{textAlign: 'left'}} title={horizonScheduleNote(h)}>
+                        {horizonLabel(h)} mean (n obs/elig){h.observableUnderCadence ? '' : ' · not observable'}
+                      </th>
+                    ))}
+                  </tr></thead>
                   <tbody>
                     {report.calibration.rows.map(row => (
                       <tr key={row.threshold}>
                         <td>{row.threshold}</td>
                         <td style={{textAlign: 'right'}}>{row.eligibleCount}</td>
                         {row.byHorizon.map(h => (
-                          <td key={h.horizon} title={`${h.coverage.observed} observed, ${h.coverage.pending} pending, ${h.coverage.unavailable} unavailable, ${h.coverage.missed} missed`}>
+                          <td key={h.horizon} title={`${coverageLabel(h.coverage)} ${observedAfterLabel(h.observedAfterHours)}`}>
                             {h.returnsPct.count ? `${pct(h.returnsPct.mean)} (${h.returnsPct.count}/${h.eligible})` : `— (0/${h.eligible})`}
                             {h.cellStatus !== 'sufficient' && <span className="muted"> {cellStatusLabel(h.cellStatus)}</span>}
                           </td>
@@ -309,7 +353,7 @@ export default function GoldminePanel() {
 
       <div className="panel-head" style={{marginTop: 0}}>
         <h2 style={{margin: 0}}>Recent opportunities</h2>
-        <span className="muted" style={{fontSize: 13}}>Recorded at detection · outcome tracked over 15m/1h/6h/24h</span>
+        <span className="muted" style={{fontSize: 13}}>Recorded at detection · outcomes observed at the first daily scan at or after each 1-day, 3-day and 7-day target</span>
       </div>
       {historyError && (
         <div className="banner" role="alert" style={{margin: '16px 22px 0'}}>
@@ -329,7 +373,16 @@ export default function GoldminePanel() {
             </div>
             <p style={{fontSize: 13, color: '#b5c1cd', margin: '10px 0'}}>{signal.assessment.summary}</p>
             <div className="mono" style={{fontSize: 12, color: '#8fa0b0', display: 'flex', gap: 14, flexWrap: 'wrap'}}>
-              {signal.outcomes.map(o => <span key={o.horizon}>{o.horizon}: {o.status === 'observed' ? (o.returnPct === null ? '—' : `${o.returnPct > 0 ? '+' : ''}${o.returnPct}%`) : o.status}</span>)}
+              {/* `state` (derived at read time), not the stored `status`: a pending outcome whose window has
+                  already closed reads as "expired-unswept", never as work still to come. An observed outcome
+                  carries the real elapsed hours, so a "1-day target" return never implies a 24-hour hold. */}
+              {signal.outcomes.map(o => (
+                <span key={o.horizon} title={o.targetHours === null || o.targetHours === undefined ? undefined : `${o.targetHours}h target`}>
+                  {o.horizonLabel ?? o.horizon}: {o.status === 'observed'
+                    ? `${o.returnPct === null ? '—' : `${o.returnPct > 0 ? '+' : ''}${o.returnPct}%`}${typeof o.observedAfterHours === 'number' ? ` after ${o.observedAfterHours.toFixed(1)}h` : ''}`
+                    : (o.state ?? o.status) === 'expired_unswept' ? 'expired-unswept' : (o.state ?? o.status)}
+                </span>
+              ))}
             </div>
             <a className="source-link" href={`https://dexscreener.com/solana/${signal.pair}`} target="_blank" rel="noopener noreferrer">Pool data & chart <ArrowUpRight size={13} /></a>
           </div>

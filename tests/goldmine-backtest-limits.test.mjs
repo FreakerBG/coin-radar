@@ -16,8 +16,11 @@ import {pair} from './helpers/goldmine-fixtures.mjs';
 
 const {
   readAllSignalsWithOutcomes, SIGNAL_READ_BATCH_SIZE, MAX_SIGNAL_READ_BATCHES, MAX_RETAINED_SIGNALS,
-  OUTCOME_ID_BATCH_SIZE, MAX_WORST_CASE_QUERIES, HORIZONS,
+  OUTCOME_ID_BATCH_SIZE, MAX_WORST_CASE_QUERIES,
 } = await import('../lib/goldmine/signals.ts');
+// The horizons a new signal is actually given (lib/goldmine/cadence.ts). The legacy ids stay readable but
+// are never written, so the per-signal outcome count this test reconciles against is the active set's size.
+const {ACTIVE_HORIZONS} = await import('../lib/goldmine/cadence.ts');
 const {MODEL_VERSION, scoreCandidate} = await import('../lib/goldmine/score.ts');
 const {snapshotFromPair} = await import('../lib/goldmine/snapshot.ts');
 
@@ -33,7 +36,7 @@ function insertSignal(id, detectedAt) {
   const assessment = {...scoreCandidate(snapshot), modelVersion: MODEL_VERSION};
   d1.sqlite.prepare('INSERT INTO goldmine_signals (id, address, pair, symbol, model_version, state, score, opportunity, detected_at, detected_price, snapshot, assessment) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
     .run(id, id, id, 'SYM', MODEL_VERSION, assessment.state, assessment.score, assessment.opportunity ? 1 : 0, detectedAt, 1, JSON.stringify(snapshot), JSON.stringify(assessment));
-  for (const horizon of HORIZONS) {
+  for (const horizon of ACTIVE_HORIZONS) {
     d1.sqlite.prepare('INSERT INTO goldmine_outcomes (signal_id, horizon, due_at, deadline_at, status, observed_at, price, liquidity) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
       .run(id, horizon.id, detectedAt + horizon.after, detectedAt + horizon.after + horizon.window, 'observed', detectedAt + horizon.after, 1.1, 1000);
   }
@@ -73,13 +76,13 @@ describe('worst-case query count and retained data, at the real constants', () =
     const expectedNewest = Array.from({length: MAX_RETAINED_SIGNALS}, (_, i) => `sig-${String(i + 25).padStart(5, '0')}`);
     assert.deepEqual(ids, expectedNewest, 'the newest MAX_RETAINED_SIGNALS signals must be retained, not the oldest');
     assert.equal(new Set(result.signals.map(s => s.id)).size, MAX_RETAINED_SIGNALS, 'no duplicates across pages');
-    // Every retained signal has exactly HORIZONS.length outcomes: the outcome-id-batched read reconciles
+    // Every retained signal has exactly ACTIVE_HORIZONS.length outcomes: the outcome-id-batched read reconciles
     // fully across every outcome-id-batch page.
-    assert.equal(result.outcomes.length, MAX_RETAINED_SIGNALS * HORIZONS.length);
+    assert.equal(result.outcomes.length, MAX_RETAINED_SIGNALS * ACTIVE_HORIZONS.length);
     const bySignal = new Map();
     for (const outcome of result.outcomes) bySignal.set(outcome.signalId, (bySignal.get(outcome.signalId) ?? 0) + 1);
     assert.equal(bySignal.size, MAX_RETAINED_SIGNALS);
-    assert.ok([...bySignal.values()].every(count => count === HORIZONS.length), 'every signal has exactly one outcome per horizon, none lost or duplicated');
+    assert.ok([...bySignal.values()].every(count => count === ACTIVE_HORIZONS.length), 'every signal has exactly one outcome per horizon, none lost or duplicated');
   });
 
   test('equal detected_at values at the exact cap boundary are handled without omission or duplication', async () => {

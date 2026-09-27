@@ -23,9 +23,39 @@ const goldmineChecked = (overrides = {}) => ({
   warnings: [], coverage: 'Fixture coverage.', disclaimer: 'Research signal only, not financial advice.',
   ...overrides,
 });
-const goldmineTracking = (overrides = {}) => ({modelVersion: 'momentum-v2.1.0', signals: [], stats: [], disclaimer: 'Research signal only, not financial advice.', ...overrides});
+// The cadence block the panel reads, matching lib/goldmine/cadence.ts: four legacy intraday horizons that a
+// once-daily scan cannot evaluate, and three active daily-snapshot targets that it can.
+const HOUR = 3600000, DAY = 24 * HOUR;
+const horizon = (id, label, targetMs, graceWindowMs, active) => ({
+  id, label, description: label + ' fixture.', schedule: active ? 'daily-snapshot-v1' : 'intraday-v0',
+  active, targetMs, graceWindowMs, latestObservableAgeMs: targetMs + graceWindowMs, observableUnderCadence: active,
+});
+const cadence = () => ({
+  cronExpression: '0 0 * * *', scanCadenceMs: DAY, schedulerJitterMs: 59 * 60000,
+  maxScanGapMs: DAY + 59 * 60000, minScanGapMs: DAY - 59 * 60000,
+  observationGraceMs: 26 * HOUR, observationGraceBufferMs: 61 * 60000,
+  evaluationScheduleVersion: 'daily-snapshot-v1', legacyEvaluationScheduleVersion: 'intraday-v0',
+  exactTargetBoundaryNote: 'Never guaranteed to be exactly the target age.',
+  horizons: [
+    horizon('15m', '15m (legacy)', 15 * 60000, 5 * 60000, false),
+    horizon('1h', '1h (legacy)', HOUR, 15 * 60000, false),
+    horizon('6h', '6h (legacy)', 6 * HOUR, HOUR, false),
+    horizon('24h', '24h (legacy)', 24 * HOUR, 3 * HOUR, false),
+    horizon('d1', '1-day target', DAY, 26 * HOUR, true),
+    horizon('d3', '3-day target', 3 * DAY, 26 * HOUR, true),
+    horizon('d7', '7-day target', 7 * DAY, 26 * HOUR, true),
+  ],
+});
+const goldmineTracking = (overrides = {}) => ({modelVersion: 'momentum-v2.1.0', evaluationScheduleVersion: 'daily-snapshot-v1', cadence: cadence(), signals: [], stats: [], disclaimer: 'Research signal only, not financial advice.', ...overrides});
+const emptyCoverage = () => ({pending: 0, expiredUnswept: 0, observed: 0, unavailable: 0, missed: 0});
+const emptyDistribution = () => ({count: 0, mean: null, median: null, stdev: null});
+const denominatorGroup = (signals, observedReturns) => ({signals, coverage: {...emptyCoverage(), observed: observedReturns}, observedReturns});
 const goldmineBacktest = (overrides = {}) => ({
-  modelVersion: 'momentum-v2.1.0', totalSignals: 0, skippedMalformedRows: 0, skippedMalformedOutcomes: 0, truncated: false,
+  modelVersion: 'momentum-v2.1.0', evaluationScheduleVersion: 'daily-snapshot-v1', cadence: cadence(),
+  generatedAt: Date.parse('2026-01-08T00:00:00.000Z'),
+  totals: {signals: 0, opportunities: 0, control: 0, strategy: 0},
+  denominators: {control: denominatorGroup(0, 0), strategy: denominatorGroup(0, 0), opportunity: denominatorGroup(0, 0)},
+  totalSignals: 0, skippedMalformedRows: 0, skippedMalformedOutcomes: 0, truncated: false,
   replay: {
     currentVersionSignals: 0, matched: 0, mismatchedCount: 0, mismatchedSample: [], mismatchedSampleTruncated: false,
     unsupportedCount: 0, unsupportedModelVersions: [], invalidCount: 0,
@@ -104,15 +134,42 @@ test('Goldmine: backtesting section degrades gracefully with too few recorded si
 });
 
 const populatedBacktest = (overrides = {}) => {
-  const performance = [{modelVersion: 'momentum-v2.1.0', state: 'BREAKOUT', horizon: '15m', coverage: {pending: 0, observed: 12, unavailable: 0, missed: 0}, returnsPct: {count: 12, mean: 4.2, median: 3.1, stdev: 6.5}, positiveShare: 0.6}];
+  // One active daily-snapshot bucket with an honest elapsed-observation distribution (observed about two
+  // days after detection, not at the 24-hour target), and one legacy bucket that the current cadence could
+  // never evaluate: almost entirely missed, with a pending row whose window has already closed.
+  const performance = [
+    {
+      modelVersion: 'momentum-v2.1.0', state: 'BREAKOUT', horizon: 'd1', horizonLabel: '1-day target',
+      horizonSchedule: 'daily-snapshot-v1', horizonActive: true, observableUnderCadence: true, targetHours: 24,
+      coverage: {pending: 1, expiredUnswept: 0, observed: 12, unavailable: 0, missed: 0},
+      returnsPct: {count: 12, mean: 4.2, median: 3.1, stdev: 6.5}, positiveShare: 0.6,
+      observedAfterHours: {count: 12, mean: 47.2, median: 47.2, stdev: 0.4},
+    },
+    {
+      modelVersion: 'momentum-v2.1.0', state: 'BREAKOUT', horizon: '15m', horizonLabel: '15m (legacy)',
+      horizonSchedule: 'intraday-v0', horizonActive: false, observableUnderCadence: false, targetHours: 0.25,
+      coverage: {pending: 0, expiredUnswept: 3, observed: 0, unavailable: 0, missed: 9},
+      returnsPct: emptyDistribution(), positiveShare: null, observedAfterHours: emptyDistribution(),
+    },
+  ];
+  const cell = (id, label, active, overrides2 = {}) => ({
+    horizon: id, horizonLabel: label, horizonSchedule: active ? 'daily-snapshot-v1' : 'intraday-v0',
+    horizonActive: active, observableUnderCadence: active, targetHours: active ? 24 : 0.25,
+    eligible: 4, coverage: {...emptyCoverage(), observed: 4}, coverageRatio: 1, eligibleWithOutcome: 4,
+    returnsPct: {count: 4, mean: 2, median: 1, stdev: 3}, positiveShare: 0.5,
+    cellStatus: 'insufficient', sufficientEvidence: false, observedAfterHours: {count: 4, mean: 47.2, median: 47.2, stdev: 0.4},
+    ...overrides2,
+  });
   const calibration = {
     modelVersion: 'momentum-v2.1.0', excludedOtherVersionSignals: 0,
     cutoffAt: Date.parse('2026-01-01T00:00:00.000Z'), referenceCount: 6, evaluationCount: 6,
-    sufficientCellCount: 0, insufficientCellCount: 1, notEvaluableCellCount: 23, totalCellCount: 24, descriptiveOnly: true,
-    rows: [{threshold: 60, eligibleCount: 4, byHorizon: [{horizon: '15m', eligible: 4, coverage: {pending: 0, observed: 4, unavailable: 0, missed: 0}, coverageRatio: 1, eligibleWithOutcome: 4, returnsPct: {count: 4, mean: 2, median: 1, stdev: 3}, positiveShare: 0.5, cellStatus: 'insufficient', sufficientEvidence: false}]}],
+    sufficientCellCount: 0, insufficientCellCount: 2, notEvaluableCellCount: 40, totalCellCount: 42, descriptiveOnly: true,
+    rows: [{threshold: 60, eligibleCount: 4, byHorizon: [cell('15m', '15m (legacy)', false), cell('d1', '1-day target', true)]}],
   };
   return goldmineBacktest({
     totalSignals: 12,
+    totals: {signals: 87, opportunities: 0, control: 60, strategy: 27},
+    denominators: {control: denominatorGroup(60, 40), strategy: denominatorGroup(27, 12), opportunity: denominatorGroup(0, 0)},
     replay: {currentVersionSignals: 12, matched: 12, mismatchedCount: 0, mismatchedSample: [], mismatchedSampleTruncated: false, unsupportedCount: 0, unsupportedModelVersions: [], invalidCount: 0},
     performance, calibration, ...overrides,
   });
@@ -124,11 +181,73 @@ test('Goldmine: backtesting section shows a performance and calibration report o
   await tab(page, 'Goldmine').click();
   await expect(page.getByRole('heading', {name: 'Backtesting & calibration'})).toBeVisible();
   await expect(page.getByText('12 valid signals analyzed.')).toBeVisible();
-  await expect(page.getByText('BREAKOUT')).toBeVisible();
+  await expect(page.getByText('BREAKOUT').first()).toBeVisible();
   await expect(page.getByText('momentum-v2.1.0').first()).toBeVisible();
   await expect(page.getByText('Score threshold sweep (descriptive only) - model momentum-v2.1.0')).toBeVisible();
   await expect(page.getByText('Descriptive only: at least one evaluable cell', {exact: false})).toBeVisible();
-  await expect(page.getByText('insufficient evidence', {exact: false})).toBeVisible();
+  await expect(page.getByText('insufficient evidence', {exact: false}).first()).toBeVisible();
+});
+
+// Stage 06: the facts that make the recorded outcome evidence honest have to be visible on the page, not
+// only present in the API response.
+test.describe('Goldmine: the dashboard states the cadence limits plainly', () => {
+  test('the once-daily cadence and the daily-snapshot meaning of the active horizons are stated', async ({page}) => {
+    await mockApis(page, {'goldmine:backtest': {status: 200, json: populatedBacktest()}});
+    await openDashboard(page);
+    await tab(page, 'Goldmine').click();
+    await expect(page.getByText('scans once a day', {exact: false})).toBeVisible();
+    await expect(page.getByText('first daily scan at or after its target age', {exact: false})).toBeVisible();
+    await expect(page.getByText('not exact-time execution prices', {exact: false})).toBeVisible();
+    await expect(page.getByText('Evaluation schedule daily-snapshot-v1', {exact: false})).toBeVisible();
+  });
+
+  test('legacy intraday horizons are named as unevaluable under this cadence', async ({page}) => {
+    await mockApis(page, {'goldmine:backtest': {status: 200, json: populatedBacktest()}});
+    await openDashboard(page);
+    await tab(page, 'Goldmine').click();
+    await expect(page.getByText('cannot be evaluated by a once-daily scan', {exact: false})).toBeVisible();
+    // Including the 6h horizon the earlier documentation omitted.
+    await expect(page.getByText('15m, 1h, 6h, 24h', {exact: false})).toBeVisible();
+    await expect(page.getByText('legacy, not observable on this cadence').first()).toBeVisible();
+  });
+
+  test('expired-unswept coverage is labeled as a closed window, not as live pending work', async ({page}) => {
+    await mockApis(page, {'goldmine:backtest': {status: 200, json: populatedBacktest()}});
+    await openDashboard(page);
+    await tab(page, 'Goldmine').click();
+    await expect(page.getByText('3 expired-unswept (window closed, not live pending)', {exact: false})).toBeVisible();
+  });
+
+  test('the actual elapsed observation duration is visible next to the return', async ({page}) => {
+    await mockApis(page, {'goldmine:backtest': {status: 200, json: populatedBacktest()}});
+    await openDashboard(page);
+    await tab(page, 'Goldmine').click();
+    await expect(page.getByText('47.2h after detection').first()).toBeVisible();
+    await expect(page.getByText('active daily snapshot').first()).toBeVisible();
+  });
+
+  test('zero opportunities across all recorded history is stated plainly, with separate control and strategy denominators', async ({page}) => {
+    await mockApis(page, {'goldmine:backtest': {status: 200, json: populatedBacktest()}});
+    await openDashboard(page);
+    await tab(page, 'Goldmine').click();
+    await expect(page.getByText('0 opportunities across all 87 recorded signals', {exact: false})).toBeVisible();
+    await expect(page.getByText('That is a result, not missing data', {exact: false})).toBeVisible();
+    await expect(page.getByText('60 REJECTED control signals (40 observed returns)', {exact: false})).toBeVisible();
+    await expect(page.getByText('27 actionable-state signals (12 observed)', {exact: false})).toBeVisible();
+    await expect(page.getByText('says nothing about how the candidates that cleared every gate performed', {exact: false})).toBeVisible();
+  });
+
+  test('the cadence explanation is shown even below the "not enough data" threshold', async ({page}) => {
+    // This is exactly when an owner asks why everything is missed, so the answer must not hide behind a
+    // populated report.
+    await mockApis(page, {'goldmine:backtest': {status: 200, json: goldmineBacktest({totalSignals: 2})}});
+    await openDashboard(page);
+    await tab(page, 'Goldmine').click();
+    await expect(page.getByRole('heading', {name: 'Not enough recorded signals yet'})).toBeVisible();
+    await expect(page.getByText('scans once a day', {exact: false})).toBeVisible();
+    await expect(page.getByText('cannot be evaluated by a once-daily scan', {exact: false})).toBeVisible();
+    await expect(page.getByText('Across all recorded history: 0 signals, and so 0 opportunities.', {exact: false})).toBeVisible();
+  });
 });
 
 test('Goldmine: a truncated/malformed-data report shows an explicit data-quality warning, not a bare "N signals recorded"', async ({page}) => {
@@ -271,14 +390,22 @@ test('Goldmine: recorded history shows only past verified opportunities, with tr
     id: 'sig-1', address: coin.address, pair: coin.pair, symbol: coin.symbol, state: 'BREAKOUT', score: 81, opportunity: true,
     detectedAt: '2026-01-01T00:00:00.000Z', detectedPrice: coin.price, contractSafety: {status: 'verified', source: 'rugcheck'},
     assessment: {summary: 'BREAKOUT · score 81/100. Passes every gate.'},
-    outcomes: [{horizon: '15m', status: 'observed', returnPct: 4.2}, {horizon: '1h', status: 'pending', returnPct: null}],
+    outcomes: [
+      {horizon: 'd1', horizonLabel: '1-day target', status: 'observed', state: 'observed', returnPct: 4.2, observedAfterHours: 47.2, targetHours: 24},
+      {horizon: 'd3', horizonLabel: '3-day target', status: 'pending', state: 'pending', returnPct: null, observedAfterHours: null, targetHours: 72},
+      {horizon: 'd7', horizonLabel: '7-day target', status: 'pending', state: 'expired_unswept', returnPct: null, observedAfterHours: null, targetHours: 168},
+    ],
   };
   await mockApis(page, {goldmine: {status: 200, json: goldmineTracking({signals: [signal]})}});
   await openDashboard(page);
   await tab(page, 'Goldmine').click();
   await expect(page.getByRole('heading', {name: 'Recent opportunities'})).toBeVisible();
-  await expect(page.getByText('15m: +4.2%')).toBeVisible();
-  await expect(page.getByText('1h: pending')).toBeVisible();
+  // The observed return names the real elapsed time, never the target age alone.
+  await expect(page.getByText('1-day target: +4.2% after 47.2h')).toBeVisible();
+  await expect(page.getByText('3-day target: pending')).toBeVisible();
+  // A pending row whose window has already closed is not shown as live pending work.
+  await expect(page.getByText('7-day target: expired-unswept')).toBeVisible();
+  await expect(page.getByText('7-day target: pending')).toHaveCount(0);
 });
 
 test('Goldmine: signal history unavailable shows a retryable error, not an empty history', async ({page}) => {

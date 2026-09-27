@@ -1,20 +1,24 @@
 // Goldmine signal tracking in D1. A signal records a scored candidate at detection: its snapshot, its
-// assessment and the provider price at that moment. Each signal gets one outcome row per horizon,
-// evaluated once, only inside that horizon's window: a check that comes too late marks the outcome
-// missed instead of recording a later price as if it were the horizon's. Signals are shared market
-// observations and hold no user data. Prices are provider quotes, not executable prices.
+// assessment and the provider price at that moment. Each signal gets one outcome row per *active* horizon
+// (lib/goldmine/cadence.ts ACTIVE_HORIZONS), evaluated once, only inside that horizon's window: a check
+// that comes too late marks the outcome missed instead of recording a later price as if it were the
+// horizon's. Signals are shared market observations and hold no user data. Prices are provider quotes,
+// not executable prices.
+//
+// Writing and reading use deliberately different horizon sets (Stage 06). New signals only ever get
+// ACTIVE_HORIZONS; validation and every read path accept KNOWN_HORIZON_IDS, which also covers the legacy
+// intraday ids already present in stored history. Collapsing the two would make every historical row
+// malformed and erase it from coverage reporting.
 import {reportFailure} from '../diagnostics';
 import {fetchJson} from '../market';
+import {
+  ACTIVE_HORIZONS, derivedOutcomeState, horizonById, horizonOrderIndex, hoursOf, isActiveHorizon,
+  isKnownHorizonId, isObservableUnderCadence, observationAgeMs,
+} from './cadence';
 import {MODEL_VERSION, STATES, type Assessment} from './score';
 import {at, contractSafetySummary, socialEvidence, WINDOWS, type CandidateSnapshot, type ContractSafety, type ContractSafetyFacts} from './snapshot';
 
-const MINUTE = 60000, HOUR = 60 * MINUTE;
-export const HORIZONS = [
-  {id: '15m', after: 15 * MINUTE, window: 5 * MINUTE},
-  {id: '1h', after: HOUR, window: 15 * MINUTE},
-  {id: '6h', after: 6 * HOUR, window: HOUR},
-  {id: '24h', after: 24 * HOUR, window: 3 * HOUR},
-] as const;
+const HOUR = 60 * 60000;
 // A token can be recorded again in the same state once per bucket, so a pattern that persists does not
 // create a signal per scan.
 export const SIGNAL_BUCKET_MS = 6 * HOUR;
@@ -66,7 +70,10 @@ export async function recordSignals(database: D1Database, scored: Scored[], dete
     assessment: JSON.stringify(assessment),
   }));
   let inserted = 0;
-  const horizons = JSON.stringify(Object.fromEntries(HORIZONS.map(({id, after, window}) => [id, {after, window}])));
+  // Only the active schedule is ever written. A legacy id is never created again, which is what makes a
+  // stored horizon id an exact record of the evaluation schedule that produced the row - and the reason no
+  // per-row schedule column, and so no migration, is needed to version this honestly.
+  const horizons = JSON.stringify(Object.fromEntries(ACTIVE_HORIZONS.map(({id, after, window}) => [id, {after, window}])));
   for (let index = 0; index < rows.length; index += SIGNALS_PER_INSERT) {
     const chunk = rows.slice(index, index + SIGNALS_PER_INSERT);
     const result = await database.prepare("INSERT OR IGNORE INTO goldmine_signals (id, address, pair, symbol, model_version, state, score, opportunity, detected_at, detected_price, snapshot, assessment) SELECT json_extract(value, '$.id'), json_extract(value, '$.address'), json_extract(value, '$.pair'), json_extract(value, '$.symbol'), json_extract(value, '$.modelVersion'), json_extract(value, '$.state'), json_extract(value, '$.score'), json_extract(value, '$.opportunity'), json_extract(value, '$.detectedAt'), json_extract(value, '$.detectedPrice'), json_extract(value, '$.snapshot'), json_extract(value, '$.assessment') FROM json_each(?)")
@@ -239,16 +246,27 @@ export function isValidStoredAssessment(value: unknown): value is Assessment {
   return true;
 }
 
+// The statuses evaluateOutcomes ever persists. 'expired_unswept' is deliberately absent: it is derived at
+// read time from (status, deadline_at, now) by lib/goldmine/cadence.ts derivedOutcomeState, never stored,
+// because a read must not write.
 export const OUTCOME_STATUSES = ['pending', 'observed', 'unavailable', 'missed'] as const;
-const KNOWN_HORIZONS: readonly string[] = HORIZONS.map(h => h.id);
 
 // Structural validation of a stored, parsed outcome row against exactly the shape evaluateOutcomes ever
-// writes (lib/goldmine/signals.ts): a known status, a known horizon, and status-appropriate nullability
-// of observed_at/price/liquidity. An unrecognized status string (a corrupt or hand-edited row) must never
-// be reinterpreted as 'pending' - that would silently inflate pending coverage and hide the corruption.
-export function isValidStoredOutcomeRow(row: {horizon: string; status: string; observed_at: number | null; price: number | null; liquidity: number | null}): boolean {
-  if (!KNOWN_HORIZONS.includes(row.horizon)) return false;
+// writes (lib/goldmine/signals.ts): a known status, a known horizon, a coherent due/deadline pair, and
+// status-appropriate nullability of observed_at/price/liquidity. An unrecognized status string (a corrupt
+// or hand-edited row) must never be reinterpreted as 'pending' - that would silently inflate pending
+// coverage and hide the corruption.
+//
+// "Known horizon" is KNOWN_HORIZON_IDS (legacy *and* active), not the active set the writer uses: every
+// row already in storage carries a legacy id, and validating against the writer's set alone would mark all
+// of that history malformed. `deadline_at` is checked only for the two properties recordSignals can never
+// violate - finite, and at or after due_at, since every horizon's window is strictly positive - so this is
+// a corruption check, not a re-derivation of any particular horizon's window.
+export function isValidStoredOutcomeRow(row: {horizon: string; status: string; due_at: number; deadline_at: number; observed_at: number | null; price: number | null; liquidity: number | null}): boolean {
+  if (!isKnownHorizonId(row.horizon)) return false;
   if (!(OUTCOME_STATUSES as readonly string[]).includes(row.status)) return false;
+  if (typeof row.due_at !== 'number' || !Number.isFinite(row.due_at)) return false;
+  if (typeof row.deadline_at !== 'number' || !Number.isFinite(row.deadline_at) || row.deadline_at < row.due_at) return false;
   if (row.status === 'observed') {
     if (typeof row.observed_at !== 'number' || !Number.isFinite(row.observed_at)) return false;
     if (typeof row.price !== 'number' || !Number.isFinite(row.price) || row.price <= 0) return false;
@@ -270,7 +288,10 @@ export type StoredSignalRow = {
   score: number; opportunity: boolean; detectedAt: number; detectedPrice: number;
   snapshot: CandidateSnapshot; assessment: Assessment;
 };
-export type StoredOutcomeRow = {signalId: string; horizon: string; status: OutcomeStatus; dueAt: number; observedAt: number | null; price: number | null; liquidity: number | null};
+// `deadlineAt` is carried through so every read path can derive 'expired_unswept' (a pending row whose
+// window has already closed) without a write and without a second query. The column has always existed;
+// it was simply not read back before Stage 06.
+export type StoredOutcomeRow = {signalId: string; horizon: string; status: OutcomeStatus; dueAt: number; deadlineAt: number; observedAt: number | null; price: number | null; liquidity: number | null};
 
 // Signals are read in fixed-size pages ordered by (detected_at, id) DESCENDING - a stable keyset cursor,
 // never an OFFSET, so a page boundary is unaffected by rows inserted or settled between pages (an OFFSET
@@ -316,7 +337,7 @@ export const OUTCOME_ID_BATCH_SIZE = 200;
 export const MAX_WORST_CASE_QUERIES = MAX_SIGNAL_READ_BATCHES + Math.ceil(MAX_RETAINED_SIGNALS / OUTCOME_ID_BATCH_SIZE);
 
 type SignalRow = {id: string; address: string; pair: string; symbol: string; model_version: string; state: string; score: number; opportunity: number; detected_at: number; detected_price: number; snapshot: string; assessment: string};
-type OutcomeRow = {signal_id: string; horizon: string; status: string; due_at: number; observed_at: number | null; price: number | null; liquidity: number | null};
+type OutcomeRow = {signal_id: string; horizon: string; status: string; due_at: number; deadline_at: number; observed_at: number | null; price: number | null; liquidity: number | null};
 
 // Every stored signal and its outcomes, for read-only backtesting/calibration (lib/goldmine/backtest.ts).
 // Unlike readTracking (last 50 signals, current-model-version stats only), this reads every signal up to
@@ -384,7 +405,7 @@ export async function readAllSignalsWithOutcomes(database: D1Database, options: 
   let skippedMalformedOutcomes = 0;
   for (let index = 0; index < signals.length; index += outcomeIdBatchSize) {
     const ids = signals.slice(index, index + outcomeIdBatchSize).map(signal => signal.id);
-    const rows = (await database.prepare('SELECT signal_id, horizon, status, due_at, observed_at, price, liquidity FROM goldmine_outcomes WHERE signal_id IN (SELECT value FROM json_each(?))')
+    const rows = (await database.prepare('SELECT signal_id, horizon, status, due_at, deadline_at, observed_at, price, liquidity FROM goldmine_outcomes WHERE signal_id IN (SELECT value FROM json_each(?))')
       .bind(JSON.stringify(ids)).all<OutcomeRow>()).results;
     for (const row of rows) {
       // An outcome row whose status/horizon/nullability does not match exactly what evaluateOutcomes ever
@@ -394,7 +415,7 @@ export async function readAllSignalsWithOutcomes(database: D1Database, options: 
       if (!isValidStoredOutcomeRow(row)) { skippedMalformedOutcomes++; continue; }
       outcomes.push({
         signalId: row.signal_id, horizon: row.horizon, status: row.status as OutcomeStatus,
-        dueAt: row.due_at, observedAt: row.observed_at, price: row.price, liquidity: row.liquidity,
+        dueAt: row.due_at, deadlineAt: row.deadline_at, observedAt: row.observed_at, price: row.price, liquidity: row.liquidity,
       });
     }
   }
@@ -402,23 +423,59 @@ export async function readAllSignalsWithOutcomes(database: D1Database, options: 
 }
 
 // Recent signals with their outcomes, and per-state outcome counts for the current model version.
-export async function readTracking(database: D1Database) {
+//
+// `now` is the read timestamp used to derive 'expired_unswept' (lib/goldmine/cadence.ts). It is a
+// parameter so the derivation is deterministic and testable, and it is only ever read: a pending row past
+// its deadline is reported as expired-unswept here and is still only rewritten to 'missed' by a scan.
+export async function readTracking(database: D1Database, now: number = Date.now()) {
   const signals = (await database.prepare('SELECT id, address, pair, symbol, model_version, state, score, opportunity, detected_at, detected_price, snapshot, assessment FROM goldmine_signals ORDER BY detected_at DESC, id LIMIT 50')
     .all<{id: string; address: string; pair: string; symbol: string; model_version: string; state: string; score: number; opportunity: number; detected_at: number; detected_price: number; snapshot: string; assessment: string}>()).results;
-  const outcomes = signals.length ? (await database.prepare('SELECT signal_id, horizon, status, due_at, observed_at, price, liquidity FROM goldmine_outcomes WHERE signal_id IN (SELECT value FROM json_each(?))')
-    .bind(JSON.stringify(signals.map(signal => signal.id))).all<{signal_id: string; horizon: string; status: string; due_at: number; observed_at: number | null; price: number | null; liquidity: number | null}>()).results : [];
-  const stats = (await database.prepare("SELECT s.state AS state, o.horizon AS horizon, o.status AS status, COUNT(*) AS count, AVG(CASE WHEN o.status = 'observed' THEN o.price / s.detected_price - 1 END) AS mean_return, SUM(CASE WHEN o.status = 'observed' AND o.price > s.detected_price THEN 1 ELSE 0 END) AS positive FROM goldmine_outcomes o JOIN goldmine_signals s ON s.id = o.signal_id WHERE s.model_version = ? GROUP BY s.state, o.horizon, o.status")
-    .bind(MODEL_VERSION).all<{state: string; horizon: string; status: string; count: number; mean_return: number | null; positive: number}>()).results;
+  const outcomes = signals.length ? (await database.prepare('SELECT signal_id, horizon, status, due_at, deadline_at, observed_at, price, liquidity FROM goldmine_outcomes WHERE signal_id IN (SELECT value FROM json_each(?))')
+    .bind(JSON.stringify(signals.map(signal => signal.id))).all<{signal_id: string; horizon: string; status: string; due_at: number; deadline_at: number; observed_at: number | null; price: number | null; liquidity: number | null}>()).results : [];
+  // The grouped statistic derives the same expired-unswept distinction the per-row read does, in SQL, so a
+  // pending row whose window has already closed can never be counted as live pending work here either.
+  // This is a SELECT with a bound read timestamp; it writes nothing.
+  //
+  // The derived column is aliased `derived_status`, NOT `status`, and the GROUP BY references that alias.
+  // This is load-bearing, not cosmetic: SQLite (and libSQL) resolve a bare name in GROUP BY against the
+  // input tables *first* and only fall back to a result alias when no column matches. `GROUP BY ... status`
+  // would therefore bind to goldmine_outcomes.status - grouping live-pending and expired-unswept rows
+  // together, with the CASE then evaluated against an arbitrary row of the merged group. A name no table
+  // column shares can only resolve to the derived expression, in any SQLite-derived engine.
+  const stats = (await database.prepare("SELECT s.state AS state, o.horizon AS horizon, CASE WHEN o.status = 'pending' AND o.deadline_at < ? THEN 'expired_unswept' ELSE o.status END AS derived_status, COUNT(*) AS count, AVG(CASE WHEN o.status = 'observed' THEN o.price / s.detected_price - 1 END) AS mean_return, AVG(CASE WHEN o.status = 'observed' THEN o.observed_at - s.detected_at END) AS mean_observed_elapsed, SUM(CASE WHEN o.status = 'observed' AND o.price > s.detected_price THEN 1 ELSE 0 END) AS positive FROM goldmine_outcomes o JOIN goldmine_signals s ON s.id = o.signal_id WHERE s.model_version = ? GROUP BY s.state, o.horizon, derived_status")
+    .bind(now, MODEL_VERSION).all<{state: string; horizon: string; derived_status: string; count: number; mean_return: number | null; mean_observed_elapsed: number | null; positive: number}>()).results;
 
-  const order = HORIZONS.map(horizon => horizon.id as string);
-  const byHorizon = (a: {horizon: string}, b: {horizon: string}) => order.indexOf(a.horizon) - order.indexOf(b.horizon);
-  const summary = new Map<string, {state: string; horizon: string; pending: number; observed: number; unavailable: number; missed: number; meanReturnPct: number | null; positiveShare: number | null}>();
+  const byHorizon = (a: {horizon: string}, b: {horizon: string}) => horizonOrderIndex(a.horizon) - horizonOrderIndex(b.horizon);
+  type StatEntry = {
+    state: string; horizon: string; horizonLabel: string; horizonActive: boolean; horizonSchedule: string | null;
+    observableUnderCadence: boolean; targetHours: number | null;
+    pending: number; expiredUnswept: number; observed: number; unavailable: number; missed: number;
+    meanReturnPct: number | null; meanObservedAfterHours: number | null; positiveShare: number | null;
+  };
+  const summary = new Map<string, StatEntry>();
   for (const row of stats) {
     const key = `${row.state}:${row.horizon}`;
-    const entry = summary.get(key) ?? {state: row.state, horizon: row.horizon, pending: 0, observed: 0, unavailable: 0, missed: 0, meanReturnPct: null, positiveShare: null};
-    if (row.status === 'pending' || row.status === 'observed' || row.status === 'unavailable' || row.status === 'missed') entry[row.status] += row.count;
-    if (row.status === 'observed') {
+    // A stored horizon id with no definition (a corrupt or hand-edited row) is reported as itself with
+    // unknown metadata, never silently relabelled as one of the real horizons.
+    const definition = horizonById(row.horizon);
+    const entry = summary.get(key) ?? {
+      state: row.state, horizon: row.horizon,
+      horizonLabel: definition?.label ?? row.horizon,
+      horizonActive: definition !== null && isActiveHorizon(definition),
+      horizonSchedule: definition?.schedule ?? null,
+      observableUnderCadence: definition !== null && isObservableUnderCadence(definition),
+      targetHours: definition ? hoursOf(definition.after) : null,
+      pending: 0, expiredUnswept: 0, observed: 0, unavailable: 0, missed: 0,
+      meanReturnPct: null, meanObservedAfterHours: null, positiveShare: null,
+    };
+    if (row.derived_status === 'pending') entry.pending += row.count;
+    else if (row.derived_status === 'expired_unswept') entry.expiredUnswept += row.count;
+    else if (row.derived_status === 'observed' || row.derived_status === 'unavailable' || row.derived_status === 'missed') entry[row.derived_status] += row.count;
+    if (row.derived_status === 'observed') {
       entry.meanReturnPct = percent(row.mean_return);
+      // The mean *actual* time between detection and observation, never assumed to be the target age: on a
+      // daily cadence an observation legitimately lands at the target or about a day past it.
+      entry.meanObservedAfterHours = row.mean_observed_elapsed === null || !Number.isFinite(row.mean_observed_elapsed) ? null : hoursOf(row.mean_observed_elapsed);
       entry.positiveShare = row.count ? Number((row.positive / row.count).toFixed(4)) : null;
     }
     summary.set(key, entry);
@@ -443,17 +500,72 @@ export async function readTracking(database: D1Database) {
       // stored snapshot can never crash this read or be read as safe.
       contractSafety: contractSafetySummary(at(parseSnapshot(signal.snapshot), 'contractSafety')),
       assessment: JSON.parse(signal.assessment) as Assessment,
-      outcomes: outcomes.filter(outcome => outcome.signal_id === signal.id).sort(byHorizon).map(outcome => ({
-        horizon: outcome.horizon,
-        status: outcome.status,
-        dueAt: new Date(outcome.due_at).toISOString(),
-        observedAt: outcome.observed_at === null ? null : new Date(outcome.observed_at).toISOString(),
-        price: outcome.price,
-        liquidity: outcome.liquidity,
-        returnPct: outcome.status === 'observed' && outcome.price !== null ? percent(outcome.price / signal.detected_price - 1) : null,
-      })),
+      outcomes: outcomes.filter(outcome => outcome.signal_id === signal.id).sort(byHorizon).map(outcome => {
+        const definition = horizonById(outcome.horizon);
+        const elapsedMs = observationAgeMs(signal.detected_at, outcome.observed_at);
+        return {
+          horizon: outcome.horizon,
+          // A friendly name for the horizon ('1-day target', '15m (legacy)'), so the dashboard never has to
+          // invent one and a legacy row is never displayed as if it were part of the active schedule.
+          horizonLabel: definition?.label ?? outcome.horizon,
+          horizonActive: definition !== null && isActiveHorizon(definition),
+          horizonSchedule: definition?.schedule ?? null,
+          observableUnderCadence: definition !== null && isObservableUnderCadence(definition),
+          targetHours: definition ? hoursOf(definition.after) : null,
+          // The stored status, unchanged - and, separately, what that status means as of this read. A
+          // pending row past its deadline is 'expired_unswept', never live pending work, and storage is not
+          // touched to say so.
+          status: outcome.status,
+          state: derivedOutcomeState({status: outcome.status, deadlineAt: outcome.deadline_at}, now),
+          dueAt: new Date(outcome.due_at).toISOString(),
+          deadlineAt: new Date(outcome.deadline_at).toISOString(),
+          observedAt: outcome.observed_at === null ? null : new Date(outcome.observed_at).toISOString(),
+          // How long after detection this price was actually read. On a daily cadence this is the only
+          // honest answer to "is this the target-age price?" - the horizon id alone cannot give one.
+          observedAfterHours: hoursOf(elapsedMs),
+          price: outcome.price,
+          liquidity: outcome.liquidity,
+          returnPct: outcome.status === 'observed' && outcome.price !== null ? percent(outcome.price / signal.detected_price - 1) : null,
+        };
+      }),
     })),
     stats: [...summary.values()].sort((a, b) => a.state.localeCompare(b.state) || byHorizon(a, b)),
+  };
+}
+
+// COUNT/SUM come back from D1 and from Turso as driver-shaped values, and one malformed or legacy row
+// must not be able to turn a count into NaN, a negative or a fraction on a dashboard.
+const wholeCount = (value: unknown) => typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+
+// All-history signal counts, deliberately independent of the bounded page-by-page read above
+// (readAllSignalsWithOutcomes, capped at MAX_RETAINED_SIGNALS and able to report `truncated`). A dashboard
+// that says "N opportunities recorded" must mean *every* opportunity ever recorded, not "every one inside
+// this request's read bound", and those two numbers diverge the moment history passes the cap.
+//
+// The control/strategy split is kept as two separate counts and never summed into one "performance"
+// denominator: a REJECTED signal was never actionable, so its outcomes are a control observation, not
+// evidence about the strategy. `opportunities` is the subset of `strategy` that cleared every gate.
+export type SignalTotals = {signals: number; opportunities: number; control: number; strategy: number};
+
+// One grouped COUNT over goldmine_signals - a single read-only query, whatever the size of history, so it
+// adds exactly one query to the backtest request's budget.
+export async function readSignalTotals(database: D1Database): Promise<SignalTotals> {
+  // `opportunity = 1 AND state <> 'REJECTED'` applies the same hard rule denominatorSplit applies in
+  // JS (lib/goldmine/backtest.ts): scoreCandidate can never produce a REJECTED opportunity, so a stored
+  // row claiming both is corruption, and it must not be counted as an opportunity here while being
+  // counted as control below. Without the state guard such a row would break the invariant this type
+  // documents - opportunities nested inside strategy - and the dashboard would report an opportunity
+  // that no strategy denominator contains.
+  const row = await database.prepare("SELECT COUNT(*) AS signals, SUM(CASE WHEN opportunity = 1 AND state <> 'REJECTED' THEN 1 ELSE 0 END) AS opportunities, SUM(CASE WHEN state = 'REJECTED' THEN 1 ELSE 0 END) AS control FROM goldmine_signals")
+    .first<{signals: number | null; opportunities: number | null; control: number | null}>();
+  const signals = wholeCount(row?.signals);
+  const control = wholeCount(row?.control);
+  return {
+    signals,
+    opportunities: wholeCount(row?.opportunities),
+    control,
+    // Never negative, even if a driver returned something unexpected for one of the two counts.
+    strategy: Math.max(0, signals - control),
   };
 }
 
@@ -462,10 +574,6 @@ export async function readTracking(database: D1Database) {
 // recent scan that recorded anything recorded - derived from existing columns, needing no new table,
 // column or migration.
 export type LatestBatch = {detectedAt: string; signalCount: number; opportunityCount: number; byState: {state: string; count: number}[]};
-
-// COUNT/SUM come back from D1 and from Turso as driver-shaped values, and one malformed or legacy row
-// must not be able to turn a count into NaN, a negative or a fraction on a dashboard.
-const wholeCount = (value: unknown) => typeof value === 'number' && Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
 
 // Reads the most recent recorded batch, for the dashboard's "most recent recorded signals" line
 // (lib/goldmine/dashboard-view.ts, app/goldmine-panel.tsx). Read-only and bounded: one grouped query

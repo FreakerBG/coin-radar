@@ -52,7 +52,9 @@ describe('empty history', () => {
   test('degrades gracefully with zero signals: no crash, calibration is null, empty report arrays', async () => {
     const data = await body(await read());
     assert.equal(data.modelVersion, MODEL_VERSION);
+    assert.equal(data.evaluationScheduleVersion, 'daily-snapshot-v1');
     assert.equal(data.totalSignals, 0);
+    assert.deepEqual(data.totals, {signals: 0, opportunities: 0, control: 0, strategy: 0});
     assert.deepEqual(data.performance, []);
     assert.equal(data.calibration, null);
     assert.deepEqual(data.replay, {
@@ -133,14 +135,107 @@ describe('performance report', () => {
     insertOutcome('sig-1', '24h', {status: 'missed', dueAt: now + 24 * HOUR});
     const data = await body(await read());
     const byHorizon = Object.fromEntries(data.performance.map(bucket => [bucket.horizon, bucket]));
-    assert.deepEqual(byHorizon['15m'].coverage, {pending: 0, observed: 1, unavailable: 0, missed: 0});
+    assert.deepEqual(byHorizon['15m'].coverage, {pending: 0, expiredUnswept: 0, observed: 1, unavailable: 0, missed: 0});
     assert.equal(byHorizon['15m'].returnsPct.count, 1);
-    assert.deepEqual(byHorizon['1h'].coverage, {pending: 1, observed: 0, unavailable: 0, missed: 0});
-    assert.deepEqual(byHorizon['6h'].coverage, {pending: 0, observed: 0, unavailable: 1, missed: 0});
-    assert.deepEqual(byHorizon['24h'].coverage, {pending: 0, observed: 0, unavailable: 0, missed: 1});
+    // The 1h row's window is still open at the read timestamp, so it is genuinely live pending. The
+    // expired-unswept case is covered separately below and in tests/goldmine-outcome-schedule.test.mjs.
+    assert.deepEqual(byHorizon['1h'].coverage, {pending: 1, expiredUnswept: 0, observed: 0, unavailable: 0, missed: 0});
+    assert.deepEqual(byHorizon['6h'].coverage, {pending: 0, expiredUnswept: 0, observed: 0, unavailable: 1, missed: 0});
+    assert.deepEqual(byHorizon['24h'].coverage, {pending: 0, expiredUnswept: 0, observed: 0, unavailable: 0, missed: 1});
+    // Every legacy horizon is reported as belonging to the superseded schedule and as unobservable on this
+    // deployment's once-daily cadence.
+    for (const horizon of ['15m', '1h', '6h', '24h']) {
+      assert.equal(byHorizon[horizon].horizonActive, false, horizon);
+      assert.equal(byHorizon[horizon].observableUnderCadence, false, horizon);
+      assert.equal(byHorizon[horizon].horizonSchedule, 'intraday-v0', horizon);
+    }
     // Never mutated the outcome rows either.
     const outcomes = d1.rows('SELECT status FROM goldmine_outcomes ORDER BY horizon');
     assert.deepEqual(outcomes.map(o => o.status).sort(), ['missed', 'observed', 'pending', 'unavailable']);
+  });
+});
+
+// Stage 06: everything a consumer needs in order to read the outcome evidence honestly has to be in the
+// response, not only derivable from it.
+describe('cadence, all-history totals and separate denominators', () => {
+  test('reports the evaluation schedule version separately from the scoring model version', async () => {
+    const data = await body(await read());
+    assert.equal(data.evaluationScheduleVersion, 'daily-snapshot-v1');
+    assert.equal(data.modelVersion, MODEL_VERSION);
+    assert.notEqual(data.evaluationScheduleVersion, data.modelVersion);
+  });
+
+  test('reports the cadence, and for every known horizon its target, grace window and observability', async () => {
+    const data = await body(await read());
+    assert.equal(data.cadence.cronExpression, '0 0 * * *');
+    assert.equal(data.cadence.scanCadenceMs, 24 * HOUR);
+    assert.equal(data.cadence.maxScanGapMs, 24 * HOUR + 59 * MINUTE);
+    assert.equal(data.cadence.observationGraceMs, 26 * HOUR);
+    assert.ok(data.cadence.observationGraceBufferMs > 0);
+    assert.deepEqual(data.cadence.horizons.map(h => [h.id, h.active, h.observableUnderCadence, h.targetMs, h.graceWindowMs]), [
+      ['15m', false, false, 15 * MINUTE, 5 * MINUTE],
+      ['1h', false, false, HOUR, 15 * MINUTE],
+      ['6h', false, false, 6 * HOUR, HOUR],
+      ['24h', false, false, 24 * HOUR, 3 * HOUR],
+      ['d1', true, true, 24 * HOUR, 26 * HOUR],
+      ['d3', true, true, 72 * HOUR, 26 * HOUR],
+      ['d7', true, true, 168 * HOUR, 26 * HOUR],
+    ]);
+    assert.match(data.cadence.exactTargetBoundaryNote, /never guaranteed to be exactly the target age/);
+    assert.ok(typeof data.generatedAt === 'number' && Number.isFinite(data.generatedAt));
+  });
+
+  test('the all-history opportunity count is zero when nothing ever cleared every gate, and is not the bounded read count', async () => {
+    const now = clock.now();
+    // Five signals, none an opportunity (the fixture candidate has no verified contract safety).
+    for (let index = 0; index < 5; index++) insertSignal({id: `sig-${index}`, detectedAt: now + index});
+    const data = await body(await read());
+    assert.equal(data.totals.signals, 5);
+    assert.equal(data.totals.opportunities, 0, 'zero is reported as zero, never omitted');
+    assert.equal(data.totals.control + data.totals.strategy, data.totals.signals,
+      'control and strategy partition every recorded signal exactly');
+  });
+
+  test('control and strategy denominators are reported apart, and an opportunity is never added to either', async () => {
+    const now = clock.now();
+    // Genuinely rejected candidates, produced by the real scorer (thin liquidity is a hard gate), not by
+    // overriding the stored state column: a row whose column and assessment disagree is malformed data and
+    // is excluded from the read entirely.
+    insertSignal({id: 'ctl-1', detectedAt: now, snapshotOverrides: {liquidity: {usd: 20000}}});
+    insertSignal({id: 'ctl-2', detectedAt: now + 1, snapshotOverrides: {liquidity: {usd: 20000}}});
+    insertSignal({id: 'act-1', detectedAt: now + 2});
+    insertOutcome('ctl-1', 'd1', {status: 'observed', dueAt: now + 24 * HOUR, deadlineAt: now + 50 * HOUR, observedAt: now + 24 * HOUR, price: 1.5});
+    insertOutcome('act-1', 'd1', {status: 'observed', dueAt: now + 24 * HOUR, deadlineAt: now + 50 * HOUR, observedAt: now + 24 * HOUR, price: 1.5});
+    const data = await body(await read());
+    assert.equal(data.denominators.control.signals, 2);
+    assert.equal(data.denominators.control.observedReturns, 1);
+    assert.equal(data.denominators.strategy.signals, 1);
+    assert.equal(data.denominators.strategy.observedReturns, 1);
+    assert.notEqual(data.denominators.control.observedReturns + data.denominators.strategy.observedReturns, data.denominators.strategy.observedReturns,
+      'the two are genuinely distinct numbers, reported side by side rather than summed');
+    assert.ok(data.denominators.opportunity.signals <= data.denominators.strategy.signals,
+      'opportunity is nested inside strategy, never a fourth independent population');
+  });
+
+  test('the limitations name the cadence problem, the daily-snapshot meaning and the control group', async () => {
+    const data = await body(await read());
+    const text = data.limitations.join(' ');
+    assert.match(text, /legacy 15m, 1h, 6h and 24h horizons cannot be evaluated/);
+    assert.match(text, /not exact-time execution prices/);
+    assert.match(text, /REJECTED signals are recorded and evaluated as a control group/);
+    assert.match(text, /expired-unswept/);
+  });
+
+  test('the report is read-only: a request never writes a row, even with expired-unswept outcomes present', async () => {
+    const now = clock.now();
+    insertSignal({id: 'sig-1', detectedAt: now});
+    // A pending row whose window closed long ago, which no scan has swept yet.
+    insertOutcome('sig-1', 'd1', {status: 'pending', dueAt: now - 50 * HOUR, deadlineAt: now - 2 * HOUR});
+    const before = JSON.stringify(d1.rows('SELECT * FROM goldmine_outcomes'));
+    const data = await body(await read());
+    const bucket = data.performance.find(entry => entry.horizon === 'd1');
+    assert.deepEqual(bucket.coverage, {pending: 0, expiredUnswept: 1, observed: 0, unavailable: 0, missed: 0});
+    assert.equal(JSON.stringify(d1.rows('SELECT * FROM goldmine_outcomes')), before, 'the row is reported, never rewritten');
   });
 });
 
