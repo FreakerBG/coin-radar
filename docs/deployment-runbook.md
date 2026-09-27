@@ -312,14 +312,14 @@ Each secret fails closed when unset: no cookie can be issued or verified, no log
 
 **What the lock does and does not guarantee.** `acquireLock()` writes a row with an expiry. It excludes a second caller *for the length of the lease*. A holder that runs past its lease has the lease expire underneath it, and a second caller then legitimately acquires - so the lease must exceed the worst-case runtime of the work. The scan takes a 300s lease (`SCAN_LOCK_TTL_MS`), which is the maximum duration Vercel allows a function on this plan, so a scan cannot still be running when its lease expires. It is **not** exactly-once execution: a scan killed mid-flight blocks the next one for up to five minutes, and nothing resumes its partial work - the next scan simply starts over.
 
-**Observation status.** A registered cron configuration, a platform-triggered execution and an *automatic* schedule-driven execution are three different things. As of 2026-09-25 the first two are observed and the third is not:
+**Observation status.** A registered cron configuration, a platform-triggered execution and an *automatic* schedule-driven execution are three different things. As of 2026-09-27 all three are observed:
 
 | Claim | Status |
 | --- | --- |
 | `vercel.json` declares a daily cron | Verified in the repository. |
 | Vercel has registered the cron job | **Yes.** Registered by production deployment `dpl_B6UfwzPpmqCUb4T9ZPLVcQdpkS4H`. `vercel crons ls` reports `/api/goldmine/scheduled` on `0 0 * * *`, and the project's `crons.definitions` names the same pair. |
 | A platform-triggered scheduled run has been observed | **Yes.** `vercel crons run /api/goldmine/scheduled` was triggered at `2026-09-25T08:17:27.111Z`; the runtime log records `GET /api/goldmine/scheduled` returning `200` at `08:17:27.397Z` against the internal deployment domain. See 10.9. |
-| An *automatic* schedule-driven run has been observed | **No - pending observation.** The first automatic execution is expected between **00:00-00:59 UTC on 2026-09-26** (03:00-03:59 Europe/Sofia). A manually triggered run does not substitute for this. |
+| An *automatic* schedule-driven run has been observed | **Yes.** The first natural, unattended execution fired at `2026-09-27 00:54:13 UTC` (`2026-09-27 03:54:13 Europe/Sofia`): `GET /api/goldmine/scheduled` returned `200` against production deployment `dpl_CCP4mnFgVbuRL1wJh7YJaQbmbZUw` (internal domain `coin-radar-ih6wi5oje-vibe-code22.vercel.app`), with zero runtime errors or warnings. No manual invocation, `CRON_SECRET` use, configuration change, deployment or Turso manipulation occurred around it. |
 
 ### 10.6 Migrations
 

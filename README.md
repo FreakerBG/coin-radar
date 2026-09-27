@@ -1,15 +1,23 @@
 # Coin Radar
 
-Private Solana research dashboard with market discovery, X evidence, budget-based conditional allocation, recorded manual positions and entry/exit review alerts. No wallet connection, signing, swaps or custody.
+Private Solana research dashboard with market discovery, X evidence, budget-based conditional allocation, recorded manual positions, entry/exit review alerts and Goldmine signal tracking. Research software only: it never connects a wallet, signs, swaps, custodies funds or executes a trade — every position is a manually recorded record of a trade the user made elsewhere.
 
 ## Runtime and setup
 
-Vinext/React on Cloudflare Workers, hosted by OpenAI Sites. Cloudflare D1 is declared as DB in `.openai/hosting.json`. Sites publishing applies the migrations in `drizzle/` before the new Worker goes live; see [Database and deployment](#database-and-deployment). The Site remains private.
+Coin Radar ships as the same Next.js (vinext) app deployed to two independent targets:
 
-X requires an `X_BEARER_TOKEN` server-side secret set in Sites environment settings and a publication applying that environment revision. Never put credentials in browser storage, source, or chat. Configure an X developer-console spending limit, then set a daily request cap in Advisor. Default cap is zero. No paid requests run automatically.
+- **Production: Vercel + Turso.** The live deployment (`vibe-code22/coin-radar` on Vercel, `main` branch). Turso (libSQL) is the production database; migrations are applied with `npm run db:migrate:turso`. Access is gated by owner authentication (below), not Sign in with ChatGPT. `vercel.json` schedules the unattended Goldmine scan once a day. See [docs/deployment-runbook.md § 10](docs/deployment-runbook.md) for provisioning, environment variables and the scheduling/observation record.
+- **Sites/Cloudflare compatibility.** The original target: vinext compiled to a Cloudflare Worker, hosted by OpenAI Sites, gated by Sign in with ChatGPT, with Cloudflare D1 as `DB`. This path is kept working alongside Vercel+Turso — the application code and migrations are shared — but production traffic runs on Vercel. See [Database and deployment](#database-and-deployment) and `examples/d1/` for the Cloudflare-only reference pieces.
+
+**Owner authentication (Vercel deployment only).** `POST /api/auth/login` verifies a submitted password against the `OWNER_PASSWORD_HASH` secret and, on success, sets a signed session cookie (`app/owner-auth.ts`); `POST /api/auth/logout` clears it; `GET /api/auth/session` reports only whether the caller is signed in and where to sign in, never who. This never runs on the Sites/Cloudflare path, where Sign in with ChatGPT is the only gate.
+
+X requires an `X_BEARER_TOKEN` server-side secret (Sites environment settings, or the Vercel project's production environment variables) and a publish/deploy applying that revision. Never put credentials in browser storage, source, or chat. Configure an X developer-console spending limit, then set a daily request cap in Advisor. Default cap is zero. No paid requests run automatically.
 
 ## API
 
+- `POST /api/auth/login` (Vercel deployment only): same-origin, verifies the submitted password against `OWNER_PASSWORD_HASH`, sets a signed session cookie on success.
+- `POST /api/auth/logout` (Vercel deployment only): same-origin, clears the session cookie.
+- `GET /api/auth/session` (Vercel deployment only): whether the caller is signed in and where to sign in; never identifies who.
 - `GET /api/market`: latest DEX Screener profiles + promoted Solana tokens; up to 30 addresses, highest-liquidity pool per base token.
 - `GET /api/market?q=<symbol-or-address>`: Solana-only search. Confirm exact contracts.
 - `GET /api/market?addresses=<addresses>`: watchlist batch, up to 30.
@@ -22,11 +30,13 @@ X requires an `X_BEARER_TOKEN` server-side secret set in Sites environment setti
 - `POST /api/social` with `{address}`: authenticated same-origin on-demand exact-contract X recent search; max 25 posts, author IDs and engagement counts, 15-minute D1 cache. No user expansions. Includes sample deduplication; does not claim whole-market social velocity. Per-contract lock and atomic per-user UTC daily request cap. Failed attempts conservatively consume the request allowance. Provider billing can differ from request count; enforce dollar spend at X.
 - `POST /api/goldmine`: authenticated same-origin Goldmine scan under one shared lock. Settles due signal outcomes, then scores the discovery set with Momentum Score v2 and records each priced candidate once per state and six-hour bucket. Never trades, sizes positions or requests X. See [docs/goldmine-intelligence.md](docs/goldmine-intelligence.md).
 - `GET /api/goldmine`: authenticated, read-only. The 50 most recent signals with their 15m/1h/6h/24h outcomes, per-state outcome counts for the current model version, and `latest`: the most recent recorded batch of signals (its detection time, how many signals it holds, how many were opportunities, and the count per state), or `null` when nothing has ever been recorded. `latest` reports what was written, not that a scan ran and not who ran it; a scan that records nothing leaves it unchanged. See [docs/goldmine-intelligence.md](docs/goldmine-intelligence.md).
-- `GET /api/health`: authenticated, read-only check that D1 is reachable and has every table and column the routes use. Returns `ok`/`compatible`, or 503 with `storage: unavailable` or `schema: incompatible`. No writes, no provider requests, no schema details in the response.
+- `GET`/`POST /api/goldmine/scheduled`: unattended entry point for the same Goldmine scan pipeline as `POST /api/goldmine`, for a platform scheduler rather than a signed-in browser. No session or same-origin check applies; authorization is a shared secret only (`Authorization: Bearer <CRON_SECRET>`, Vercel Cron's own convention, or a custom `x-goldmine-cron-secret` header), fail-closed if unset. On the Vercel deployment, `vercel.json` triggers this once a day. See [docs/goldmine-intelligence.md](docs/goldmine-intelligence.md).
+- `GET /api/goldmine/backtest`: authenticated, read-only. Recomputes performance and calibration statistics from already-stored Goldmine signals and outcomes; makes no provider request and writes nothing. See [docs/goldmine-intelligence.md § 3c](docs/goldmine-intelligence.md).
+- `GET /api/health`: authenticated, read-only check that the database is reachable and has every table and column the routes use. Returns `ok`/`compatible`, or 503 with `storage: unavailable` or `schema: incompatible`. No writes, no provider requests, no schema details in the response.
 
 Route failures write one redacted JSON line per failure (`coin_radar.failure`, with route, operation, level and error) to the Worker log. Records never include request bodies, user identifiers, email addresses or credentials; see [docs/deployment-runbook.md](docs/deployment-runbook.md).
 
-All monetary inputs are USD. Access relies on private Sites sign-in. Do not make public with paid integrations without reviewing access and abuse protection.
+All monetary inputs are USD. Access relies on private sign-in — Sign in with ChatGPT on the Sites/Cloudflare deployment, owner password auth on the Vercel deployment. Do not make public with paid integrations without reviewing access and abuse protection.
 
 ## Advisor rules
 
@@ -99,7 +109,7 @@ Known limitations, not changed in Stage 02:
 
 ## Database and deployment
 
-Coin Radar is published through OpenAI Sites. `npm run build` first checks the migration history, then copies `drizzle/` into the build. Sites publishing applies pending migrations to the production D1 database (binding `DB`) one at a time, **before** the new Worker goes live, so the code already running must keep working on the new schema. The checklist, deployment sequence, smoke checks, rollback options and failure matrix are in [docs/deployment-runbook.md](docs/deployment-runbook.md).
+Production runs on Vercel with Turso as the database; `npm run db:migrate:turso` applies pending migrations there. The Sites/Cloudflare path remains compatible: `npm run build` first checks the migration history, then copies `drizzle/` into the build, and Sites publishing applies pending migrations to Cloudflare D1 (binding `DB`) one at a time, **before** the new Worker goes live, so the code already running must keep working on the new schema. Both paths share the same `drizzle/` migrations and schema. The checklist, deployment sequence, smoke checks, rollback options and failure matrix for both are in [docs/deployment-runbook.md](docs/deployment-runbook.md).
 
 | Command | Scope |
 | --- | --- |
