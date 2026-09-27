@@ -3,7 +3,7 @@
 import assert from 'node:assert/strict';
 import {beforeEach, describe, test} from 'node:test';
 import {addresses, failures, installFetch, offlineFetch} from './helpers/harness.mjs';
-import {NOW, pair} from './helpers/goldmine-fixtures.mjs';
+import {NOW, cases, pair} from './helpers/goldmine-fixtures.mjs';
 
 const {deriveContractSafety, extractFacts, attachContractSafety, withContractSafety, LP_LOCKED_MIN_PCT, MAX_CHECKS_PER_SCAN, SCAN_BUDGET_MS} = await import('../lib/goldmine/contract-safety.ts');
 const {snapshotFromPair} = await import('../lib/goldmine/snapshot.ts');
@@ -323,5 +323,45 @@ describe('withContractSafety: only actionable candidates ever reach RugCheck', (
     assert.equal(after.snapshot.contractSafety.status, 'unsafe');
     assert.equal(after.assessment.opportunity, false);
     assert.deepEqual(after.assessment.blockers.map(b => b.id), ['contract_safety_unverified']);
+  });
+
+  // Regression: discovery order (lib/market.ts) has nothing to do with how close a candidate is to
+  // becoming an opportunity. Before this fix, withContractSafety spent the MAX_CHECKS_PER_SCAN budget in
+  // whatever order candidates arrived, so a run of OVERHEATED candidates (blocked by state alone - no
+  // RugCheck result can ever make them an opportunity) appearing first could exhaust the cap before a
+  // genuine near-miss (a candidate blocked only by contract safety) was ever reached, silently forcing it
+  // to 'unavailable' too. This reproduces exactly that discovery order and asserts the near-miss is
+  // checked instead of one of the never-actionable candidates.
+  test('the RugCheck budget is spent on candidates safety can still flip into an opportunity, not on discovery order', async () => {
+    const calls = installFetch(() => Response.json(report()));
+    const overheated = (n) => ({
+      snapshot: snapshotFromPair(pair({...cases.overheated, baseToken: {address: candidateAddress('HeatCand', n), name: 'X', symbol: 'X'}, pairAddress: candidateAddress('HeatPair', n)}), NOW),
+    });
+    const neverActionable = Array.from({length: MAX_CHECKS_PER_SCAN}, (_, n) => {
+      const {snapshot} = overheated(n);
+      return {snapshot, assessment: scoreCandidate(snapshot)};
+    });
+    for (const entry of neverActionable) {
+      assert.equal(entry.assessment.state, 'OVERHEATED');
+      // Blocked by state alone (plus the not-yet-checked safety blocker every fresh candidate starts
+      // with) - state_not_actionable can never clear, so no RugCheck result changes this candidate's
+      // opportunity status.
+      assert.ok(entry.assessment.blockers.some(b => b.id === 'state_not_actionable'));
+    }
+    const nearMissSnapshot = snapshotFromPair(pair({...cases.breakout, baseToken: {address: candidateAddress('PeakCand', 0), name: 'PEAK', symbol: 'PEAK'}, pairAddress: candidateAddress('PeakPair', 0)}), NOW);
+    const nearMiss = {snapshot: nearMissSnapshot, assessment: scoreCandidate(nearMissSnapshot)};
+    assert.equal(nearMiss.assessment.state, 'BREAKOUT');
+    assert.deepEqual(nearMiss.assessment.blockers.map(b => b.id), ['contract_safety_unverified']);
+
+    // The near-miss arrives last, after every never-actionable candidate has already filled the cap.
+    const result = await withContractSafety([...neverActionable, nearMiss], testNow);
+    assert.equal(calls.length, MAX_CHECKS_PER_SCAN, 'the cap is still respected');
+
+    const checkedNearMiss = result.find(entry => entry.snapshot.address === nearMissSnapshot.address);
+    assert.equal(checkedNearMiss.snapshot.contractSafety.status, 'verified', 'the near-miss was prioritized over never-actionable candidates');
+    assert.equal(checkedNearMiss.assessment.opportunity, true, 'it can now report an opportunity once safety is verified');
+
+    const unavailableCount = result.filter(entry => entry.snapshot.contractSafety.status === 'unavailable').length;
+    assert.equal(unavailableCount, 1, 'exactly one never-actionable candidate is pushed past the budget instead');
   });
 });
