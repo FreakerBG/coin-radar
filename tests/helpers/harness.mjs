@@ -109,10 +109,15 @@ for (const level of ['error', 'warn']) {
 
 // lib/market.ts keeps a module-level response cache keyed by URL. Each test gets a
 // clock far beyond earlier tests' TTLs, so cached provider data never crosses tests.
+//
+// The step must exceed the span any single test advances its own clock through, not just the cache TTL: a
+// test that runs its clock past the *next* test's base would leave cache entries that still look fresh
+// there. The Stage 06 outcome horizons reach 7 days plus a 26-hour grace window (lib/goldmine/cadence.ts),
+// so a test can legitimately span more than a week; 60 days leaves wide margin over that.
 let clockBase = Date.UTC(2026, 0, 5, 12);
 export function startClock() {
   mock.timers.reset();
-  clockBase += 7 * 24 * 3600 * 1000;
+  clockBase += 60 * 24 * 3600 * 1000;
   mock.timers.enable({apis: ['Date'], now: clockBase});
   return {
     now: () => Date.now(),

@@ -8,6 +8,8 @@ import {pair} from './helpers/goldmine-fixtures.mjs';
 const {replaySignal, replayAll, distribution, performanceReport, wouldBeOpportunityAt, calibrationSweep, defaultCutoff, MIN_EVALUATION_SIGNALS, MIN_OBSERVED_RETURN_SAMPLES, CALIBRATION_THRESHOLDS, MAX_REPLAY_EXCEPTION_DIAGNOSTICS} = await import('../lib/goldmine/backtest.ts');
 const {scoreCandidate, MODEL_VERSION} = await import('../lib/goldmine/score.ts');
 const {snapshotFromPair} = await import('../lib/goldmine/snapshot.ts');
+// Reported calibration cells cover every known horizon, legacy and active (lib/goldmine/cadence.ts).
+const {KNOWN_HORIZON_IDS} = await import('../lib/goldmine/cadence.ts');
 
 const NOW = Date.UTC(2026, 8, 18, 12);
 const MINUTE = 60000, HOUR = 60 * MINUTE;
@@ -229,47 +231,47 @@ describe('performanceReport', () => {
   test('every outcome status is counted in coverage; pending/unavailable/missed are never dropped or treated as zero return', () => {
     const signals = [signal('BREAKOUT', 's1', 1)];
     const outcomes = [
-      {signalId: 's1', horizon: '15m', status: 'observed', dueAt: NOW, observedAt: NOW, price: 1.2, liquidity: 1000},
-      {signalId: 's1', horizon: '1h', status: 'pending', dueAt: NOW, observedAt: null, price: null, liquidity: null},
-      {signalId: 's1', horizon: '6h', status: 'unavailable', dueAt: NOW, observedAt: NOW, price: null, liquidity: null},
-      {signalId: 's1', horizon: '24h', status: 'missed', dueAt: NOW, observedAt: null, price: null, liquidity: null},
+      {signalId: 's1', horizon: '15m', status: 'observed', dueAt: NOW, deadlineAt: NOW + MINUTE, observedAt: NOW, price: 1.2, liquidity: 1000},
+      {signalId: 's1', horizon: '1h', status: 'pending', dueAt: NOW, deadlineAt: NOW + MINUTE, observedAt: null, price: null, liquidity: null},
+      {signalId: 's1', horizon: '6h', status: 'unavailable', dueAt: NOW, deadlineAt: NOW + MINUTE, observedAt: NOW, price: null, liquidity: null},
+      {signalId: 's1', horizon: '24h', status: 'missed', dueAt: NOW, deadlineAt: NOW + MINUTE, observedAt: null, price: null, liquidity: null},
     ];
-    const report = performanceReport(signals, outcomes);
+    const report = performanceReport(signals, outcomes, NOW);
     const byHorizon = Object.fromEntries(report.map(bucket => [bucket.horizon, bucket]));
-    assert.deepEqual(byHorizon['15m'].coverage, {pending: 0, observed: 1, unavailable: 0, missed: 0});
+    assert.deepEqual(byHorizon['15m'].coverage, {pending: 0, expiredUnswept: 0, observed: 1, unavailable: 0, missed: 0});
     assert.equal(byHorizon['15m'].returnsPct.count, 1);
     assert.equal(byHorizon['15m'].returnsPct.mean, 20);
-    assert.deepEqual(byHorizon['1h'].coverage, {pending: 1, observed: 0, unavailable: 0, missed: 0});
+    assert.deepEqual(byHorizon['1h'].coverage, {pending: 1, expiredUnswept: 0, observed: 0, unavailable: 0, missed: 0});
     assert.equal(byHorizon['1h'].returnsPct.count, 0, 'a pending outcome contributes no return, not a zero return');
-    assert.deepEqual(byHorizon['6h'].coverage, {pending: 0, observed: 0, unavailable: 1, missed: 0});
+    assert.deepEqual(byHorizon['6h'].coverage, {pending: 0, expiredUnswept: 0, observed: 0, unavailable: 1, missed: 0});
     assert.equal(byHorizon['6h'].returnsPct.count, 0);
-    assert.deepEqual(byHorizon['24h'].coverage, {pending: 0, observed: 0, unavailable: 0, missed: 1});
+    assert.deepEqual(byHorizon['24h'].coverage, {pending: 0, expiredUnswept: 0, observed: 0, unavailable: 0, missed: 1});
     assert.equal(byHorizon['24h'].returnsPct.count, 0);
   });
 
   test('buckets are grouped separately per model version x state x horizon', () => {
     const signals = [signal('BREAKOUT', 's1'), signal('EARLY', 's2'), {...signal('BREAKOUT', 's3'), modelVersion: 'momentum-v2.0.0'}];
     const outcomes = [
-      {signalId: 's1', horizon: '15m', status: 'observed', dueAt: NOW, observedAt: NOW, price: 1.1, liquidity: 1},
-      {signalId: 's2', horizon: '15m', status: 'observed', dueAt: NOW, observedAt: NOW, price: 0.9, liquidity: 1},
-      {signalId: 's3', horizon: '15m', status: 'observed', dueAt: NOW, observedAt: NOW, price: 1.5, liquidity: 1},
+      {signalId: 's1', horizon: '15m', status: 'observed', dueAt: NOW, deadlineAt: NOW + MINUTE, observedAt: NOW, price: 1.1, liquidity: 1},
+      {signalId: 's2', horizon: '15m', status: 'observed', dueAt: NOW, deadlineAt: NOW + MINUTE, observedAt: NOW, price: 0.9, liquidity: 1},
+      {signalId: 's3', horizon: '15m', status: 'observed', dueAt: NOW, deadlineAt: NOW + MINUTE, observedAt: NOW, price: 1.5, liquidity: 1},
     ];
-    const report = performanceReport(signals, outcomes);
+    const report = performanceReport(signals, outcomes, NOW);
     assert.equal(report.length, 3);
     const keys = report.map(b => `${b.modelVersion}:${b.state}:${b.horizon}`).sort();
     assert.deepEqual(keys, ['momentum-v2.0.0:BREAKOUT:15m', `${MODEL_VERSION}:BREAKOUT:15m`, `${MODEL_VERSION}:EARLY:15m`].sort());
   });
 
   test('an outcome referencing an unknown signal id is ignored rather than crashing', () => {
-    const report = performanceReport([signal('BREAKOUT', 's1')], [{signalId: 'missing', horizon: '15m', status: 'observed', dueAt: NOW, observedAt: NOW, price: 1, liquidity: 1}]);
+    const report = performanceReport([signal('BREAKOUT', 's1')], [{signalId: 'missing', horizon: '15m', status: 'observed', dueAt: NOW, deadlineAt: NOW + MINUTE, observedAt: NOW, price: 1, liquidity: 1}], NOW);
     assert.deepEqual(report, []);
   });
 
   test('never mutates its inputs', () => {
     const signals = [signal('BREAKOUT', 's1')];
-    const outcomes = [{signalId: 's1', horizon: '15m', status: 'observed', dueAt: NOW, observedAt: NOW, price: 1.2, liquidity: 1}];
+    const outcomes = [{signalId: 's1', horizon: '15m', status: 'observed', dueAt: NOW, deadlineAt: NOW + MINUTE, observedAt: NOW, price: 1.2, liquidity: 1}];
     const before = JSON.stringify([signals, outcomes]);
-    performanceReport(signals, outcomes);
+    performanceReport(signals, outcomes, NOW);
     assert.equal(JSON.stringify([signals, outcomes]), before);
   });
 
@@ -279,8 +281,8 @@ describe('performanceReport', () => {
     // reproduction. Coverage still counts the outcome as observed (the row itself is well-formed and
     // stamped 'observed'); only the unusable, non-finite derived return is excluded.
     const signals = [signal('BREAKOUT', 's1', 1e-300)];
-    const outcomes = [{signalId: 's1', horizon: '15m', status: 'observed', dueAt: NOW, observedAt: NOW, price: 1e300, liquidity: 1}];
-    const report = performanceReport(signals, outcomes);
+    const outcomes = [{signalId: 's1', horizon: '15m', status: 'observed', dueAt: NOW, deadlineAt: NOW + MINUTE, observedAt: NOW, price: 1e300, liquidity: 1}];
+    const report = performanceReport(signals, outcomes, NOW);
     const bucket = report.find(b => b.horizon === '15m');
     assert.equal(bucket.coverage.observed, 1, 'the stamped observed status is still counted');
     assert.equal(bucket.returnsPct.count, 0, 'no usable finite return was produced');
@@ -290,8 +292,8 @@ describe('performanceReport', () => {
 
   test('a normal finite return is unaffected by the non-finite guard', () => {
     const signals = [signal('BREAKOUT', 's1', 1)];
-    const outcomes = [{signalId: 's1', horizon: '15m', status: 'observed', dueAt: NOW, observedAt: NOW, price: 1.25, liquidity: 1}];
-    const report = performanceReport(signals, outcomes);
+    const outcomes = [{signalId: 's1', horizon: '15m', status: 'observed', dueAt: NOW, deadlineAt: NOW + MINUTE, observedAt: NOW, price: 1.25, liquidity: 1}];
+    const report = performanceReport(signals, outcomes, NOW);
     const bucket = report.find(b => b.horizon === '15m');
     assert.equal(bucket.returnsPct.count, 1);
     assert.equal(bucket.returnsPct.mean, 25);
@@ -336,13 +338,13 @@ describe('calibrationSweep', () => {
     };
   }
   function outcomeFor(signal, horizon = '15m') {
-    return {signalId: signal.id, horizon, status: 'observed', dueAt: signal.detectedAt, observedAt: signal.detectedAt, price: 1 * (1 + signal._return), liquidity: 1};
+    return {signalId: signal.id, horizon, status: 'observed', dueAt: signal.detectedAt, deadlineAt: signal.detectedAt + MINUTE, observedAt: signal.detectedAt, price: 1 * (1 + signal._return), liquidity: 1};
   }
 
   test('signals before the cutoff (the reference half) never contribute to any row, however extreme their outcome', () => {
     const reference = evalSignal('ref', NOW - HOUR, 90, 5); // +500% return, but strictly before cutoff
     const evaluation = evalSignal('eval', NOW, 65, 0.1);
-    const result = calibrationSweep([reference, evaluation], [outcomeFor(reference), outcomeFor(evaluation)], {cutoffAt: NOW, thresholds: [60]});
+    const result = calibrationSweep([reference, evaluation], [outcomeFor(reference), outcomeFor(evaluation)], {cutoffAt: NOW, now: NOW, thresholds: [60]});
     assert.equal(result.referenceCount, 1);
     assert.equal(result.evaluationCount, 1);
     const row = result.rows[0];
@@ -352,7 +354,7 @@ describe('calibrationSweep', () => {
 
   test('descriptiveOnly is true when the evaluation half has fewer than MIN_EVALUATION_SIGNALS signals', () => {
     const evaluation = evalSignal('eval', NOW, 65, 0.1);
-    const result = calibrationSweep([evaluation], [outcomeFor(evaluation)], {cutoffAt: NOW - MINUTE});
+    const result = calibrationSweep([evaluation], [outcomeFor(evaluation)], {cutoffAt: NOW - MINUTE, now: NOW});
     assert.equal(result.evaluationCount, 1);
     assert.ok(result.evaluationCount < MIN_EVALUATION_SIGNALS);
     assert.equal(result.descriptiveOnly, true);
@@ -362,21 +364,21 @@ describe('calibrationSweep', () => {
   test('descriptiveOnly is false once the evaluation half reaches MIN_EVALUATION_SIGNALS AND every reported cell is individually sufficient', () => {
     const evaluation = Array.from({length: MIN_EVALUATION_SIGNALS}, (_, i) => evalSignal('eval' + i, NOW + i, 65, 0.05));
     // Every horizon gets a real observed outcome for every signal, and only threshold 60 is asked about
-    // (all 20 signals are eligible there), so every one of the 4 reported cells is individually sufficient.
-    const outcomes = evaluation.flatMap(s => ['15m', '1h', '6h', '24h'].map(horizon => outcomeFor(s, horizon)));
-    const result = calibrationSweep(evaluation, outcomes, {cutoffAt: NOW, thresholds: [60]});
+    // (all 20 signals are eligible there), so every one of the reported cells (one per known horizon) is individually sufficient.
+    const outcomes = evaluation.flatMap(s => KNOWN_HORIZON_IDS.map(horizon => outcomeFor(s, horizon)));
+    const result = calibrationSweep(evaluation, outcomes, {cutoffAt: NOW, now: NOW, thresholds: [60]});
     assert.equal(result.evaluationCount, MIN_EVALUATION_SIGNALS);
     assert.equal(result.insufficientCellCount, 0);
     assert.equal(result.descriptiveOnly, false);
   });
 
   test('reaching MIN_EVALUATION_SIGNALS alone, with other thresholds/horizons still weak, keeps descriptiveOnly true', () => {
-    // Reproduces the original (single-horizon, default-thresholds) fixture: only 15m has outcomes, so 1h/
-    // 6h/24h remain insufficient (eligible but unobserved) and every threshold above 65 has zero eligible
+    // Reproduces the original (single-horizon, default-thresholds) fixture: only 15m has outcomes, so every other reported horizon
+    // remains insufficient (eligible but unobserved) and every threshold above 65 has zero eligible
     // signals (not_evaluable). Evaluation-half size alone must not flip descriptiveOnly to false.
     const evaluation = Array.from({length: MIN_EVALUATION_SIGNALS}, (_, i) => evalSignal('eval' + i, NOW + i, 65, 0.05));
     const outcomes = evaluation.map(s => outcomeFor(s));
-    const result = calibrationSweep(evaluation, outcomes, {cutoffAt: NOW});
+    const result = calibrationSweep(evaluation, outcomes, {cutoffAt: NOW, now: NOW});
     assert.equal(result.evaluationCount, MIN_EVALUATION_SIGNALS);
     assert.equal(result.descriptiveOnly, true);
   });
@@ -384,13 +386,13 @@ describe('calibrationSweep', () => {
   test('a higher threshold only ever narrows (never widens) the eligible set', () => {
     const evaluation = [evalSignal('a', NOW, 55, 0.1), evalSignal('b', NOW, 65, 0.1), evalSignal('c', NOW, 85, 0.1)];
     const outcomes = evaluation.map(s => outcomeFor(s));
-    const result = calibrationSweep(evaluation, outcomes, {cutoffAt: NOW - 1, thresholds: [40, 60, 80]});
+    const result = calibrationSweep(evaluation, outcomes, {cutoffAt: NOW - 1, now: NOW, thresholds: [40, 60, 80]});
     const counts = result.rows.map(row => row.eligibleCount);
     assert.deepEqual(counts, [...counts].sort((a, b) => b - a), `eligible counts must be non-increasing as threshold rises: ${counts}`);
   });
 
   test('uses CALIBRATION_THRESHOLDS by default', () => {
-    const result = calibrationSweep([], [], {cutoffAt: NOW});
+    const result = calibrationSweep([], [], {cutoffAt: NOW, now: NOW});
     assert.deepEqual(result.rows.map(r => r.threshold), CALIBRATION_THRESHOLDS);
   });
 
@@ -398,7 +400,7 @@ describe('calibrationSweep', () => {
     const evaluation = [evalSignal('a', NOW, 65, 0.1)];
     const outcomes = evaluation.map(s => outcomeFor(s));
     const before = JSON.stringify([evaluation, outcomes]);
-    calibrationSweep(evaluation, outcomes, {cutoffAt: NOW - 1});
+    calibrationSweep(evaluation, outcomes, {cutoffAt: NOW - 1, now: NOW});
     assert.equal(JSON.stringify([evaluation, outcomes]), before);
   });
 
@@ -407,13 +409,13 @@ describe('calibrationSweep', () => {
   test('>= MIN_EVALUATION_SIGNALS evaluation signals with zero observed outcomes is still descriptiveOnly', () => {
     const evaluation = Array.from({length: MIN_EVALUATION_SIGNALS}, (_, i) => evalSignal('eval' + i, NOW + i, 65, 0.05));
     // No outcomes recorded for any of them at all (imagine every horizon still pending/unsettled).
-    const result = calibrationSweep(evaluation, [], {cutoffAt: NOW});
+    const result = calibrationSweep(evaluation, [], {cutoffAt: NOW, now: NOW});
     assert.equal(result.evaluationCount, MIN_EVALUATION_SIGNALS);
     assert.equal(result.descriptiveOnly, true, 'a large evaluation half with no observed outcomes must never read as sufficient evidence');
     const row60 = result.rows.find(r => r.threshold === 60);
     const horizon15m = row60.byHorizon.find(h => h.horizon === '15m');
     assert.equal(horizon15m.eligible, MIN_EVALUATION_SIGNALS);
-    assert.deepEqual(horizon15m.coverage, {pending: 0, observed: 0, unavailable: 0, missed: 0}, 'missing outcomes are never guessed at as any status');
+    assert.deepEqual(horizon15m.coverage, {pending: 0, expiredUnswept: 0, observed: 0, unavailable: 0, missed: 0}, 'missing outcomes are never guessed at as any status');
     assert.equal(horizon15m.eligibleWithOutcome, 0);
     assert.ok(horizon15m.eligibleWithOutcome < MIN_OBSERVED_RETURN_SAMPLES);
     assert.equal(horizon15m.sufficientEvidence, false);
@@ -424,11 +426,11 @@ describe('calibrationSweep', () => {
     // Only 3 of the 20 have an observed 15m outcome; the rest are pending.
     const outcomes = evaluation.map((s, i) => i < 3
       ? outcomeFor(s)
-      : {signalId: s.id, horizon: '15m', status: 'pending', dueAt: s.detectedAt, observedAt: null, price: null, liquidity: 1});
-    const result = calibrationSweep(evaluation, outcomes, {cutoffAt: NOW});
+      : {signalId: s.id, horizon: '15m', status: 'pending', dueAt: s.detectedAt, deadlineAt: s.detectedAt + MINUTE, observedAt: null, price: null, liquidity: 1});
+    const result = calibrationSweep(evaluation, outcomes, {cutoffAt: NOW, now: NOW});
     const row60 = result.rows.find(r => r.threshold === 60);
     const horizon15m = row60.byHorizon.find(h => h.horizon === '15m');
-    assert.deepEqual(horizon15m.coverage, {pending: 17, observed: 3, unavailable: 0, missed: 0});
+    assert.deepEqual(horizon15m.coverage, {pending: 17, expiredUnswept: 0, observed: 3, unavailable: 0, missed: 0});
     assert.equal(horizon15m.eligibleWithOutcome, 3);
     assert.equal(horizon15m.coverageRatio, Number((3 / 20).toFixed(4)));
     assert.equal(horizon15m.sufficientEvidence, false, 'only 3 observed returns, below MIN_OBSERVED_RETURN_SAMPLES');
@@ -437,11 +439,11 @@ describe('calibrationSweep', () => {
 
   test('a threshold/horizon with eligible signals but zero observed returns is distinguished from one with none eligible', () => {
     const eligibleNoOutcome = evalSignal('a', NOW, 90, 0.1); // eligible at every threshold up to 90
-    const outcome = {signalId: eligibleNoOutcome.id, horizon: '15m', status: 'unavailable', dueAt: NOW, observedAt: NOW, price: null, liquidity: null};
-    const result = calibrationSweep([eligibleNoOutcome], [outcome], {cutoffAt: NOW - 1, thresholds: [90]});
+    const outcome = {signalId: eligibleNoOutcome.id, horizon: '15m', status: 'unavailable', dueAt: NOW, deadlineAt: NOW + MINUTE, observedAt: NOW, price: null, liquidity: null};
+    const result = calibrationSweep([eligibleNoOutcome], [outcome], {cutoffAt: NOW - 1, now: NOW, thresholds: [90]});
     const horizon15m = result.rows[0].byHorizon.find(h => h.horizon === '15m');
     assert.equal(horizon15m.eligible, 1);
-    assert.deepEqual(horizon15m.coverage, {pending: 0, observed: 0, unavailable: 1, missed: 0});
+    assert.deepEqual(horizon15m.coverage, {pending: 0, expiredUnswept: 0, observed: 0, unavailable: 1, missed: 0});
     assert.equal(horizon15m.eligibleWithOutcome, 0);
     assert.equal(horizon15m.returnsPct.count, 0, 'an unavailable outcome never becomes a zero return');
   });
@@ -453,13 +455,13 @@ describe('calibrationSweep', () => {
     ];
     const outcomes = [
       outcomeFor(signals[0]),
-      {signalId: signals[1].id, horizon: '15m', status: 'pending', dueAt: NOW, observedAt: null, price: null, liquidity: null},
-      {signalId: signals[2].id, horizon: '15m', status: 'unavailable', dueAt: NOW, observedAt: NOW, price: null, liquidity: null},
-      {signalId: signals[3].id, horizon: '15m', status: 'missed', dueAt: NOW, observedAt: null, price: null, liquidity: null},
+      {signalId: signals[1].id, horizon: '15m', status: 'pending', dueAt: NOW, deadlineAt: NOW + MINUTE, observedAt: null, price: null, liquidity: null},
+      {signalId: signals[2].id, horizon: '15m', status: 'unavailable', dueAt: NOW, deadlineAt: NOW + MINUTE, observedAt: NOW, price: null, liquidity: null},
+      {signalId: signals[3].id, horizon: '15m', status: 'missed', dueAt: NOW, deadlineAt: NOW + MINUTE, observedAt: null, price: null, liquidity: null},
     ];
-    const result = calibrationSweep(signals, outcomes, {cutoffAt: NOW - 1, thresholds: [90]});
+    const result = calibrationSweep(signals, outcomes, {cutoffAt: NOW - 1, now: NOW, thresholds: [90]});
     const horizon15m = result.rows[0].byHorizon.find(h => h.horizon === '15m');
-    assert.deepEqual(horizon15m.coverage, {pending: 1, observed: 1, unavailable: 1, missed: 1});
+    assert.deepEqual(horizon15m.coverage, {pending: 1, expiredUnswept: 0, observed: 1, unavailable: 1, missed: 1});
     assert.equal(horizon15m.eligible, 4);
   });
 
@@ -469,7 +471,7 @@ describe('calibrationSweep', () => {
   test('a threshold/horizon cell with zero eligible signals is not_evaluable, distinct from insufficient', () => {
     const evaluation = Array.from({length: MIN_EVALUATION_SIGNALS}, (_, i) => evalSignal('eval' + i, NOW + i, 30, 0.1)); // never eligible at threshold 90
     const outcomes = evaluation.map(s => outcomeFor(s));
-    const result = calibrationSweep(evaluation, outcomes, {cutoffAt: NOW, thresholds: [90]});
+    const result = calibrationSweep(evaluation, outcomes, {cutoffAt: NOW, now: NOW, thresholds: [90]});
     const horizon15m = result.rows[0].byHorizon.find(h => h.horizon === '15m');
     assert.equal(horizon15m.eligible, 0);
     assert.equal(horizon15m.cellStatus, 'not_evaluable');
@@ -479,20 +481,22 @@ describe('calibrationSweep', () => {
   test('exact reconciliation: sufficientCellCount + insufficientCellCount + notEvaluableCellCount === totalCellCount', () => {
     const evaluation = Array.from({length: MIN_EVALUATION_SIGNALS}, (_, i) => evalSignal('eval' + i, NOW + i, 65, 0.05));
     const outcomes = evaluation.map(s => outcomeFor(s)); // only 15m has an outcome; 1h/6h/24h are not_evaluable-by-outcome (but still eligible)
-    const result = calibrationSweep(evaluation, outcomes, {cutoffAt: NOW, thresholds: [40, 60, 90]});
-    assert.equal(result.totalCellCount, 3 * 4);
+    const result = calibrationSweep(evaluation, outcomes, {cutoffAt: NOW, now: NOW, thresholds: [40, 60, 90]});
+    // One cell per threshold per KNOWN horizon: the legacy ids are still reported (that is how the cadence
+    // problem stays visible) alongside the active ones.
+    assert.equal(result.totalCellCount, 3 * KNOWN_HORIZON_IDS.length);
     assert.equal(result.sufficientCellCount + result.insufficientCellCount + result.notEvaluableCellCount, result.totalCellCount);
   });
 
   test('a single sufficient cell among many weak/not-evaluable cells never makes descriptiveOnly false (20 signals, only 15m observed)', () => {
     const evaluation = Array.from({length: MIN_EVALUATION_SIGNALS}, (_, i) => evalSignal('eval' + i, NOW + i, 65, 0.05));
     const outcomes = evaluation.map(s => outcomeFor(s)); // 20 observed 15m returns: 15m/threshold<=65 cells are sufficient
-    const result = calibrationSweep(evaluation, outcomes, {cutoffAt: NOW, thresholds: CALIBRATION_THRESHOLDS});
+    const result = calibrationSweep(evaluation, outcomes, {cutoffAt: NOW, now: NOW, thresholds: CALIBRATION_THRESHOLDS});
     const sufficientCells = result.rows.flatMap(r => r.byHorizon).filter(h => h.cellStatus === 'sufficient');
     assert.ok(sufficientCells.length >= 1, 'at least one cell (15m, threshold<=65) is sufficient in this setup');
-    // 1h/6h/24h horizons have no outcome rows at all -> not_evaluable is impossible here since eligible>0;
+    // Every horizon other than 15m has no outcome rows at all -> not_evaluable is impossible here since eligible>0;
     // they are insufficient (eligible signals, zero observed returns), which must keep descriptiveOnly true.
-    assert.ok(result.insufficientCellCount > 0, 'most cells (1h/6h/24h, and higher thresholds) remain weak');
+    assert.ok(result.insufficientCellCount > 0, 'most cells (every horizon but 15m, and higher thresholds) remain weak');
     assert.equal(result.descriptiveOnly, true, 'one strong cell must never validate the whole calibration result');
   });
 
@@ -500,8 +504,8 @@ describe('calibrationSweep', () => {
     const evaluation = Array.from({length: MIN_EVALUATION_SIGNALS}, (_, i) => evalSignal('eval' + i, NOW + i, 65, 0.05));
     // Every horizon gets an observed outcome for every signal, all eligible at threshold 60 (the only one
     // we ask about), so every reported cell is sufficient.
-    const outcomes = evaluation.flatMap(s => ['15m', '1h', '6h', '24h'].map(horizon => outcomeFor(s, horizon)));
-    const result = calibrationSweep(evaluation, outcomes, {cutoffAt: NOW, thresholds: [60]});
+    const outcomes = evaluation.flatMap(s => KNOWN_HORIZON_IDS.map(horizon => outcomeFor(s, horizon)));
+    const result = calibrationSweep(evaluation, outcomes, {cutoffAt: NOW, now: NOW, thresholds: [60]});
     assert.equal(result.insufficientCellCount, 0);
     assert.ok(result.sufficientCellCount > 0);
     assert.equal(result.descriptiveOnly, false);
@@ -510,8 +514,8 @@ describe('calibrationSweep', () => {
   test('when every evaluable cell is insufficient, descriptiveOnly is true', () => {
     const evaluation = Array.from({length: MIN_EVALUATION_SIGNALS}, (_, i) => evalSignal('eval' + i, NOW + i, 65, 0.05));
     // Only 2 observed returns per horizon - well below MIN_OBSERVED_RETURN_SAMPLES everywhere.
-    const outcomes = evaluation.slice(0, 2).flatMap(s => ['15m', '1h', '6h', '24h'].map(horizon => outcomeFor(s, horizon)));
-    const result = calibrationSweep(evaluation, outcomes, {cutoffAt: NOW, thresholds: [60]});
+    const outcomes = evaluation.slice(0, 2).flatMap(s => KNOWN_HORIZON_IDS.map(horizon => outcomeFor(s, horizon)));
+    const result = calibrationSweep(evaluation, outcomes, {cutoffAt: NOW, now: NOW, thresholds: [60]});
     assert.equal(result.sufficientCellCount, 0);
     assert.ok(result.insufficientCellCount > 0);
     assert.equal(result.descriptiveOnly, true);
@@ -521,8 +525,8 @@ describe('calibrationSweep', () => {
     const signal = evalSignal('a', NOW, 90, 0.1);
     // A corrupt-in-effect price (Infinity) is stamped 'observed' but must never become part of the return
     // sample: sufficiency is judged from returns.length, never from coverage.observed alone.
-    const outcome = {signalId: signal.id, horizon: '15m', status: 'observed', dueAt: NOW, observedAt: NOW, price: Infinity, liquidity: 1};
-    const result = calibrationSweep([signal], [outcome], {cutoffAt: NOW - 1, thresholds: [90]});
+    const outcome = {signalId: signal.id, horizon: '15m', status: 'observed', dueAt: NOW, deadlineAt: NOW + MINUTE, observedAt: NOW, price: Infinity, liquidity: 1};
+    const result = calibrationSweep([signal], [outcome], {cutoffAt: NOW - 1, now: NOW, thresholds: [90]});
     const horizon15m = result.rows[0].byHorizon.find(h => h.horizon === '15m');
     assert.equal(horizon15m.coverage.observed, 1, 'coverage still counts the stamped status');
     assert.equal(horizon15m.returnsPct.count, 0, 'but no usable finite return was produced');
@@ -537,7 +541,7 @@ describe('calibrationSweep', () => {
     // sweep's rules by coincidence, but must never be scored as if it were the current model's output.
     const legacy = {...evalSignal('legacy', NOW, 65, 0.1), modelVersion: 'momentum-v1.0.0'};
     const outcomes = [outcomeFor(current), outcomeFor(legacy)];
-    const result = calibrationSweep([current, legacy], outcomes, {cutoffAt: NOW - 1, thresholds: [60]});
+    const result = calibrationSweep([current, legacy], outcomes, {cutoffAt: NOW - 1, now: NOW, thresholds: [60]});
     assert.equal(result.modelVersion, 'momentum-v2.1.0');
     assert.equal(result.excludedOtherVersionSignals, 1);
     assert.equal(result.evaluationCount, 1, 'the legacy-version signal never joins the evaluation half');

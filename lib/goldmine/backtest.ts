@@ -10,7 +10,12 @@
 // model_version has no implementation of that version in this codebase; it is never run through the
 // current scoreCandidate and relabeled as its historical result - it is marked unsupported instead.
 import {reportFailure} from '../diagnostics';
-import {HORIZONS, type StoredOutcomeRow, type StoredSignalRow} from './signals';
+import {
+  countCoverage, derivedOutcomeState, emptyCoverage, horizonById, horizonOrderIndex, hoursOf,
+  isActiveHorizon, isObservableUnderCadence, KNOWN_HORIZONS, observationAgeMs,
+  type EvaluationScheduleVersion, type OutcomeCoverage,
+} from './cadence';
+import {type StoredOutcomeRow, type StoredSignalRow} from './signals';
 import {MODEL_VERSION, scoreCandidate, type Assessment} from './score';
 
 // This is a research/diagnostic tool, not a forecast: nothing here claims predictive accuracy or
@@ -19,10 +24,13 @@ export const BACKTEST_LIMITATIONS = [
   'Discovery covers at most 30 recently profiled or promoted Solana tokens per scan, not the whole market: stored signals are a sample of what was scanned, never exhaustive historical coverage, and are biased toward whatever DEX Screener profiled or promoted.',
   'The detection price is a DEX Screener quote at scan time, not an executable price; realized returns below ignore fees, slippage and price impact.',
   'Only momentum-v2.1.0 has an implementation in this codebase. Signals recorded under a different stored model_version show their original stored assessment only; there is no supported replay for them here.',
-  'Outcome coverage (pending/unavailable/missed) is reported next to observed returns, never dropped from the denominator or treated as a zero return - a state with mostly missed or unavailable outcomes has little realized evidence regardless of its observed mean.',
+  'Outcome coverage (pending/expired-unswept/unavailable/missed) is reported next to observed returns, never dropped from the denominator or treated as a zero return - a state with mostly missed or unavailable outcomes has little realized evidence regardless of its observed mean. `pending` counts only outcomes still inside their observation window; a row whose window has closed but which no scan has swept yet is counted separately as expired-unswept, never as work still to come.',
+  'This deployment scans once a day, so the legacy 15m, 1h, 6h and 24h horizons cannot be evaluated by it: their observation windows are all narrower than the maximum gap between two daily scans, so no scan is guaranteed to fall inside one. They remain in the report because they exist in stored history, not because they measure anything about the current cadence. The 24h horizon is the subtle case - its 3-hour window is wide enough only when cron drift happens to land the next scan inside it, so whether it settled at all was luck, not design.',
+  'The active horizons (1-day, 3-day and 7-day targets) are daily snapshots, not exact-time execution prices: each is observed at the first daily scan at or after its target age, which can legitimately be the target age or roughly a day later. Every observation reports the actual elapsed time between detection and observation; read that, not the horizon name, as the holding period a return describes.',
+  'REJECTED signals are recorded and evaluated as a control group, never as strategy performance. Their observations share no denominator with opportunity or actionable-state observations: the report carries separate control and strategy counts, and combining them would read a deliberately-not-traded population as evidence about the ones that cleared every gate.',
   'The calibration threshold sweep is descriptive only: candidate thresholds are fixed, never chosen or searched for to fit this data, and it is calibrated on the current model version alone - signals from any other stored model_version are excluded, never reinterpreted under these thresholds.',
   'Evidence sufficiency is judged per threshold/horizon cell, from the actual observed returns used in that cell\'s distribution, not from how many signals were evaluated: descriptiveOnly stays true unless every reported, evaluable cell (one with at least one eligible signal) individually meets the observed-return requirement - one strong cell can never make the whole result read as validated.',
-  'Samples are not statistically independent: the same token can be recorded again in a later scan, and one signal contributes to up to four overlapping horizon buckets (15m/1h/6h/24h) at once. Treat every mean, median and stdev here as descriptive of this recorded history, not as an estimate from independent trials - and treat any mean computed from a single observed return (n=1) as a single data point, not a statistic.',
+  'Samples are not statistically independent: the same token can be recorded again in a later scan, and one signal contributes to every one of its horizon buckets at once (three overlapping buckets under the active schedule, four under the legacy one). Treat every mean, median and stdev here as descriptive of this recorded history, not as an estimate from independent trials - and treat any mean computed from a single observed return (n=1) as a single data point, not a statistic.',
   'History is read newest-first and bounded per request; if `truncated` is true, only the most recently detected signals within that bound are reflected below, not the full stored history. Rows or outcomes that fail structural validation are excluded and counted (skippedMalformedRows/skippedMalformedOutcomes), never guessed at or silently folded into any status.',
 ];
 
@@ -160,33 +168,71 @@ export function distribution(values: number[]): Distribution {
 
 // --- Performance analysis: model version x state x horizon --------------------------------------------
 
-export type OutcomeCoverage = {pending: number; observed: number; unavailable: number; missed: number};
-export type PerformanceBucket = {
+// Re-exported from lib/goldmine/cadence.ts, which owns the shape, so the API, the read paths and the
+// dashboard cannot drift into two different ideas of what a coverage breakdown contains.
+export type {OutcomeCoverage};
+
+// The horizon facts every reported row needs in order to be read honestly on its own, without a lookup
+// into the top-level cadence block: which evaluation schedule wrote it, whether that schedule is still in
+// use, and whether this deployment's cadence can evaluate it at all. `observableUnderCadence: false` is
+// the whole reason a legacy bucket's coverage is nearly all missed; a row unable to say so invites exactly
+// the opposite reading.
+export type HorizonFacts = {
+  horizonLabel: string;
+  horizonSchedule: EvaluationScheduleVersion | null;
+  horizonActive: boolean;
+  observableUnderCadence: boolean;
+  targetHours: number | null;
+};
+
+// An id with no definition is a corrupt or hand-edited row's horizon: reported as itself with unknown
+// metadata, never quietly attributed to a real horizon.
+const horizonFacts = (id: string): HorizonFacts => {
+  const definition = horizonById(id);
+  return {
+    horizonLabel: definition?.label ?? id,
+    horizonSchedule: definition?.schedule ?? null,
+    horizonActive: definition !== null && isActiveHorizon(definition),
+    observableUnderCadence: definition !== null && isObservableUnderCadence(definition),
+    targetHours: definition ? hoursOf(definition.after) : null,
+  };
+};
+
+export type PerformanceBucket = HorizonFacts & {
   modelVersion: string;
   state: string;
   horizon: string;
   coverage: OutcomeCoverage;
   returnsPct: Distribution;
   positiveShare: number | null;
+  // The distribution of *actual* elapsed hours between detection and observation, over the same outcomes
+  // `returnsPct` was computed from. This is what says whether a "1-day target" return really describes
+  // about a day or about two: on a once-daily cadence both are legitimate, and the horizon name alone
+  // cannot tell them apart.
+  observedAfterHours: Distribution;
 };
 
-const HORIZON_ORDER = HORIZONS.map(horizon => horizon.id as string);
 const byBucketOrder = (a: PerformanceBucket, b: PerformanceBucket) =>
-  a.modelVersion.localeCompare(b.modelVersion) || a.state.localeCompare(b.state) || HORIZON_ORDER.indexOf(a.horizon) - HORIZON_ORDER.indexOf(b.horizon);
+  a.modelVersion.localeCompare(b.modelVersion) || a.state.localeCompare(b.state) || horizonOrderIndex(a.horizon) - horizonOrderIndex(b.horizon);
 
 // Every stored outcome, grouped by model version x signal state x horizon, whatever the outcome status.
-// Coverage counts every status so a bucket dominated by pending/unavailable/missed outcomes is visible as
-// such, never collapsed into (or silently excluded from) the denominator of the observed-returns stats.
-export function performanceReport(signals: StoredSignalRow[], outcomes: StoredOutcomeRow[]): PerformanceBucket[] {
+// Coverage counts every *derived* state, so a bucket dominated by pending/expired-unswept/unavailable/
+// missed outcomes is visible as such, never collapsed into (or silently excluded from) the denominator of
+// the observed-returns stats.
+//
+// `now` is the read timestamp the expired-unswept distinction is derived against (lib/goldmine/cadence.ts
+// derivedOutcomeState). Nothing is written: a row past its deadline is *reported* as expired-unswept and
+// left exactly as it is in storage, because only a scan settles a row.
+export function performanceReport(signals: StoredSignalRow[], outcomes: StoredOutcomeRow[], now: number): PerformanceBucket[] {
   const byId = new Map(signals.map(signal => [signal.id, signal]));
-  type Accumulator = {modelVersion: string; state: string; horizon: string; coverage: OutcomeCoverage; returns: number[]; positive: number};
+  type Accumulator = {modelVersion: string; state: string; horizon: string; coverage: OutcomeCoverage; returns: number[]; elapsedHours: number[]; positive: number};
   const buckets = new Map<string, Accumulator>();
   for (const outcome of outcomes) {
     const signal = byId.get(outcome.signalId);
     if (!signal) continue; // An outcome for a signal not in this read (e.g. a corrupt row skipped upstream).
     const key = `${signal.modelVersion} ${signal.state} ${outcome.horizon}`;
-    const bucket = buckets.get(key) ?? {modelVersion: signal.modelVersion, state: signal.state, horizon: outcome.horizon, coverage: {pending: 0, observed: 0, unavailable: 0, missed: 0}, returns: [], positive: 0};
-    if (outcome.status === 'pending' || outcome.status === 'observed' || outcome.status === 'unavailable' || outcome.status === 'missed') bucket.coverage[outcome.status]++;
+    const bucket = buckets.get(key) ?? {modelVersion: signal.modelVersion, state: signal.state, horizon: outcome.horizon, coverage: emptyCoverage(), returns: [], elapsedHours: [], positive: 0};
+    countCoverage(bucket.coverage, derivedOutcomeState(outcome, now));
     if (outcome.status === 'observed' && outcome.price !== null && signal.detectedPrice > 0) {
       const returnPct = (outcome.price / signal.detectedPrice - 1) * 100;
       // Only a finite return ever enters the distribution - consistent with calibrationSweep below. An
@@ -199,18 +245,73 @@ export function performanceReport(signals: StoredSignalRow[], outcomes: StoredOu
       if (Number.isFinite(returnPct)) {
         bucket.returns.push(returnPct);
         if (outcome.price > signal.detectedPrice) bucket.positive++;
+        // Paired with the return, from the same row, so the two distributions always describe the same
+        // sample: a mean return of +4% "observed after 47.2 hours on average" is one statement, and it
+        // would be meaningless if the elapsed times came from a different set of outcomes.
+        const elapsed = hoursOf(observationAgeMs(signal.detectedAt, outcome.observedAt));
+        if (elapsed !== null) bucket.elapsedHours.push(elapsed);
       }
     }
     buckets.set(key, bucket);
   }
   return [...buckets.values()].map(bucket => ({
+    ...horizonFacts(bucket.horizon),
     modelVersion: bucket.modelVersion,
     state: bucket.state,
     horizon: bucket.horizon,
     coverage: bucket.coverage,
     returnsPct: distribution(bucket.returns),
     positiveShare: bucket.returns.length ? Number((bucket.positive / bucket.returns.length).toFixed(4)) : null,
+    observedAfterHours: distribution(bucket.elapsedHours),
   })).sort(byBucketOrder);
+}
+
+// --- Control group versus strategy: two denominators that are never added together --------------------
+
+// One population's signals and the outcome coverage they produced. `observedReturns` is the usable
+// observed-return sample, which is what any mean would actually be computed from.
+export type DenominatorGroup = {signals: number; coverage: OutcomeCoverage; observedReturns: number};
+
+// Three populations, reported side by side and deliberately never summed into a single "performance"
+// denominator:
+//   control  - signals whose state is REJECTED. They were never actionable and were recorded precisely so
+//              there is something to compare against. Their observations are a control measurement.
+//   strategy - signals in an actionable state (anything other than REJECTED).
+//   opportunity - the subset of strategy that cleared every gate (`opportunity === true`). This is the only
+//              population the product ever presented as a candidate.
+// control and strategy partition the signals exactly (a signal is REJECTED or it is not), so
+// control.signals + strategy.signals === the signals in this read; opportunity is nested inside strategy
+// and is therefore never added to either.
+export type DenominatorSplit = {control: DenominatorGroup; strategy: DenominatorGroup; opportunity: DenominatorGroup};
+
+export function denominatorSplit(signals: StoredSignalRow[], outcomes: StoredOutcomeRow[], now: number): DenominatorSplit {
+  const group = (): DenominatorGroup => ({signals: 0, coverage: emptyCoverage(), observedReturns: 0});
+  const split: DenominatorSplit = {control: group(), strategy: group(), opportunity: group()};
+  const membership = new Map<string, DenominatorGroup[]>();
+  for (const signal of signals) {
+    // A REJECTED signal is never also counted as strategy, whatever its stored `opportunity` flag claims:
+    // scoreCandidate's hard gate means a rejected candidate can never be an opportunity, and a stored row
+    // that says otherwise is not a reason to move it into the strategy denominator.
+    const groups = signal.state === 'REJECTED'
+      ? [split.control]
+      : signal.opportunity ? [split.strategy, split.opportunity] : [split.strategy];
+    for (const entry of groups) entry.signals++;
+    membership.set(signal.id, groups);
+  }
+  const byId = new Map(signals.map(signal => [signal.id, signal]));
+  for (const outcome of outcomes) {
+    const groups = membership.get(outcome.signalId);
+    const signal = byId.get(outcome.signalId);
+    if (!groups || !signal) continue;
+    const state = derivedOutcomeState(outcome, now);
+    const usable = outcome.status === 'observed' && outcome.price !== null && signal.detectedPrice > 0
+      && Number.isFinite((outcome.price / signal.detectedPrice - 1) * 100);
+    for (const entry of groups) {
+      countCoverage(entry.coverage, state);
+      if (usable) entry.observedReturns++;
+    }
+  }
+  return split;
 }
 
 // --- Calibration: threshold sweep with a time-ordered split --------------------------------------------
@@ -255,7 +356,7 @@ export function wouldBeOpportunityAt(assessment: Assessment, threshold: number):
 // A populated 15m cell must never lend credibility to a weak or not-evaluable 1h/6h/24h cell, or to a
 // different threshold row - each cell's status is computed only from its own returns.
 export type CellEvidenceStatus = 'sufficient' | 'insufficient' | 'not_evaluable';
-export type CalibrationHorizonRow = {
+export type CalibrationHorizonRow = HorizonFacts & {
   horizon: string;
   eligible: number;
   coverage: OutcomeCoverage;
@@ -268,6 +369,9 @@ export type CalibrationHorizonRow = {
   // returnsPct.count (the usable observed-return sample actually used by the distribution), not
   // coverage.observed.
   sufficientEvidence: boolean;
+  // Same meaning as on a performance bucket: the actual elapsed hours between detection and observation for
+  // the outcomes this cell's returns came from.
+  observedAfterHours: Distribution;
 };
 export type CalibrationRow = {threshold: number; eligibleCount: number; byHorizon: CalibrationHorizonRow[]};
 export type CalibrationResult = {
@@ -280,7 +384,7 @@ export type CalibrationResult = {
   cutoffAt: number;
   referenceCount: number;
   evaluationCount: number;
-  // Exact reconciliation over every reported cell (thresholds.length * HORIZONS.length): each cell is
+  // Exact reconciliation over every reported cell (thresholds.length * KNOWN_HORIZONS.length): each cell is
   // counted in exactly one of these three, so sufficientCellCount + insufficientCellCount +
   // notEvaluableCellCount === totalCellCount always.
   sufficientCellCount: number;
@@ -325,8 +429,8 @@ export function defaultCutoff(signals: StoredSignalRow[]): number | null {
 // outcomes are still pending/unavailable/missed must not read as sufficient evidence merely because it
 // contains many signals; `rows` are still returned in full for visibility even when descriptiveOnly is
 // true, never withheld.
-export function calibrationSweep(signals: StoredSignalRow[], outcomes: StoredOutcomeRow[], options: {cutoffAt: number; thresholds?: number[]; modelVersion?: string}): CalibrationResult {
-  const {cutoffAt, thresholds = CALIBRATION_THRESHOLDS, modelVersion = MODEL_VERSION} = options;
+export function calibrationSweep(signals: StoredSignalRow[], outcomes: StoredOutcomeRow[], options: {cutoffAt: number; now: number; thresholds?: number[]; modelVersion?: string}): CalibrationResult {
+  const {cutoffAt, now, thresholds = CALIBRATION_THRESHOLDS, modelVersion = MODEL_VERSION} = options;
   const inScope = signals.filter(signal => signal.modelVersion === modelVersion);
   const excludedOtherVersionSignals = signals.length - inScope.length;
   const reference = inScope.filter(signal => signal.detectedAt < cutoffAt);
@@ -340,19 +444,25 @@ export function calibrationSweep(signals: StoredSignalRow[], outcomes: StoredOut
   let sufficientCellCount = 0, insufficientCellCount = 0, notEvaluableCellCount = 0;
   const rows = thresholds.map(threshold => {
     const eligible = evaluation.filter(signal => wouldBeOpportunityAt(signal.assessment, threshold));
-    const byHorizon = HORIZONS.map(({id}) => {
-      const coverage: OutcomeCoverage = {pending: 0, observed: 0, unavailable: 0, missed: 0};
+    // Every KNOWN horizon, legacy and active. The legacy cells are what make the cadence problem visible
+    // at all - an all-missed 15m column next to a populated d1 column is the finding, not noise to hide -
+    // and dropping them would also silently remove all existing history from this report.
+    const byHorizon = KNOWN_HORIZONS.map(({id}) => {
+      const coverage: OutcomeCoverage = emptyCoverage();
       const returns: number[] = [];
+      const elapsedHours: number[] = [];
       let positive = 0;
       for (const signal of eligible) {
         const outcome = (outcomesBySignal.get(signal.id) ?? []).find(candidate => candidate.horizon === id);
         if (!outcome) continue; // No stored outcome row for this signal/horizon at all - never guessed at.
-        if (outcome.status === 'pending' || outcome.status === 'observed' || outcome.status === 'unavailable' || outcome.status === 'missed') coverage[outcome.status]++;
+        countCoverage(coverage, derivedOutcomeState(outcome, now));
         if (outcome.status === 'observed' && outcome.price !== null && signal.detectedPrice > 0) {
           const returnPct = (outcome.price / signal.detectedPrice - 1) * 100;
           if (Number.isFinite(returnPct)) {
             returns.push(returnPct);
             if (outcome.price > signal.detectedPrice) positive++;
+            const elapsed = hoursOf(observationAgeMs(signal.detectedAt, outcome.observedAt));
+            if (elapsed !== null) elapsedHours.push(elapsed);
           }
         }
       }
@@ -365,6 +475,7 @@ export function calibrationSweep(signals: StoredSignalRow[], outcomes: StoredOut
       else if (cellStatus === 'insufficient') insufficientCellCount++;
       else notEvaluableCellCount++;
       return {
+        ...horizonFacts(id),
         horizon: id as string,
         eligible: eligible.length,
         coverage,
@@ -374,6 +485,7 @@ export function calibrationSweep(signals: StoredSignalRow[], outcomes: StoredOut
         positiveShare: returns.length ? Number((positive / returns.length).toFixed(4)) : null,
         cellStatus,
         sufficientEvidence: cellStatus === 'sufficient',
+        observedAfterHours: distribution(elapsedHours),
       };
     });
     return {threshold, eligibleCount: eligible.length, byHorizon};

@@ -8,6 +8,7 @@ import {createD1, runtime, startClock} from './helpers/harness.mjs';
 import {pair} from './helpers/goldmine-fixtures.mjs';
 
 const {isValidStoredSnapshot, isValidStoredAssessment, isValidStoredOutcomeRow, readAllSignalsWithOutcomes} = await import('../lib/goldmine/signals.ts');
+const {KNOWN_HORIZON_IDS} = await import('../lib/goldmine/cadence.ts');
 const {MODEL_VERSION, scoreCandidate} = await import('../lib/goldmine/score.ts');
 const {snapshotFromPair} = await import('../lib/goldmine/snapshot.ts');
 const {extractFacts, deriveContractSafety} = await import('../lib/goldmine/contract-safety.ts');
@@ -200,7 +201,9 @@ describe('isValidStoredAssessment', () => {
 });
 
 describe('isValidStoredOutcomeRow', () => {
-  const base = {horizon: '15m', status: 'pending', observed_at: null, price: null, liquidity: null};
+  // A legacy '15m' row, exactly as the intraday schedule wrote it. It must stay valid: every outcome row in
+  // stored history carries a legacy horizon id (lib/goldmine/cadence.ts LEGACY_HORIZONS).
+  const base = {horizon: '15m', status: 'pending', due_at: 1000, deadline_at: 1000 + 5 * 60000, observed_at: null, price: null, liquidity: null};
   test('accepts a well-formed pending row', () => assert.equal(isValidStoredOutcomeRow(base), true));
   test('accepts a well-formed observed row', () => {
     assert.equal(isValidStoredOutcomeRow({...base, status: 'observed', observed_at: 1, price: 1.2, liquidity: 1000}), true);
@@ -214,7 +217,12 @@ describe('isValidStoredOutcomeRow', () => {
   test('accepts a well-formed missed row', () => assert.equal(isValidStoredOutcomeRow({...base, status: 'missed'}), true));
   test('rejects an unknown status string ("CORRUPT")', () => assert.equal(isValidStoredOutcomeRow({...base, status: 'CORRUPT'}), false));
   test('rejects a wrong-case known status ("Observed")', () => assert.equal(isValidStoredOutcomeRow({...base, status: 'Observed', observed_at: 1, price: 1}), false));
+  // '3d' is deliberately chosen: it is the confusable spelling of the active 'd3' horizon, so this also
+  // guards against a read path that accepts an id the writer never produces.
   test('rejects an unknown horizon', () => assert.equal(isValidStoredOutcomeRow({...base, horizon: '3d'}), false));
+  test('accepts every known horizon id, legacy and active', () => {
+    for (const horizon of KNOWN_HORIZON_IDS) assert.equal(isValidStoredOutcomeRow({...base, horizon}), true, horizon);
+  });
   test('rejects observed with a missing (null) price', () => assert.equal(isValidStoredOutcomeRow({...base, status: 'observed', observed_at: 1, price: null}), false));
   test('rejects observed with a NaN price', () => assert.equal(isValidStoredOutcomeRow({...base, status: 'observed', observed_at: 1, price: NaN}), false));
   test('rejects observed with an infinite price', () => assert.equal(isValidStoredOutcomeRow({...base, status: 'observed', observed_at: 1, price: Infinity}), false));

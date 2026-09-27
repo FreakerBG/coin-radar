@@ -1,5 +1,6 @@
 // /api/goldmine: signed-in scans that score DEX Screener candidates, record signals with the detection
-// price, and settle 15m/1h/6h/24h outcomes only inside their windows. DEX Screener is a local fetch double.
+// price, and settle the active daily-snapshot outcomes (d1/d3/d7, lib/goldmine/cadence.ts) only inside their
+// windows. DEX Screener is a local fetch double.
 import assert from 'node:assert/strict';
 import {beforeEach, describe, test} from 'node:test';
 import {addresses, body, createD1, failures, installFetch, jsonRequest, runtime, signIn, signOut, startClock} from './helpers/harness.mjs';
@@ -7,6 +8,7 @@ import {pair} from './helpers/goldmine-fixtures.mjs';
 
 const {GET, POST} = await import('../app/api/goldmine/route.ts');
 const {MODEL_VERSION} = await import('../lib/goldmine/score.ts');
+const {ACTIVE_HORIZON_IDS, MAX_SCAN_GAP_MS, MIN_SCAN_GAP_MS, OBSERVATION_GRACE_MS, SCAN_CADENCE_MS} = await import('../lib/goldmine/cadence.ts');
 const {contractSafetySummary} = await import('../lib/goldmine/snapshot.ts');
 
 // A realistic populated RugCheck report that verifies cleanly (same shape as the Stage 03B provider
@@ -26,7 +28,7 @@ function safetyReport(overrides = {}) {
   };
 }
 
-const MINUTE = 60000, HOUR = 60 * MINUTE;
+const MINUTE = 60000, HOUR = 60 * MINUTE, DAY = 24 * HOUR;
 let d1, clock, calls, feeds, outcomePools;
 
 const scan = origin => POST(jsonRequest('/api/goldmine', {method: 'POST', body: {}, origin}));
@@ -44,6 +46,17 @@ function discoveryPairs() {
   ];
 }
 const outcomePool = (pairAddress, token, priceUsd, liquidity = 140000) => ({chainId: 'solana', pairAddress, baseToken: {address: token}, priceUsd, liquidity: {usd: liquidity}});
+
+// A scan that settles due outcomes and records nothing new: discovery answers normally but returns no
+// pools. The active horizons are days apart, and every multi-day advance crosses a new six-hour signal
+// bucket (SIGNAL_BUCKET_MS), so an ordinary follow-up scan would re-record the same tokens and add fresh
+// pending outcomes to whatever is being counted. This keeps the signal under test the only one with
+// outcomes, without suppressing any part of the settling path.
+async function settleOnlyScan() {
+  const pairs = feeds.pairs;
+  feeds.pairs = () => Response.json([]);
+  try { return await body(await scan()); } finally { feeds.pairs = pairs; }
+}
 
 beforeEach(() => {
   clock = startClock();
@@ -109,8 +122,12 @@ describe('scanning', () => {
     const now = clock.now();
     assert.deepEqual(signals().map(row => [row.address, row.state, row.score, row.opportunity, row.detected_at, row.detected_price]),
       [[addresses.tokenA, 'BREAKOUT', 81, 0, now, 0.01], [addresses.tokenB, 'REJECTED', b.score, 0, now, 2]]);
+    // Only the active daily schedule is written: a 1-, 3- and 7-day target, each with the 26h grace window
+    // that makes it observable by a once-daily scan. No legacy intraday row is ever created again.
     assert.deepEqual(outcomes().filter(row => row.address === addresses.tokenA).map(row => [row.horizon, row.status, row.due_at - now, row.deadline_at - now]), [
-      ['15m', 'pending', 15 * MINUTE, 20 * MINUTE], ['1h', 'pending', HOUR, HOUR + 15 * MINUTE], ['6h', 'pending', 6 * HOUR, 7 * HOUR], ['24h', 'pending', 24 * HOUR, 27 * HOUR],
+      ['d1', 'pending', DAY, DAY + OBSERVATION_GRACE_MS],
+      ['d3', 'pending', 3 * DAY, 3 * DAY + OBSERVATION_GRACE_MS],
+      ['d7', 'pending', 7 * DAY, 7 * DAY + OBSERVATION_GRACE_MS],
     ]);
     const [stored] = d1.rows('SELECT snapshot, assessment FROM goldmine_signals WHERE address = ?', addresses.tokenA);
     const {snapshot, ...assessment} = a;
@@ -140,7 +157,7 @@ describe('scanning', () => {
     clock.advance(6 * HOUR);
     assert.equal((await body(await scan())).tracking.newSignals, 2);
     assert.equal(signals().length, 4);
-    assert.equal(outcomes().length, 16);
+    assert.equal(outcomes().length, 4 * ACTIVE_HORIZON_IDS.length);
   });
 
   test('uses cached public X evidence without requesting X, and never for promoted tokens', async () => {
@@ -174,7 +191,7 @@ describe('scanning', () => {
     assert.deepEqual([data.candidates.length, data.tracking.newSignals], [25, 25]);
     assert.deepEqual(inserts.map(json => JSON.parse(json).length), [10, 10, 5]);
     assert.ok(inserts.every(json => json.length < 50000), `largest bound value ${Math.max(...inserts.map(json => json.length))} bytes`);
-    assert.deepEqual([signals().length, outcomes().length], [25, 100]);
+    assert.deepEqual([signals().length, outcomes().length], [25, 25 * ACTIVE_HORIZON_IDS.length]);
   });
 
   test('another scan holding the lock makes this one busy; a failure still releases the lock', async () => {
@@ -191,7 +208,7 @@ describe('scanning', () => {
 
   test('a discovery outage records nothing and still settles due outcomes', async () => {
     await scan();
-    clock.advance(16 * MINUTE);
+    clock.advance(DAY); // the first active horizon (d1) is now due, whatever discovery does
     feeds.profiles = feeds.boosts = () => new Response('unavailable', {status: 503});
     const data = await body(await scan());
     assert.deepEqual([data.status, data.candidates, data.tracking.newSignals, data.tracking.outcomes.observed], ['provider_unavailable', [], 0, 2]);
@@ -207,61 +224,110 @@ describe('outcome tracking', () => {
     // Later scans in a new six-hour bucket record new signals; follow the first one only.
     const status = () => Object.fromEntries(outcomes().filter(row => row.address === addresses.tokenA && row.detected_at === detected).map(row => [row.horizon, [row.status, row.price]]));
 
-    clock.advance(10 * MINUTE);
-    assert.equal((await body(await scan())).tracking.outcomes.provider, 'not_needed', 'nothing is due before 15 minutes');
+    // A scan a minute short of the 1-day target settles nothing: the drift that makes a daily snapshot land
+    // a day late, and the exact case the grace window exists to absorb.
+    clock.advance(DAY - MINUTE);
+    assert.equal((await settleOnlyScan()).tracking.outcomes.provider, 'not_needed', 'nothing is due before the 24h target');
+    assert.deepEqual(status()['d1'], ['pending', null]);
 
-    clock.advance(6 * MINUTE);
-    assert.deepEqual((await body(await scan())).tracking.outcomes, {provider: 'ok', observed: 2, unavailable: 0, missed: 0, deferred: 0});
-    assert.deepEqual(status(), {'15m': ['observed', 0.012], '1h': ['pending', null], '6h': ['pending', null], '24h': ['pending', null]});
+    // The next daily scan is the first qualifying one, and settles d1 only.
+    clock.advance(MINUTE);
+    assert.deepEqual((await settleOnlyScan()).tracking.outcomes, {provider: 'ok', observed: 2, unavailable: 0, missed: 0, deferred: 0});
+    assert.deepEqual(status(), {d1: ['observed', 0.012], d3: ['pending', null], d7: ['pending', null]});
 
-    // The next check comes 80 minutes after detection: past the 1h window (60-75 minutes).
-    clock.advance(detected + 80 * MINUTE - clock.now());
+    // A check past d3's deadline (72h + 26h) can never be recorded as the 3-day price: it is missed.
+    clock.advance(detected + 3 * DAY + OBSERVATION_GRACE_MS + HOUR - clock.now());
     outcomePools = () => Response.json({pairs: [outcomePool(addresses.pairA, addresses.tokenA, '0.5'), outcomePool(addresses.pairB, addresses.tokenB, '9')]});
-    const late = await body(await scan());
+    const late = await settleOnlyScan();
     assert.deepEqual([late.tracking.outcomes.missed, late.tracking.outcomes.observed], [2, 0]);
-    assert.deepEqual(status()['1h'], ['missed', null]);
+    assert.deepEqual(status()['d3'], ['missed', null]);
 
-    clock.advance(detected + 6 * HOUR + 30 * MINUTE - clock.now());
-    await scan();
-    assert.deepEqual(status()['6h'], ['observed', 0.5]);
-    const [row] = outcomes().filter(outcome => outcome.address === addresses.tokenA && outcome.detected_at === detected && outcome.horizon === '6h');
+    // d7 is still open, and settles at the first scan at or after its 168h target.
+    clock.advance(detected + 7 * DAY + 30 * MINUTE - clock.now());
+    await settleOnlyScan();
+    assert.deepEqual(status()['d7'], ['observed', 0.5]);
+    const [row] = outcomes().filter(outcome => outcome.address === addresses.tokenA && outcome.detected_at === detected && outcome.horizon === 'd7');
     assert.equal(row.observed_at, clock.now());
+    assert.ok(row.observed_at - detected >= 7 * DAY, 'never observed before its target');
   });
 
   test('a pool missing from a successful response is unavailable; a provider failure leaves outcomes pending', async () => {
     await scan();
-    clock.advance(16 * MINUTE);
+    clock.advance(DAY);
     outcomePools = () => new Response('rate limited', {status: 429});
-    const failed = await body(await scan());
+    const failed = await settleOnlyScan();
     assert.deepEqual(failed.tracking.outcomes, {provider: 'unavailable', observed: 0, unavailable: 0, missed: 0, deferred: 0});
     assert.ok(failures.some(failure => failure.operation === 'outcome-provider' && failure.level === 'warn'));
-    assert.equal(outcomes().filter(row => row.horizon === '15m' && row.status === 'pending').length, 2);
+    // A provider failure leaves the row pending inside its still-open window, for the next scan to retry.
+    assert.equal(outcomes().filter(row => row.horizon === 'd1' && row.status === 'pending').length, 2);
 
     clock.advance(MINUTE);
     outcomePools = () => Response.json({pairs: [outcomePool(addresses.pairA, addresses.tokenA, '0.011'), outcomePool(addresses.pairB, addresses.tokenA, '1'), {chainId: 'ethereum', pairAddress: addresses.pairB, baseToken: {address: addresses.tokenB}, priceUsd: '1'}]});
-    assert.deepEqual((await body(await scan())).tracking.outcomes, {provider: 'ok', observed: 1, unavailable: 1, missed: 0, deferred: 0});
-    assert.deepEqual(outcomes().filter(row => row.horizon === '15m').map(row => [row.address, row.status, row.price]),
+    assert.deepEqual((await settleOnlyScan()).tracking.outcomes, {provider: 'ok', observed: 1, unavailable: 1, missed: 0, deferred: 0});
+    assert.deepEqual(outcomes().filter(row => row.horizon === 'd1').map(row => [row.address, row.status, row.price]),
       [[addresses.tokenA, 'observed', 0.011], [addresses.tokenB, 'unavailable', null]]);
   });
 
   test('GET lists recent signals with ordered outcomes, returns and per-state statistics', async () => {
     await scan();
-    clock.advance(16 * MINUTE);
-    await scan();
+    const detected = clock.now();
+    clock.advance(DAY);
+    await settleOnlyScan();
+    const observedAt = clock.now();
     const response = await read();
     assert.equal(response.headers.get('cache-control'), 'no-store');
     const data = await body(response);
     assert.equal(data.modelVersion, MODEL_VERSION);
+    assert.equal(data.evaluationScheduleVersion, 'daily-snapshot-v1');
     assert.deepEqual(data.signals.map(signal => [signal.address, signal.state]), [[addresses.tokenA, 'BREAKOUT'], [addresses.tokenB, 'REJECTED']]);
     const a = data.signals[0];
-    assert.deepEqual(a.outcomes.map(outcome => [outcome.horizon, outcome.status, outcome.returnPct]), [['15m', 'observed', 20], ['1h', 'pending', null], ['6h', 'pending', null], ['24h', 'pending', null]]);
+    assert.deepEqual(a.outcomes.map(outcome => [outcome.horizon, outcome.status, outcome.returnPct]), [['d1', 'observed', 20], ['d3', 'pending', null], ['d7', 'pending', null]]);
+    // Each outcome carries the schedule it belongs to and, for the settled one, the real elapsed time -
+    // never an implied "this is the 24-hour price".
+    const settled = a.outcomes[0];
+    assert.deepEqual([settled.horizonLabel, settled.horizonActive, settled.observableUnderCadence, settled.targetHours], ['1-day target', true, true, 24]);
+    assert.equal(settled.state, 'observed');
+    assert.equal(settled.observedAfterHours, Number(((observedAt - detected) / HOUR).toFixed(2)));
+    assert.deepEqual(a.outcomes.slice(1).map(outcome => outcome.state), ['pending', 'pending'], 'the unsettled windows are still genuinely open');
     assert.equal(a.assessment.summary.startsWith('BREAKOUT · score 81/100.'), true);
     assert.deepEqual(data.signals.map(signal => signal.contractSafety.status), ['unavailable', 'unavailable'], 'the dashboard can read contract safety without a second RugCheck call');
-    assert.deepEqual(data.stats.filter(row => row.horizon === '15m'), [
-      {state: 'BREAKOUT', horizon: '15m', pending: 0, observed: 1, unavailable: 0, missed: 0, meanReturnPct: 20, positiveShare: 1},
-      {state: 'REJECTED', horizon: '15m', pending: 0, observed: 1, unavailable: 0, missed: 0, meanReturnPct: -25, positiveShare: 0},
+    assert.deepEqual(data.stats.filter(row => row.horizon === 'd1').map(row => [row.state, row.pending, row.expiredUnswept, row.observed, row.meanReturnPct, row.positiveShare]), [
+      ['BREAKOUT', 0, 0, 1, 20, 1],
+      ['REJECTED', 0, 0, 1, -25, 0],
     ]);
-    assert.deepEqual(data.stats.filter(row => row.horizon === '24h').map(row => [row.state, row.pending, row.meanReturnPct]), [['BREAKOUT', 1, null], ['REJECTED', 1, null]]);
+    assert.deepEqual(data.stats.filter(row => row.horizon === 'd1').map(row => [row.horizonLabel, row.horizonActive, row.observableUnderCadence, row.targetHours]), [
+      ['1-day target', true, true, 24], ['1-day target', true, true, 24],
+    ]);
+    assert.deepEqual(data.stats.filter(row => row.horizon === 'd7').map(row => [row.state, row.pending, row.meanReturnPct]), [['BREAKOUT', 1, null], ['REJECTED', 1, null]]);
+  });
+
+  // --- Stage 06: the cadence block, and expired-unswept rows in the grouped statistic -------------------
+
+  test('GET reports the cadence it was read under, with every known horizon and its observability', async () => {
+    const data = await body(await read());
+    assert.equal(data.cadence.cronExpression, '0 0 * * *');
+    assert.deepEqual([data.cadence.scanCadenceMs, data.cadence.maxScanGapMs, data.cadence.observationGraceMs],
+      [SCAN_CADENCE_MS, MAX_SCAN_GAP_MS, OBSERVATION_GRACE_MS]);
+    assert.ok(data.cadence.observationGraceBufferMs > 0, 'the grace window must clear the maximum scan gap');
+    assert.deepEqual(data.cadence.horizons.map(horizon => [horizon.id, horizon.active, horizon.observableUnderCadence]), [
+      ['15m', false, false], ['1h', false, false], ['6h', false, false], ['24h', false, false],
+      ['d1', true, true], ['d3', true, true], ['d7', true, true],
+    ]);
+    assert.equal(data.cadence.minScanGapMs, MIN_SCAN_GAP_MS);
+  });
+
+  test('a pending outcome past its deadline is reported as expired-unswept, not live pending, with no write', async () => {
+    await scan();
+    const before = JSON.stringify(d1.rows('SELECT * FROM goldmine_outcomes'));
+    // Move past d1's deadline without ever scanning again, then read.
+    clock.advance(DAY + OBSERVATION_GRACE_MS + HOUR);
+    const data = await body(await read());
+    const outcome = data.signals[0].outcomes.find(entry => entry.horizon === 'd1');
+    assert.equal(outcome.status, 'pending', 'storage is untouched');
+    assert.equal(outcome.state, 'expired_unswept', 'but it is not reported as work still to come');
+    const stat = data.stats.find(row => row.horizon === 'd1' && row.state === 'BREAKOUT');
+    assert.deepEqual([stat.pending, stat.expiredUnswept], [0, 1]);
+    assert.equal(JSON.stringify(d1.rows('SELECT * FROM goldmine_outcomes')), before, 'opening the dashboard never rewrites a row');
   });
 });
 
