@@ -125,7 +125,7 @@ Model version is not filtered, unlike `readTracking()`'s statistics, so a model 
 `app/api/goldmine/scheduled/route.ts` (`GET` and `POST`, both run `lib/goldmine/scan.ts`'s `runGoldmineScan`, the same pipeline and the same shared `goldmine:scan` lock as the interactive `POST /api/goldmine`) is the unattended entry point. There is no signed-in user and no browser origin for a scheduler, so it never uses `getChatGPTUser()`/`sameOrigin()`; authorization is entirely `lib/goldmine/scheduled-auth.ts`'s shared-secret check, which accepts either:
 
 - `x-goldmine-cron-secret: <GOLDMINE_CRON_SECRET>` - a custom header, for any scheduler that can set an arbitrary header (a future Cloudflare Worker cron trigger once Sites supports it, or a manual/curl trigger).
-- `Authorization: Bearer <CRON_SECRET>` - Vercel Cron's own convention: Vercel sends a project's `CRON_SECRET` as this header on requests to a `crons` entry in `vercel.json`, and its documentation shows handlers comparing exactly this (<https://vercel.com/docs/cron-jobs/manage-cron-jobs>). **No platform-triggered run has been observed yet** - no production deployment carrying the `crons` entry exists, so the cron is not registered. A manual authenticated request proves the handler works, not that the platform calls it. Both conventions remain supported so that a misunderstanding of the request format degrades to "cron secret rejected", never to a silently unauthenticated endpoint.
+- `Authorization: Bearer <CRON_SECRET>` - Vercel Cron's own convention: Vercel sends a project's `CRON_SECRET` as this header on requests to a `crons` entry in `vercel.json`, and its documentation shows handlers comparing exactly this (<https://vercel.com/docs/cron-jobs/manage-cron-jobs>). **A platform-triggered run has been observed**, both manually (`vercel crons run`) and, since 2026-09-27, from the platform's own schedule: the first natural execution fired at `2026-09-27 00:54:13 UTC`, returning `200` with zero runtime errors or warnings. Both conventions remain supported so that a misunderstanding of the request format degrades to "cron secret rejected", never to a silently unauthenticated endpoint.
 
 Both env vars fail closed like every other secret check in this codebase: if unset, that path can never authorize a request, however it is called.
 
@@ -165,5 +165,5 @@ Both env vars fail closed like every other secret check in this codebase: if uns
 - Social momentum exists only where someone already ran an X search for the contract.
 - The detection price is the discovery response, which the shared provider cache may have fetched up to 60 seconds before `detected_at`; outcome prices may be up to 10 seconds old.
 - More than 150 due pools in one scan are deferred; if scans stop, deferred outcomes still become `missed` when their windows close.
-- The scan lock expires after 60 seconds; an overlapping scan cannot duplicate signals (IDs) or outcomes (primary key).
+- The scan lock expires after 300,000 ms (five minutes, `SCAN_LOCK_TTL_MS`); an overlapping scan cannot duplicate signals (IDs) or outcomes (primary key).
 - Signals and outcomes grow without a retention policy until Stage 03C.
