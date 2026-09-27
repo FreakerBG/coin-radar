@@ -166,4 +166,4 @@ Both env vars fail closed like every other secret check in this codebase: if uns
 - The detection price is the discovery response, which the shared provider cache may have fetched up to 60 seconds before `detected_at`; outcome prices may be up to 10 seconds old.
 - More than 150 due pools in one scan are deferred; if scans stop, deferred outcomes still become `missed` when their windows close.
 - The scan lock expires after 300,000 ms (five minutes, `SCAN_LOCK_TTL_MS`); an overlapping scan cannot duplicate signals (IDs) or outcomes (primary key).
-- Signals and outcomes grow without a retention policy until Stage 03C.
+- Signals and outcomes currently have no retention or archival policy. Historical records are retained for backtesting and calibration; any future pruning design must preserve the aggregate evidence required by those features.
