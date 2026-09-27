@@ -237,10 +237,28 @@ export type Scored = {snapshot: CandidateSnapshot; assessment: Assessment};
 // Only a candidate that already cleared every hard gate can ever become an opportunity (REJECTED never
 // depends on contractSafety), so only those are worth a RugCheck call. Re-scores just those candidates
 // after attaching contractSafety; every other candidate's assessment is unchanged.
+//
+// Non-REJECTED is necessary but not sufficient: a candidate already blocked by something contractSafety
+// cannot change (a risk state that can never be actionable, a score under the opportunity floor, a risk
+// input that's simply missing) stays exactly as un-opportunity whatever RugCheck returns. Checking it
+// anyway only spends a slot of the scarce MAX_CHECKS_PER_SCAN/SCAN_BUDGET_MS budget that a candidate
+// RugCheck could actually flip - one whose only blocker is 'contract_safety_unverified' - might need.
+// Discovery order (lib/market.ts: newest profiles, then top boosts) has no relationship to which
+// candidates are closest to an opportunity, so without this, a run of OVERHEATED/DISTRIBUTION/low-score
+// candidates appearing first can exhaust the cap before a genuine near-miss is ever reached. This only
+// reorders who gets checked first; every actionable candidate is still checked once slots allow it.
+function onlySafetyBlocks(assessment: Assessment): boolean {
+  return assessment.blockers.length > 0 && assessment.blockers.every(blocker => blocker.id === 'contract_safety_unverified');
+}
+
 export async function withContractSafety(scored: Scored[], now = Date.now()): Promise<Scored[]> {
   const actionable = scored.filter(({assessment}) => assessment.state !== 'REJECTED');
   if (!actionable.length) return scored;
-  const updated = await attachContractSafety(actionable.map(({snapshot}) => snapshot), now);
+  const prioritized = [...actionable].sort((a, b) => {
+    const rank = (entry: Scored) => onlySafetyBlocks(entry.assessment) ? 0 : 1;
+    return rank(a) - rank(b) || b.assessment.score - a.assessment.score || a.assessment.address.localeCompare(b.assessment.address);
+  });
+  const updated = await attachContractSafety(prioritized.map(({snapshot}) => snapshot), now);
   const byAddress = new Map(updated.map(snapshot => [snapshot.address, snapshot]));
   return scored.map(entry => {
     const snapshot = byAddress.get(entry.snapshot.address);
