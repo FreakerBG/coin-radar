@@ -107,6 +107,22 @@ for (const level of ['error', 'warn']) {
   };
 }
 
+// coin_radar.scan_outcome records (lib/diagnostics.ts reportScanOutcome), collected the same way as
+// failures above so tests can assert on the checked/busy/provider_unavailable split without parsing logs.
+export const scanOutcomes = [];
+{
+  const write = console.log.bind(console);
+  console.log = (...args) => {
+    try {
+      const record = args.length === 1 && typeof args[0] === 'string' ? JSON.parse(args[0]) : null;
+      if (record?.event === 'coin_radar.scan_outcome') return void scanOutcomes.push(record);
+    } catch {
+      // Not a scan-outcome record.
+    }
+    write(...args);
+  };
+}
+
 // lib/market.ts keeps a module-level response cache keyed by URL. Each test gets a
 // clock far beyond earlier tests' TTLs, so cached provider data never crosses tests.
 //

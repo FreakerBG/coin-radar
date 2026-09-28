@@ -13,7 +13,7 @@
 //         This detects and records candidates but never settles outcomes.
 // Both accept either convention (lib/goldmine/scheduled-auth.ts) - a caller is never locked out of a
 // method just because it uses the "other" convention.
-import { reportFailure } from '@/lib/diagnostics';
+import { reportFailure, reportScanOutcome } from '@/lib/diagnostics';
 import { acquireLock, db, releaseLock } from '@/lib/research-db';
 import { runGoldmineDetection, runGoldmineScan, SCAN_LOCK_TTL_MS } from '@/lib/goldmine/scan';
 import { isAuthorizedScheduledScan } from '@/lib/goldmine/scheduled-auth';
@@ -29,10 +29,14 @@ async function scan(request: Request, mode: 'daily' | 'detection'): Promise<Resp
   try {
     const database = db();
     lock = await acquireLock(LOCK_ID, SCAN_LOCK_TTL_MS);
-    if (!lock) return Response.json({ status: 'busy', candidates: [] }, { headers: noStore });
+    if (!lock) {
+      reportScanOutcome('goldmine-scheduled', mode, 'busy');
+      return Response.json({ status: 'busy', candidates: [] }, { headers: noStore });
+    }
     const result = mode === 'daily'
       ? await runGoldmineScan(database, Date.now())
       : await runGoldmineDetection(database, Date.now());
+    reportScanOutcome('goldmine-scheduled', mode, result.status);
     return Response.json(result, { headers: noStore });
   } catch (error) {
     reportFailure('goldmine', 'scheduled-scan', error);

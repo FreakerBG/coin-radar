@@ -2,10 +2,10 @@
 // fetch double throughout; nothing here contacts a network, signs anything or sends a credential.
 import assert from 'node:assert/strict';
 import {beforeEach, describe, test} from 'node:test';
-import {addresses, failures, installFetch, offlineFetch} from './helpers/harness.mjs';
+import {addresses, createD1, failures, installFetch, offlineFetch} from './helpers/harness.mjs';
 import {NOW, cases, pair} from './helpers/goldmine-fixtures.mjs';
 
-const {deriveContractSafety, extractFacts, attachContractSafety, withContractSafety, LP_LOCKED_MIN_PCT, MAX_CHECKS_PER_SCAN, SCAN_BUDGET_MS} = await import('../lib/goldmine/contract-safety.ts');
+const {deriveContractSafety, extractFacts, attachContractSafety, withContractSafety, LP_LOCKED_MIN_PCT, MAX_CHECKS_PER_SCAN, SCAN_BUDGET_MS, RUGCHECK_COOLDOWN_MS} = await import('../lib/goldmine/contract-safety.ts');
 const {snapshotFromPair} = await import('../lib/goldmine/snapshot.ts');
 const {scoreCandidate} = await import('../lib/goldmine/score.ts');
 
@@ -252,6 +252,52 @@ describe('attachContractSafety: network access, one candidate at a time', () => 
     assert.equal(calls.length, MAX_CHECKS_PER_SCAN);
     assert.equal(results.filter(r => r.contractSafety.status === 'verified').length, MAX_CHECKS_PER_SCAN);
     assert.equal(results.filter(r => r.contractSafety.status === 'unavailable').length, 2);
+  });
+
+  test('a 429 starts a persisted cooldown (given a database) that a later, independent call respects without any request', async () => {
+    const d1 = createD1();
+    installFetch(() => new Response('rate limited', {status: 429}));
+    const first = await attachContractSafety([snapshot()], testNow, Date.now, d1);
+    assert.equal(first[0].contractSafety.status, 'unavailable');
+
+    // A fresh call, as a cold serverless instance would make it: new fetch mock (would happily succeed),
+    // no shared in-memory state with the call above - only the database ties them together.
+    const calls = installFetch(() => Response.json(report()));
+    const second = await attachContractSafety([snapshot({baseToken: {address: addresses.tokenA, name: 'A', symbol: 'A'}, pairAddress: addresses.pairA})], testNow, Date.now, d1);
+    assert.equal(calls.length, 0, 'the cooldown skips every request, not just a repeat of the same address');
+    assert.equal(second[0].contractSafety.status, 'unavailable');
+  });
+
+  test('the persisted cooldown expires after RUGCHECK_COOLDOWN_MS and requests resume', async () => {
+    const d1 = createD1();
+    installFetch(() => new Response('rate limited', {status: 429}));
+    await attachContractSafety([snapshot()], testNow, () => testNow, d1);
+
+    const calls = installFetch(() => Response.json(report()));
+    const resumed = await attachContractSafety([snapshot({baseToken: {address: addresses.tokenA, name: 'A', symbol: 'A'}, pairAddress: addresses.pairA})], testNow, () => testNow + RUGCHECK_COOLDOWN_MS + 1, d1);
+    assert.equal(calls.length, 1, 'the cooldown has expired, so this candidate is actually checked');
+    assert.equal(resumed[0].contractSafety.status, 'verified');
+  });
+
+  test('without a database argument, no cooldown persists across calls - today\'s documented per-call-only behavior is unchanged', async () => {
+    installFetch(() => new Response('rate limited', {status: 429}));
+    await attachContractSafety([snapshot()], testNow);
+    const calls = installFetch(() => Response.json(report()));
+    const second = await attachContractSafety([snapshot({baseToken: {address: addresses.tokenA, name: 'A', symbol: 'A'}, pairAddress: addresses.pairA})], testNow);
+    assert.equal(calls.length, 1, 'with no database, each call is independent, exactly as before this change');
+    assert.equal(second[0].contractSafety.status, 'verified');
+  });
+
+  test('withContractSafety forwards its database through to the same persisted cooldown', async () => {
+    const d1 = createD1();
+    installFetch(() => new Response('rate limited', {status: 429}));
+    await withContractSafety(scored([snapshot()]), testNow, d1);
+
+    const calls = installFetch(() => Response.json(report()));
+    const other = snapshot({baseToken: {address: addresses.tokenA, name: 'A', symbol: 'A'}, pairAddress: addresses.pairA});
+    const results = await withContractSafety(scored([other]), testNow, d1);
+    assert.equal(calls.length, 0);
+    assert.equal(results[0].snapshot.contractSafety.status, 'unavailable');
   });
 
   test('SCAN_BUDGET_MS bounds wall-clock time independent of the `now` used for cache math; candidates past the budget stay unavailable', async () => {

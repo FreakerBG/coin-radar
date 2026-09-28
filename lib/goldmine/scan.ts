@@ -79,7 +79,7 @@ async function detect(database: D1Database, now: number, outcomes: OutcomeRun | 
 
   const snapshots = await attachSocialEvidence(database, bestPoolSnapshots(discovered.pairs, now, discovered.boosted));
   const prescored = snapshots.map(snapshot => ({snapshot, assessment: scoreCandidate(snapshot)}));
-  const scored = await withContractSafety(prescored, now);
+  const scored = await withContractSafety(prescored, now, database);
   const newSignals = await recordSignals(database, scored, now);
   // Response-shaping only: storage above (recordSignals) still gets the full scored snapshot, including
   // the raw contractSafety facts. Here, for the client, contractSafety is reduced to the same minimal
