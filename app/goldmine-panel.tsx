@@ -2,6 +2,7 @@
 import {useCallback,useEffect,useRef,useState} from 'react';
 import {Gem,RefreshCw,ShieldCheck,ShieldAlert,ArrowUpRight,Radio,History} from 'lucide-react';
 import {toast} from 'sonner';
+import {axiomTokenUrl} from '@/lib/axiom';
 import {isStale,latestBatchCountsLabel,latestBatchStalenessNote,latestBatchStatesLabel,opportunitiesOf,scanState,type LatestBatch,type PostedCandidate} from '@/lib/goldmine/dashboard-view';
 import {allHistoryOpportunityLabel,cadenceSummary,cellStatusLabel,coverageLabel,dataQualityWarning,denominatorNote,hasDataQualityWarning,hasEnoughData,horizonLabel,horizonScheduleNote,legacyHorizonWarning,observedAfterLabel,performanceRowsWithData,signalsSummaryLabel,type BacktestReport} from '@/lib/goldmine/backtest-view';
 import type {ContractSafetySummary} from '@/lib/goldmine/snapshot';
@@ -44,6 +45,7 @@ function SafetyBadge({contractSafety}: {contractSafety: {status: 'unavailable' |
 }
 
 function OpportunityCard({candidate}: {candidate: PostedCandidate}) {
+  const axiomUrl = axiomTokenUrl(candidate.address);
   return (
     <div className="feed-item" key={candidate.address}>
       <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 10}}>
@@ -62,7 +64,12 @@ function OpportunityCard({candidate}: {candidate: PostedCandidate}) {
         {candidate.snapshot.promoted && <span className="tag" title="Paid DEX Screener promotion">AD</span>}
       </div>
       {safetyEvidence(candidate) && <p className="muted" style={{fontSize: 12, marginTop: 8}}>{safetyEvidence(candidate)}</p>}
-      <a className="source-link" href={`https://dexscreener.com/solana/${candidate.pair}`} target="_blank" rel="noopener noreferrer">Pool data & chart <ArrowUpRight size={13} /></a>
+      <div style={{display: 'flex', flexWrap: 'wrap', gap: 12, alignItems: 'center'}}>
+        {axiomUrl && <a className="source-link" href={axiomUrl} target="_blank" rel="noopener noreferrer">Review in Axiom <ArrowUpRight size={13} /></a>}
+        <button className="source-link" type="button" onClick={() => navigator.clipboard.writeText(candidate.address).then(() => toast.success('Contract address copied')).catch(() => toast.error('Could not copy. Select the address manually.'))}>Copy contract address</button>
+        <a className="source-link" href={`https://dexscreener.com/solana/${candidate.pair}`} target="_blank" rel="noopener noreferrer">Pool data & chart <ArrowUpRight size={13} /></a>
+      </div>
+      <small className="muted" style={{display: 'block', marginTop: 6}}>Confirm the contract and current price in Axiom before placing an order. If the token page does not open, paste the copied address into Axiom search.</small>
     </div>
   );
 }
@@ -384,7 +391,11 @@ export default function GoldminePanel() {
                 </span>
               ))}
             </div>
-            <a className="source-link" href={`https://dexscreener.com/solana/${signal.pair}`} target="_blank" rel="noopener noreferrer">Pool data & chart <ArrowUpRight size={13} /></a>
+            <div style={{display: 'flex', flexWrap: 'wrap', gap: 12, alignItems: 'center'}}>
+              {axiomTokenUrl(signal.address) && <a className="source-link" href={axiomTokenUrl(signal.address)!} target="_blank" rel="noopener noreferrer">Review in Axiom <ArrowUpRight size={13} /></a>}
+              <button className="source-link" type="button" onClick={() => navigator.clipboard.writeText(signal.address).then(() => toast.success('Contract address copied')).catch(() => toast.error('Could not copy. Select the address manually.'))}>Copy contract address</button>
+              <a className="source-link" href={`https://dexscreener.com/solana/${signal.pair}`} target="_blank" rel="noopener noreferrer">Pool data & chart <ArrowUpRight size={13} /></a>
+            </div>
           </div>
         ))}
         {/* Two genuinely different situations that used to render the same sentence, which is how a
