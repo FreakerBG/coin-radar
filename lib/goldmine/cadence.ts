@@ -14,7 +14,8 @@ const MINUTE = 60_000, HOUR = 60 * MINUTE, DAY = 24 * HOUR;
 // vercel.json's `crons` entry for /api/goldmine/scheduled. Stated here so the invariants below are
 // derived from the schedule that is actually deployed, not from an assumption about it.
 export const SCAN_CRON_EXPRESSION = '0 0 * * *';
-// The nominal interval between two scheduled scans: once a day. This is the Vercel Hobby plan's limit
+// The nominal interval between two outcome-settling scheduled scans: once a day. Detection-only
+// POSTs do not change this evaluation schedule. This is the Vercel Hobby plan's limit
 // (docs/goldmine-intelligence.md section 4, docs/deployment-runbook.md), an owner decision, not a
 // pending upgrade.
 export const SCAN_CADENCE_MS = DAY;
@@ -35,11 +36,13 @@ export const MIN_SCAN_GAP_MS = SCAN_CADENCE_MS - SCHEDULER_JITTER_MS; // 23h01m
 // Every active horizon's post-target grace window. 26 hours, the value the owner decision starts from,
 // validated rather than assumed:
 //
-//   Claim. If a signal is detected at a scan, and consecutive scans are never more than MAX_SCAN_GAP_MS
-//   apart, then at least one scan falls inside [target, target + OBSERVATION_GRACE_MS].
+//   Claim. If a signal is detected at any scan, and later outcome-settling scans have gaps no wider
+//   than MAX_SCAN_GAP_MS (including the first gap after detection), then at least one of them falls
+//   inside [target, target + OBSERVATION_GRACE_MS]. The daily cron gives an even shorter first gap
+//   for a detection between its runs; the proof conservatively calls detection s(0).
 //
-//   Proof. A signal's detected_at is the scan's own timestamp: lib/goldmine/scan.ts passes one `now` to
-//   evaluateOutcomes and recordSignals, so detection coincides exactly with a scan s(0). Let the later
+//   Proof. A signal's detected_at is the detection scan's own timestamp, whether or not that scan
+//   evaluates outcomes; call that instant s(0). Let the later outcome-settling
 //   scans be s(1) < s(2) < ... with s(i+1) - s(i) <= MAX_SCAN_GAP_MS, and let T = s(0) + after be the
 //   target instant. Because `after` is finite and positive and the scan times increase without bound,
 //   there is a least j with s(j) >= T. That j is at least 1, so s(j-1) exists, and s(j-1) < T by
@@ -58,14 +61,15 @@ export const OBSERVATION_GRACE_MS = 26 * HOUR;
 // horizons that cannot be observed.
 export const OBSERVATION_GRACE_BUFFER_MS = OBSERVATION_GRACE_MS - MAX_SCAN_GAP_MS;
 
-// Why an observation is almost never exactly `after` old, even when everything works. `after` is an exact
-// multiple of SCAN_CADENCE_MS, so the target lands on a scheduling boundary: the scan nominally due at the
+// Why an observation is almost never exactly `after` old, even when everything works. For a signal first
+// detected at the daily scan, `after` is an exact multiple of SCAN_CADENCE_MS, so the target lands on a
+// scheduling boundary: the scan nominally due at the
 // target is early (by up to SCHEDULER_JITTER_MS) about as often as it is late, and an early one does not
 // qualify - it comes before due_at. The next one then settles the outcome roughly a full cadence later.
 // An observation is therefore legitimately either close to `after` or close to `after + SCAN_CADENCE_MS`,
 // which is why every read path reports the real elapsed time (observationAgeMs) instead of labelling the
 // stored price as the target-age price.
-export const EXACT_TARGET_BOUNDARY_NOTE = 'A daily scan due exactly at the target can fire up to 59 minutes early, which does not qualify, and the next daily scan then settles the outcome. An observation is therefore either near its target age or roughly one day past it - never guaranteed to be exactly the target age.';
+export const EXACT_TARGET_BOUNDARY_NOTE = 'For signals first detected at a daily scan, a scan due exactly at the target can fire up to 59 minutes early, which does not qualify, and the next daily scan then settles the outcome. Intraday detections can have any phase relative to daily settlement. Use the actual observation age: it is never guaranteed to be exactly the target age.';
 
 // --- Evaluation schedules ---------------------------------------------------------------------------
 

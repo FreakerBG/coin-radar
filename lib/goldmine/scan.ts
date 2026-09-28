@@ -1,13 +1,14 @@
 // The Goldmine scan pipeline (Stage 03A-03D), extracted from app/api/goldmine/route.ts so a
-// scheduled entry point (app/api/goldmine/scheduled/route.ts) can run exactly the same pipeline.
+// scheduled entry point (app/api/goldmine/scheduled/route.ts) can share detection while choosing
+// whether to settle outcomes. The daily GET settles; the future intraday POST never does.
 // Pure with respect to auth and locking: the caller is responsible for sign-in/CSRF checks (the
 // interactive route) or scheduler authorization (lib/goldmine/scheduled-auth.ts), and for acquiring
 // and releasing the shared `goldmine:scan` lock (lib/research-db.ts) around this call. This module
-// never changes: settle due outcomes, discover, score, attach contract safety, re-score, record.
+// detection always discovers, scores, attaches contract safety, re-scores and records.
 import {reportFailure} from '@/lib/diagnostics';
 import {discoverSolanaPairs} from '@/lib/market';
 import {DISCLAIMER, MODEL_VERSION, scoreCandidate, type Assessment} from './score';
-import {attachSocialEvidence, evaluateOutcomes, recordSignals} from './signals';
+import {attachSocialEvidence, evaluateOutcomes, recordSignals, type OutcomeRun} from './signals';
 import {bestPoolSnapshots, contractSafetySummary} from './snapshot';
 import {withContractSafety} from './contract-safety';
 
@@ -43,20 +44,28 @@ export type GoldmineScanResult = {
   asOf: string;
   candidates: unknown[];
   opportunities?: number;
-  tracking: {newSignals: number; outcomes: Awaited<ReturnType<typeof evaluateOutcomes>>};
+  // Null explicitly means the detection-only invocation did not evaluate any outcomes.
+  tracking: {newSignals: number; outcomes: OutcomeRun | null};
   warnings?: string[];
   coverage?: string;
   message?: string;
   disclaimer: string;
 };
 
-// Settles due signal outcomes, then discovers, scores (lib/goldmine/score.ts), attaches contract
-// safety (lib/goldmine/contract-safety.ts) for actionable candidates, re-scores and records. Nothing
-// here trades, sizes a position or requests X; scores come only from the provider data in the stored
-// snapshot. The caller already holds the `goldmine:scan` lock and is signed in/authorized.
+// The existing daily and interactive behavior is preserved: settle due outcomes before detection.
 export async function runGoldmineScan(database: D1Database, now: number): Promise<GoldmineScanResult> {
   const outcomes = await evaluateOutcomes(database, now);
+  return detect(database, now, outcomes);
+}
 
+// Intraday scheduler path. Never calls evaluateOutcomes, including on provider failure; pending
+// daily-snapshot-v1 outcomes remain for the daily GET (or an existing manual full scan) to settle.
+// No trading or notifications happen here. The caller still owns the shared scan lock and auth.
+export async function runGoldmineDetection(database: D1Database, now: number): Promise<GoldmineScanResult> {
+  return detect(database, now, null);
+}
+
+async function detect(database: D1Database, now: number, outcomes: OutcomeRun | null): Promise<GoldmineScanResult> {
   let discovered;
   try {
     discovered = await discoverSolanaPairs();
