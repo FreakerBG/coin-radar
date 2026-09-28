@@ -66,6 +66,7 @@ function OpportunityCard({candidate}: {candidate: PostedCandidate}) {
       {safetyEvidence(candidate) && <p className="muted" style={{fontSize: 12, marginTop: 8}}>{safetyEvidence(candidate)}</p>}
       <div style={{display: 'flex', flexWrap: 'wrap', gap: 12, alignItems: 'center'}}>
         {axiomUrl && <a className="source-link" href={axiomUrl} target="_blank" rel="noopener noreferrer">Review in Axiom <ArrowUpRight size={13} /></a>}
+        <a className="source-link" href={`https://phantom.com/tokens/solana/${candidate.address}`} target="_blank" rel="noopener noreferrer">Open in Phantom <ArrowUpRight size={13} /></a>
         <button className="source-link" type="button" onClick={() => navigator.clipboard.writeText(candidate.address).then(() => toast.success('Contract address copied')).catch(() => toast.error('Could not copy. Select the address manually.'))}>Copy contract address</button>
         <a className="source-link" href={`https://dexscreener.com/solana/${candidate.pair}`} target="_blank" rel="noopener noreferrer">Pool data & chart <ArrowUpRight size={13} /></a>
       </div>
@@ -393,6 +394,7 @@ export default function GoldminePanel() {
             </div>
             <div style={{display: 'flex', flexWrap: 'wrap', gap: 12, alignItems: 'center'}}>
               {axiomTokenUrl(signal.address) && <a className="source-link" href={axiomTokenUrl(signal.address)!} target="_blank" rel="noopener noreferrer">Review in Axiom <ArrowUpRight size={13} /></a>}
+              <a className="source-link" href={`https://phantom.com/tokens/solana/${signal.address}`} target="_blank" rel="noopener noreferrer">Open in Phantom <ArrowUpRight size={13} /></a>
               <button className="source-link" type="button" onClick={() => navigator.clipboard.writeText(signal.address).then(() => toast.success('Contract address copied')).catch(() => toast.error('Could not copy. Select the address manually.'))}>Copy contract address</button>
               <a className="source-link" href={`https://dexscreener.com/solana/${signal.pair}`} target="_blank" rel="noopener noreferrer">Pool data & chart <ArrowUpRight size={13} /></a>
             </div>
