@@ -1,5 +1,5 @@
-// app/api/goldmine/scheduled/route.ts: the unattended entry point that runs the same pipeline as
-// POST /api/goldmine (lib/goldmine/scan.ts) under the same shared lock, authorized only by
+// app/api/goldmine/scheduled/route.ts: the daily GET settles outcomes before detection, whereas
+// an intraday POST detects only. Both use the same shared lock, authorized only by
 // lib/goldmine/scheduled-auth.ts - never by sign-in or sameOrigin(), since there is no browser here.
 import assert from 'node:assert/strict';
 import { afterEach, beforeEach, describe, test } from 'node:test';
@@ -13,14 +13,14 @@ const ORIGIN = 'https://coin-radar.test';
 const ORIGINAL_CRON = process.env.GOLDMINE_CRON_SECRET;
 const ORIGINAL_BEARER = process.env.CRON_SECRET;
 
-let d1, calls;
+let d1, calls, clock;
 
 function request(method, headers = {}) {
   return new Request(`${ORIGIN}/api/goldmine/scheduled`, { method, headers });
 }
 
 beforeEach(() => {
-  startClock();
+  clock = startClock();
   d1 = createD1();
   runtime.env.DB = d1;
   failures.length = 0;
@@ -30,6 +30,7 @@ beforeEach(() => {
     if (url.startsWith('https://api.dexscreener.com/token-profiles/')) return Response.json([{ chainId: 'solana', tokenAddress: addresses.tokenA }]);
     if (url.startsWith('https://api.dexscreener.com/token-boosts/')) return Response.json([]);
     if (url.startsWith('https://api.dexscreener.com/tokens/v1/solana/')) return Response.json([pair({ pairCreatedAt: Date.now() - 48 * 3600000 })]);
+    if (url.startsWith('https://api.dexscreener.com/latest/dex/pairs/solana/')) return Response.json({pairs: [pair({pairCreatedAt: Date.now() - 48 * 3600000})]});
     if (url.startsWith('https://api.rugcheck.xyz/v1/tokens/')) return Response.json({ token: { mintAuthority: null, freezeAuthority: null }, rugged: false });
     throw new Error('Unexpected request ' + url);
   });
@@ -89,6 +90,36 @@ describe('pipeline and lock, once authorized', () => {
     assert.equal(data.modelVersion, MODEL_VERSION);
     assert.equal(data.tracking.newSignals, 1);
     assert.deepEqual(d1.rows('SELECT id FROM research_locks'), [], 'the shared lock is released');
+  });
+
+  test('POST records detections but does not evaluate due outcomes; the daily GET does', async () => {
+    const credential = { 'x-goldmine-cron-secret': 'header-secret' };
+    const first = await body(await POST(request('POST', credential)));
+    assert.equal(first.status, 'checked');
+    assert.deepEqual(first.tracking, {newSignals: 1, outcomes: null});
+    const id = d1.rows('SELECT id FROM goldmine_signals')[0].id;
+    clock.advance(24 * 3600_000);
+    const before = calls.length;
+    const intraday = await body(await POST(request('POST', credential)));
+    assert.equal(intraday.tracking.outcomes, null);
+    assert.deepEqual(d1.rows('SELECT status FROM goldmine_outcomes WHERE signal_id = ? AND horizon = ?', id, 'd1'), [{status: 'pending'}]);
+    assert.equal(calls.slice(before).filter(call => call.url.includes('/latest/dex/pairs/')).length, 0, 'POST must not fetch outcome prices');
+    const daily = await body(await GET(request('GET', {authorization: 'Bearer bearer-secret'})));
+    assert.equal(daily.tracking.outcomes.observed, 1);
+    assert.deepEqual(d1.rows('SELECT status FROM goldmine_outcomes WHERE signal_id = ? AND horizon = ?', id, 'd1'), [{status: 'observed'}]);
+  });
+
+  test('96 intraday invocations keep outcome rows pending and use the existing six-hour signal buckets', async () => {
+    const credential = {'x-goldmine-cron-secret': 'header-secret'};
+    for (let index = 0; index < 96; index++) {
+      const result = await body(await POST(request('POST', credential)));
+      assert.equal(result.status, 'checked');
+      assert.equal(result.tracking.outcomes, null);
+      clock.advance(15 * 60_000);
+    }
+    assert.equal(d1.rows('SELECT id FROM goldmine_signals').length, 4);
+    assert.deepEqual(d1.rows('SELECT DISTINCT status FROM goldmine_outcomes'), [{status: 'pending'}]);
+    assert.equal(calls.filter(call => call.url.includes('/latest/dex/pairs/')).length, 0);
   });
 
   // The reverse direction (a scheduled scan blocking the interactive route) is proven by
