@@ -57,26 +57,28 @@ bucket.
 
 ## Storage growth at 96 detections/day: a projection, not a measurement
 
-`signalId()` buckets a given `(address, state)` pair into one of four six-hour windows per day
+`signalId()` buckets a given `(model, address, state)` into one of four six-hour windows per day
 (`lib/goldmine/signals.ts` `SIGNAL_BUCKET_MS`), and `recordSignals`'s `INSERT OR IGNORE` collapses
 repeats within a bucket regardless of how many times detection runs inside it. Discovery caps a
-scan at 30 Solana tokens (`lib/market.ts`). So worst-case new rows per day from *any* detection
-cadence, including 96/day, is bounded by roughly (30 addresses) x (distinct states seen per
-address per day, realistically small) x (4 buckets) - a few hundred rows/day at the extreme, not
-thousands, and not a function of how often the detector runs. This is the existing bound in the
-code, unchanged by this PR; 96 invocations/day make it easier to reach the upper end of that
-range in practice, not raise it.
+scan at 30 Solana tokens (`lib/market.ts`).
+
+**Correction to an earlier draft of this section.** The bucket bounds repeats of the *same* mint,
+not the number of distinct mints. Discovery reads the newest token profiles and boosts, which
+churn, so a 15-minute detector sees new mints on most runs. The worst case therefore does scale
+with cadence: 96 runs x 30 distinct mints = 2,880 signals/day, each with 3 outcome rows (d1/d3/d7).
+The earlier "a few hundred rows/day, not a function of how often the detector runs" was wrong.
+The realistic figure lies between 4 x 30 = 120/day (the same 30 mints all day) and 2,880/day. It
+has to be measured; each scan's `newSignals` in its `scan_outcome` line now records it.
 
 Against that: `MAX_RETAINED_SIGNALS` (2,000 rows) is the backtest read's cap, and
-`readAllSignalsWithOutcomes` already reports `truncated: true` honestly once history exceeds it
-rather than silently dropping old rows from a claimed full-history read. At a few hundred
-rows/day worst case, 2,000 rows covers very roughly a week to a few weeks of full history before
-truncation starts - not the 30-day live research window the owner is targeting. Reaching that
-window without truncation needs either a higher cap (more D1/Turso query and memory cost per
-backtest read - see `MAX_WORST_CASE_QUERIES`) or an archive-aware analysis, neither of which is
-implemented here.
+`readAllSignalsWithOutcomes` reports `truncated: true` once history exceeds it. At even 300 new
+signals/day, 2,000 rows is under a week. It is nowhere near the 30-day research target at a
+15-minute cadence. This PR does not change that. The capacity model, the report-coverage fix and
+the 30-day answer are tracked separately as the Stage 2 storage/reporting work.
 
-**Unverified in this session, and not assumed:** Turso's actual free-tier row-count, storage and
-read/write-request quotas, and RugCheck's real unauthenticated rate-limit window. Before enabling
-a 15-minute cadence, check the Turso dashboard against the projection above and re-derive it from
-real observed volume rather than this worst-case bound.
+**Published limits, checked 2026-09-29 (turso.tech/pricing):** Turso Free allows 5 GB storage,
+500 million rows read and 10 million rows written per month, and 1-day point-in-time restore.
+Overages are billed only once enabled; otherwise queries past a quota fail with `BLOCKED`. This
+account's actual usage against those quotas was **not** readable from this session.
+RugCheck publishes no unauthenticated rate limit. Before enabling a 15-minute cadence, compare the
+Turso dashboard with real observed `newSignals` volume, not with this worst-case bound.
