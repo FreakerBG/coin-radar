@@ -13,30 +13,48 @@
 //         This detects and records candidates but never settles outcomes.
 // Both accept either convention (lib/goldmine/scheduled-auth.ts) - a caller is never locked out of a
 // method just because it uses the "other" convention.
-import { reportFailure, reportScanOutcome } from '@/lib/diagnostics';
+import { reportFailure, reportScanOutcome, type ScanOutcomeDetails } from '@/lib/diagnostics';
 import { acquireLock, db, releaseLock } from '@/lib/research-db';
-import { runGoldmineDetection, runGoldmineScan, SCAN_LOCK_TTL_MS } from '@/lib/goldmine/scan';
+import { runGoldmineDetection, runGoldmineScan, SCAN_LOCK_TTL_MS, type GoldmineScanResult } from '@/lib/goldmine/scan';
 import { isAuthorizedScheduledScan } from '@/lib/goldmine/scheduled-auth';
 
 const noStore = { 'Cache-Control': 'no-store' };
 const LOCK_ID = 'goldmine:scan';
+
+// Counts and enums only, copied field by field so nothing else from the result (candidates, addresses,
+// provider warnings) can ever reach the log line.
+function outcomeDetails(result: GoldmineScanResult, started: number): ScanOutcomeDetails {
+  const safety = result.safety;
+  return {
+    durationMs: Date.now() - started,
+    candidates: result.candidates.length,
+    opportunities: result.opportunities ?? 0,
+    newSignals: result.tracking.newSignals,
+    outcomesSettled: result.tracking.outcomes !== null,
+    ...(safety ? { safety: {
+      eligible: safety.eligible, verified: safety.verified, unsafe: safety.unsafe, unavailable: safety.unavailable,
+      requests: safety.requests, cacheHits: safety.cacheHits, rateLimited: safety.rateLimited, cooldown: safety.cooldown, unchecked: safety.unchecked,
+    } } : {}),
+  };
+}
 
 async function scan(request: Request, mode: 'daily' | 'detection'): Promise<Response> {
   if (!isAuthorizedScheduledScan(request)) {
     return Response.json({ error: 'Not authorized.' }, { status: 401, headers: noStore });
   }
   let lock: string | null = null;
+  const started = Date.now();
   try {
     const database = db();
     lock = await acquireLock(LOCK_ID, SCAN_LOCK_TTL_MS);
     if (!lock) {
-      reportScanOutcome('goldmine-scheduled', mode, 'busy');
+      reportScanOutcome('goldmine-scheduled', mode, 'busy', { durationMs: Date.now() - started });
       return Response.json({ status: 'busy', candidates: [] }, { headers: noStore });
     }
     const result = mode === 'daily'
       ? await runGoldmineScan(database, Date.now())
       : await runGoldmineDetection(database, Date.now());
-    reportScanOutcome('goldmine-scheduled', mode, result.status);
+    reportScanOutcome('goldmine-scheduled', mode, result.status, outcomeDetails(result, started));
     return Response.json(result, { headers: noStore });
   } catch (error) {
     reportFailure('goldmine', 'scheduled-scan', error);

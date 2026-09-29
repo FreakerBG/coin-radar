@@ -57,11 +57,21 @@ export type ScanStatus = 'checked' | 'busy' | 'provider_unavailable';
 // single failure; a normal day is expected to be almost entirely `checked`, and a sustained run of
 // `busy` or `provider_unavailable` is the signal an operator would otherwise only see by reading every
 // invocation's raw HTTP response individually. Carries no candidates, addresses or secrets - only the
-// route, which method produced it, and the outcome. Best effort, like reportFailure: it must never throw
-// or change the caller's response.
-export function reportScanOutcome(route: string, mode: 'daily' | 'detection', status: ScanStatus) {
+// route, which method produced it, the outcome and, when given, numeric/enum details (duration, counts,
+// contract-safety coverage) that the caller builds from counts alone. Best effort, like reportFailure: it
+// must never throw or change the caller's response.
+export type ScanOutcomeDetails = {
+  durationMs: number;
+  candidates?: number;
+  opportunities?: number;
+  newSignals?: number;
+  outcomesSettled?: boolean;
+  safety?: {eligible: number; verified: number; unsafe: number; unavailable: number; requests: number; cacheHits: number; rateLimited: boolean; cooldown: string; unchecked: number};
+};
+
+export function reportScanOutcome(route: string, mode: 'daily' | 'detection', status: ScanStatus, details?: ScanOutcomeDetails) {
   try {
-    console.log(JSON.stringify({event: 'coin_radar.scan_outcome', route, mode, status}));
+    console.log(JSON.stringify({event: 'coin_radar.scan_outcome', route, mode, status, ...details}));
   } catch {
     // Reporting is best effort; the caller's response must not change.
   }

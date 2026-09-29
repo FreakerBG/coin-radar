@@ -5,7 +5,7 @@ import {beforeEach, describe, test} from 'node:test';
 import {addresses, createD1, failures, installFetch, offlineFetch} from './helpers/harness.mjs';
 import {NOW, cases, pair} from './helpers/goldmine-fixtures.mjs';
 
-const {deriveContractSafety, extractFacts, attachContractSafety, withContractSafety, LP_LOCKED_MIN_PCT, MAX_CHECKS_PER_SCAN, SCAN_BUDGET_MS, RUGCHECK_COOLDOWN_MS} = await import('../lib/goldmine/contract-safety.ts');
+const {deriveContractSafety, extractFacts, attachContractSafety, checkContractSafety, withContractSafety, withContractSafetyCoverage, LP_LOCKED_MIN_PCT, MAX_CHECKS_PER_SCAN, SCAN_BUDGET_MS, RUGCHECK_COOLDOWN_MS} = await import('../lib/goldmine/contract-safety.ts');
 const {snapshotFromPair} = await import('../lib/goldmine/snapshot.ts');
 const {scoreCandidate} = await import('../lib/goldmine/score.ts');
 
@@ -286,6 +286,49 @@ describe('attachContractSafety: network access, one candidate at a time', () => 
     const second = await attachContractSafety([snapshot({baseToken: {address: addresses.tokenA, name: 'A', symbol: 'A'}, pairAddress: addresses.pairA})], testNow);
     assert.equal(calls.length, 1, 'with no database, each call is independent, exactly as before this change');
     assert.equal(second[0].contractSafety.status, 'verified');
+  });
+
+  test('during a cooldown a report already cached on this instance is still used (it costs no request); uncached candidates stay unavailable', async () => {
+    const d1 = createD1();
+    const cachedToken = snapshot();
+    installFetch(() => Response.json(report()));
+    await attachContractSafety([cachedToken], testNow, () => testNow, d1); // warms this instance's cache
+
+    installFetch(() => new Response('rate limited', {status: 429}));
+    const uncached = snapshot({baseToken: {address: addresses.tokenB, name: 'B', symbol: 'B'}, pairAddress: addresses.pairB});
+    await attachContractSafety([uncached], testNow, () => testNow, d1); // 429 -> cooldown
+
+    const calls = installFetch(() => Response.json(report()));
+    const {snapshots, run} = await checkContractSafety([cachedToken, uncached], testNow + 60000, () => testNow + 60000, d1);
+    assert.equal(calls.length, 0, 'no request is sent during the cooldown');
+    assert.deepEqual(snapshots.map(s => s.contractSafety.status), ['verified', 'unavailable']);
+    assert.deepEqual(run, {requests: 0, cacheHits: 1, rateLimited: false, cooldown: 'active', unchecked: 1});
+  });
+
+  test('a failed cooldown read fails closed: no request is sent, candidates stay unavailable, and detection is not aborted', async () => {
+    const broken = {prepare() { throw new Error('D1_ERROR: storage unavailable'); }};
+    const calls = installFetch(() => Response.json(report()));
+    const {snapshots, run} = await checkContractSafety([snapshot()], testNow, Date.now, broken);
+    assert.equal(calls.length, 0);
+    assert.equal(snapshots[0].contractSafety.status, 'unavailable');
+    assert.equal(run.cooldown, 'unknown');
+    assert.deepEqual(failures.map(f => [f.operation, f.level]), [['contract-safety-cooldown-read', 'warn']]);
+  });
+
+  test('a run reports exactly what happened: one request, the 429, and every remaining candidate left unchecked', async () => {
+    installFetch(() => new Response('rate limited', {status: 429}));
+    const three = [0, 1, 2].map(i => snapshot({baseToken: {address: candidateAddress('Run', i), name: 'X', symbol: 'X'}, pairAddress: candidateAddress('RunPair', i)}));
+    const {run} = await checkContractSafety(three, testNow);
+    assert.deepEqual(run, {requests: 1, cacheHits: 0, rateLimited: true, cooldown: 'disabled', unchecked: 2});
+  });
+
+  test('withContractSafetyCoverage counts only eligible (non-REJECTED) candidates and their resulting statuses', async () => {
+    installFetch(() => Response.json(report()));
+    const {safety} = await withContractSafetyCoverage(scored([snapshot()]), testNow);
+    assert.equal(safety.eligible, 1);
+    assert.deepEqual([safety.verified, safety.unsafe, safety.unavailable, safety.requests], [1, 0, 0, 1]);
+    const none = await withContractSafetyCoverage([], testNow, createD1());
+    assert.deepEqual(none.safety, {requests: 0, cacheHits: 0, rateLimited: false, cooldown: 'not_read', unchecked: 0, eligible: 0, verified: 0, unsafe: 0, unavailable: 0});
   });
 
   test('withContractSafety forwards its database through to the same persisted cooldown', async () => {

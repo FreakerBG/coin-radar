@@ -185,24 +185,49 @@ const rugcheckRateLimited = () => new Response('rate limited', { status: 429 });
 
 describe('explicit scan-outcome metrics (lib/diagnostics.ts reportScanOutcome)', () => {
   const outcome = (mode, status) => ({ event: 'coin_radar.scan_outcome', route: 'goldmine-scheduled', mode, status });
+  const head = record => ({ event: record.event, route: record.route, mode: record.mode, status: record.status });
 
   test('a checked GET and a checked POST each log their own route/mode/status, once', async () => {
     await GET(request('GET', { authorization: 'Bearer bearer-secret' }));
     await POST(request('POST', { 'x-goldmine-cron-secret': 'header-secret' }));
-    assert.deepEqual(scanOutcomes, [outcome('daily', 'checked'), outcome('detection', 'checked')]);
+    assert.deepEqual(scanOutcomes.map(head), [outcome('daily', 'checked'), outcome('detection', 'checked')]);
+  });
+
+  test('a checked outcome carries duration, counts and contract-safety coverage - numbers and enums only, never an address or a secret', async () => {
+    await GET(request('GET', { authorization: 'Bearer bearer-secret' }));
+    await POST(request('POST', { 'x-goldmine-cron-secret': 'header-secret' }));
+    const [daily, detection] = scanOutcomes;
+    assert.equal(daily.outcomesSettled, true, 'the daily GET settles outcomes');
+    assert.equal(detection.outcomesSettled, false, 'the detection POST never does');
+    for (const record of [daily, detection]) {
+      assert.equal(typeof record.durationMs, 'number');
+      assert.equal(record.candidates, 1);
+      assert.equal(record.opportunities, 0);
+      assert.deepEqual(Object.keys(record.safety).sort(), ['cacheHits', 'cooldown', 'eligible', 'rateLimited', 'requests', 'unavailable', 'unchecked', 'unsafe', 'verified']);
+      assert.equal(record.safety.cooldown, 'none');
+      const text = JSON.stringify(record);
+      for (const secret of [addresses.tokenA, addresses.pairA, 'header-secret', 'bearer-secret']) assert.equal(text.includes(secret), false, secret);
+    }
+    assert.equal(daily.newSignals, 1);
+    assert.equal(detection.newSignals, 0, 'the same six-hour bucket collapses the repeat');
+    assert.equal(daily.safety.requests + daily.safety.cacheHits, daily.safety.eligible - daily.safety.unchecked);
   });
 
   test('a lock already held logs busy and never reaches the pipeline', async () => {
     d1.sqlite.prepare('INSERT INTO research_locks (id, owner, expires) VALUES (?, ?, ?)').run('goldmine:scan', 'other', Date.now() + 30000);
     await GET(request('GET', { authorization: 'Bearer bearer-secret' }));
-    assert.deepEqual(scanOutcomes, [outcome('daily', 'busy')]);
+    assert.deepEqual(scanOutcomes.map(head), [outcome('daily', 'busy')]);
+    assert.equal(typeof scanOutcomes[0].durationMs, 'number');
+    assert.equal(scanOutcomes[0].safety, undefined);
     assert.equal(calls.length, 0);
   });
 
   test('a discovery-provider failure logs provider_unavailable, not checked', async () => {
     installFetch(() => { throw new Error('network down'); });
     await POST(request('POST', { 'x-goldmine-cron-secret': 'header-secret' }));
-    assert.deepEqual(scanOutcomes, [outcome('detection', 'provider_unavailable')]);
+    assert.deepEqual(scanOutcomes.map(head), [outcome('detection', 'provider_unavailable')]);
+    assert.equal(scanOutcomes[0].safety, undefined, 'nothing was scored, so there is no safety coverage to claim');
+    assert.equal(scanOutcomes[0].newSignals, 0);
   });
 
   test('an unauthorized request, or one that fails before a result exists, logs no scan outcome at all', async () => {
@@ -229,5 +254,34 @@ describe('the persisted RugCheck cooldown (lib/goldmine/contract-safety.ts) acro
     const afterCooldown = installProviders(rugcheckVerified);
     await POST(request('POST', credential));
     assert.ok(afterCooldown.some(call => call.url.includes('rugcheck.xyz')), 'the cooldown has elapsed, so RugCheck is asked again');
+  });
+
+  test('the response and log report the 429 and then the active cooldown, so a checked scan never hides missing safety coverage', async () => {
+    const credential = { 'x-goldmine-cron-secret': 'header-secret' };
+    installProviders(rugcheckRateLimited);
+    const limited = await body(await POST(request('POST', credential)));
+    assert.equal(limited.status, 'checked');
+    assert.equal(limited.safety.rateLimited, true);
+    assert.equal(limited.safety.requests, 1);
+    assert.equal(limited.safety.verified, 0);
+
+    clock.advance(15 * 60_000);
+    installProviders(rugcheckVerified);
+    const cooling = await body(await POST(request('POST', credential)));
+    assert.equal(cooling.safety.cooldown, 'active');
+    assert.equal(cooling.safety.requests, 0);
+    assert.deepEqual(scanOutcomes.map(record => [record.status, record.safety.rateLimited, record.safety.cooldown]), [['checked', true, 'none'], ['checked', false, 'active']]);
+  });
+
+  test('the cooldown row never interferes with the goldmine:scan lease: the lease is released after a 429 scan and is not held by an active cooldown', async () => {
+    const credential = { 'x-goldmine-cron-secret': 'header-secret' };
+    installProviders(rugcheckRateLimited);
+    await POST(request('POST', credential));
+    assert.deepEqual(d1.rows('SELECT id FROM research_locks ORDER BY id'), [{ id: 'goldmine:rugcheck-cooldown' }], 'only the cooldown remains; the scan lease was released');
+
+    // With the cooldown still active, the next scan is not "busy" - the lease is keyed only by its own id.
+    const next = await body(await POST(request('POST', credential)));
+    assert.equal(next.status, 'checked');
+    assert.deepEqual(d1.rows('SELECT id FROM research_locks ORDER BY id'), [{ id: 'goldmine:rugcheck-cooldown' }], 'releasing the lease never deletes the cooldown');
   });
 });

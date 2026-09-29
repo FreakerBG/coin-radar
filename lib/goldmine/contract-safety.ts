@@ -61,9 +61,18 @@ export const RUGCHECK_COOLDOWN_MS = 30 * 60000;
 // code never touches the scan lock's row either.
 const RUGCHECK_COOLDOWN_LOCK_ID = 'goldmine:rugcheck-cooldown';
 
-async function isRugCheckCoolingDown(database: D1Database, now: number): Promise<boolean> {
-  const row = await database.prepare('SELECT 1 FROM research_locks WHERE id = ? AND expires > ?').bind(RUGCHECK_COOLDOWN_LOCK_ID, now).first();
-  return row !== null;
+// 'unknown' when the cooldown row could not be read. The caller treats that exactly like 'active' (no
+// RugCheck request is sent): it cannot tell whether RugCheck asked us to back off, so it errs toward not
+// adding load, and every unchecked candidate stays unavailable - fail closed. It deliberately does not
+// throw: a failed read of this one optimisation row must not abort the whole detection run.
+async function rugCheckCooldownState(database: D1Database, now: number): Promise<'none' | 'active' | 'unknown'> {
+  try {
+    const row = await database.prepare('SELECT 1 FROM research_locks WHERE id = ? AND expires > ?').bind(RUGCHECK_COOLDOWN_LOCK_ID, now).first();
+    return row === null ? 'none' : 'active';
+  } catch (error) {
+    reportFailure('goldmine', 'contract-safety-cooldown-read', error, 'warn');
+    return 'unknown';
+  }
 }
 
 // Starts (or extends) the cooldown. Never shortens an existing one: two overlapping invocations that both
@@ -226,9 +235,12 @@ class RugCheckRateLimited extends Error {}
 type CacheEntry = {expires: number; fetchedAt: number; raw: unknown};
 const cache = new Map<string, CacheEntry>();
 
-async function fetchReport(address: string, now: number): Promise<{raw: unknown; fetchedAt: number}> {
+function cachedReport(address: string, now: number): {raw: unknown; fetchedAt: number} | null {
   const cached = cache.get(address);
-  if (cached && cached.expires > now) return {raw: cached.raw, fetchedAt: cached.fetchedAt};
+  return cached && cached.expires > now ? {raw: cached.raw, fetchedAt: cached.fetchedAt} : null;
+}
+
+async function fetchReport(address: string, now: number): Promise<{raw: unknown; fetchedAt: number}> {
   const response = await fetch(REPORT_URL(address), {headers: {Accept: 'application/json'}, signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)});
   if (response.status === 429) throw new RugCheckRateLimited('RugCheck rate limit reached');
   if (!response.ok) throw new Error(`RugCheck returned ${response.status}`);
@@ -248,33 +260,55 @@ async function fetchReport(address: string, now: number): Promise<{raw: unknown;
 // freshness math, kept separate so it stays deterministic in tests regardless of real elapsed time.
 //
 // `database`, when given, backs the persisted cooldown above: a 429 anywhere in this call starts it, and
-// a future call (this process or a fresh one) that finds it still active skips every RugCheck request
-// outright - not just after its own first 429 - leaving every snapshot with its existing contractSafety,
-// same as hitting the cap or the budget. Optional and additive: omitting it (every existing caller/test
-// that predates this) reproduces exactly today's per-call-only behavior.
-export async function attachContractSafety(snapshots: CandidateSnapshot[], now = Date.now(), clock: () => number = Date.now, database?: D1Database): Promise<CandidateSnapshot[]> {
-  if (!snapshots.length) return snapshots;
-  if (database && await isRugCheckCoolingDown(database, clock())) return snapshots;
-  let rateLimited = false;
+// a future call (this process or a fresh one) that finds it still active sends no RugCheck request at
+// all - not just after its own first 429. A report already in this instance's cache costs no request, so
+// it is still used during a cooldown; every other snapshot keeps its existing contractSafety, same as
+// hitting the cap or the budget. Optional and additive: omitting it (every existing caller/test that
+// predates this) reproduces exactly today's per-call-only behavior.
+//
+// The returned `run` says what actually happened, in counts only (never an address or a provider body),
+// so a scheduled invocation can report its real safety coverage instead of a bare "checked".
+export type SafetyRun = {
+  requests: number;        // RugCheck HTTP requests actually sent (cache hits excluded)
+  cacheHits: number;
+  rateLimited: boolean;    // this call received a 429
+  // Persisted cooldown state found at the start of the call: 'disabled' without a database, 'not_read'
+  // when there was nothing to check (no read is spent on an empty list).
+  cooldown: 'none' | 'active' | 'unknown' | 'disabled' | 'not_read';
+  unchecked: number;       // snapshots left as they were (cap, budget, 429, cooldown)
+};
+
+export async function checkContractSafety(snapshots: CandidateSnapshot[], now = Date.now(), clock: () => number = Date.now, database?: D1Database): Promise<{snapshots: CandidateSnapshot[]; run: SafetyRun}> {
+  const run: SafetyRun = {requests: 0, cacheHits: 0, rateLimited: false, cooldown: database ? 'not_read' : 'disabled', unchecked: 0};
+  if (!snapshots.length) return {snapshots, run};
+  if (database) run.cooldown = await rugCheckCooldownState(database, clock());
+  const networkBlocked = () => run.rateLimited || run.cooldown === 'active' || run.cooldown === 'unknown';
   let checked = 0;
   const deadline = clock() + SCAN_BUDGET_MS;
   const results: CandidateSnapshot[] = [];
   for (const snapshot of snapshots) {
-    if (rateLimited || checked >= MAX_CHECKS_PER_SCAN || clock() >= deadline) { results.push(snapshot); continue; }
+    const cached = cachedReport(snapshot.address, now);
+    if ((!cached && networkBlocked()) || checked >= MAX_CHECKS_PER_SCAN || clock() >= deadline) { run.unchecked++; results.push(snapshot); continue; }
     checked++;
+    if (cached) run.cacheHits++;
+    else run.requests++;
     try {
-      const {raw, fetchedAt} = await fetchReport(snapshot.address, now);
+      const {raw, fetchedAt} = cached ?? await fetchReport(snapshot.address, now);
       results.push({...snapshot, contractSafety: deriveContractSafety(raw, fetchedAt, now)});
     } catch (error) {
       if (error instanceof RugCheckRateLimited) {
-        rateLimited = true;
+        run.rateLimited = true;
         reportFailure('goldmine', 'contract-safety-rate-limited', error, 'warn');
         if (database) await startRugCheckCooldown(database, clock() + RUGCHECK_COOLDOWN_MS).catch(cooldownError => reportFailure('goldmine', 'contract-safety-cooldown-write', cooldownError, 'warn'));
       } else reportFailure('goldmine', 'contract-safety', error, 'warn');
       results.push(snapshot);
     }
   }
-  return results;
+  return {snapshots: results, run};
+}
+
+export async function attachContractSafety(snapshots: CandidateSnapshot[], now = Date.now(), clock: () => number = Date.now, database?: D1Database): Promise<CandidateSnapshot[]> {
+  return (await checkContractSafety(snapshots, now, clock, database)).snapshots;
 }
 
 export type Scored = {snapshot: CandidateSnapshot; assessment: Assessment};
@@ -296,17 +330,28 @@ function onlySafetyBlocks(assessment: Assessment): boolean {
   return assessment.blockers.length > 0 && assessment.blockers.every(blocker => blocker.id === 'contract_safety_unverified');
 }
 
-export async function withContractSafety(scored: Scored[], now = Date.now(), database?: D1Database): Promise<Scored[]> {
+// Coverage of one detection run, in counts only: how many candidates were eligible for a RugCheck check
+// (non-REJECTED), how many of those ended verified/unsafe/unavailable, and the SafetyRun behind it.
+export type SafetyCoverage = SafetyRun & {eligible: number; verified: number; unsafe: number; unavailable: number};
+
+export async function withContractSafetyCoverage(scored: Scored[], now = Date.now(), database?: D1Database): Promise<{scored: Scored[]; safety: SafetyCoverage}> {
   const actionable = scored.filter(({assessment}) => assessment.state !== 'REJECTED');
-  if (!actionable.length) return scored;
   const prioritized = [...actionable].sort((a, b) => {
     const rank = (entry: Scored) => onlySafetyBlocks(entry.assessment) ? 0 : 1;
     return rank(a) - rank(b) || b.assessment.score - a.assessment.score || a.assessment.address.localeCompare(b.assessment.address);
   });
-  const updated = await attachContractSafety(prioritized.map(({snapshot}) => snapshot), now, Date.now, database);
+  const {snapshots: updated, run} = await checkContractSafety(prioritized.map(({snapshot}) => snapshot), now, Date.now, database);
   const byAddress = new Map(updated.map(snapshot => [snapshot.address, snapshot]));
-  return scored.map(entry => {
-    const snapshot = byAddress.get(entry.snapshot.address);
-    return snapshot ? {snapshot, assessment: scoreCandidate(snapshot)} : entry;
-  });
+  const count = (status: ContractSafety['status']) => updated.filter(snapshot => snapshot.contractSafety.status === status).length;
+  return {
+    scored: actionable.length ? scored.map(entry => {
+      const snapshot = byAddress.get(entry.snapshot.address);
+      return snapshot ? {snapshot, assessment: scoreCandidate(snapshot)} : entry;
+    }) : scored,
+    safety: {...run, eligible: actionable.length, verified: count('verified'), unsafe: count('unsafe'), unavailable: count('unavailable')},
+  };
+}
+
+export async function withContractSafety(scored: Scored[], now = Date.now(), database?: D1Database): Promise<Scored[]> {
+  return (await withContractSafetyCoverage(scored, now, database)).scored;
 }

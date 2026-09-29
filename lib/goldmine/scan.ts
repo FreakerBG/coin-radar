@@ -10,7 +10,7 @@ import {discoverSolanaPairs} from '@/lib/market';
 import {DISCLAIMER, MODEL_VERSION, scoreCandidate, type Assessment} from './score';
 import {attachSocialEvidence, evaluateOutcomes, recordSignals, type OutcomeRun} from './signals';
 import {bestPoolSnapshots, contractSafetySummary} from './snapshot';
-import {withContractSafety} from './contract-safety';
+import {withContractSafetyCoverage, type SafetyCoverage} from './contract-safety';
 
 // Lease length for the shared `goldmine:scan` lock (lib/research-db.ts). It must exceed the worst
 // case runtime of runGoldmineScan(), because acquireLock() hands out a lease, not a mutex: a scan
@@ -46,6 +46,10 @@ export type GoldmineScanResult = {
   opportunities?: number;
   // Null explicitly means the detection-only invocation did not evaluate any outcomes.
   tracking: {newSignals: number; outcomes: OutcomeRun | null};
+  // Contract-safety coverage of this run, counts only (lib/goldmine/contract-safety.ts SafetyCoverage):
+  // a `checked` scan whose RugCheck stage was rate-limited or cooling down is still `checked`, and this
+  // is what says so. Absent when discovery failed and nothing was scored.
+  safety?: SafetyCoverage;
   warnings?: string[];
   coverage?: string;
   message?: string;
@@ -79,7 +83,7 @@ async function detect(database: D1Database, now: number, outcomes: OutcomeRun | 
 
   const snapshots = await attachSocialEvidence(database, bestPoolSnapshots(discovered.pairs, now, discovered.boosted));
   const prescored = snapshots.map(snapshot => ({snapshot, assessment: scoreCandidate(snapshot)}));
-  const scored = await withContractSafety(prescored, now, database);
+  const {scored, safety} = await withContractSafetyCoverage(prescored, now, database);
   const newSignals = await recordSignals(database, scored, now);
   // Response-shaping only: storage above (recordSignals) still gets the full scored snapshot, including
   // the raw contractSafety facts. Here, for the client, contractSafety is reduced to the same minimal
@@ -92,6 +96,6 @@ async function detect(database: D1Database, now: number, outcomes: OutcomeRun | 
   return {
     status: 'checked', modelVersion: MODEL_VERSION, asOf: new Date(now).toISOString(), candidates,
     opportunities: candidates.filter(candidate => candidate.opportunity).length,
-    tracking: {newSignals, outcomes}, warnings: discovered.warnings, coverage: COVERAGE, disclaimer: DISCLAIMER,
+    tracking: {newSignals, outcomes}, safety, warnings: discovered.warnings, coverage: COVERAGE, disclaimer: DISCLAIMER,
   };
 }

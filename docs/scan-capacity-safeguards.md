@@ -8,25 +8,39 @@ sends an alert, prunes data, or auto-trades.
 ## What is implemented here
 
 - **A persisted RugCheck cooldown** (`lib/goldmine/contract-safety.ts`, `RUGCHECK_COOLDOWN_MS`,
-  `isRugCheckCoolingDown`/`startRugCheckCooldown`). A 429 anywhere in `attachContractSafety` starts
+  `rugCheckCooldownState`/`startRugCheckCooldown`). A 429 anywhere in `checkContractSafety` starts
   a cooldown recorded in the existing `research_locks` table (no migration: it is exactly the
   `{id, expires}` shape a cooldown needs, under its own id, namespaced apart from the
   `goldmine:scan` lock). A later call - this process or a genuinely fresh serverless invocation,
-  since nothing here is in-memory - skips every RugCheck request outright while the cooldown is
-  active, leaving candidates at their existing `contractSafety` (the same fail-closed shape a 429
-  or the existing per-call cap already produce). `RUGCHECK_COOLDOWN_MS` is 30 minutes: twice the
-  15-minute cadence draft PR #22 targets, chosen so a sustained outage is actually suppressed
-  across at least one full scheduled cycle, not a measured RugCheck limit (RugCheck publishes none
-  unauthenticated). `attachContractSafety`/`withContractSafety` take the database as an optional,
-  additive parameter; every existing caller/test that omits it keeps today's per-call-only
+  since nothing here is in-memory - sends no RugCheck request while the cooldown is active,
+  leaving candidates at their existing `contractSafety` (the same fail-closed shape a 429 or the
+  existing per-call cap already produce). A report already in the instance's 10-minute cache costs
+  no request and is still used. If the cooldown row cannot be read, the call behaves as if the
+  cooldown were active (no request, candidates stay unavailable) instead of aborting detection.
+  `RUGCHECK_COOLDOWN_MS` is 30 minutes: twice the 15-minute cadence draft PR #22 targets, chosen so
+  a sustained outage is actually suppressed across at least one full scheduled cycle, not a
+  measured RugCheck limit (RugCheck publishes none unauthenticated). The database parameter is
+  optional and additive; every existing caller/test that omits it keeps today's per-call-only
   behavior exactly.
+- **Why sharing `research_locks` is safe.** Both writes are single atomic statements. The scan
+  lease (`acquireLock`) upserts only its own id and only when that row has expired;
+  `releaseLock` deletes by id *and* owner. The cooldown upsert touches only
+  `goldmine:rugcheck-cooldown` and only ever extends its expiry, so two overlapping 429s cannot
+  shorten it. The other lease ids are `goldmine:scan`, `monitor:<user>` and `social:<address>`,
+  none of which can collide. Expiry compares epoch milliseconds from each instance's own clock;
+  NTP-level skew between serverless instances (milliseconds) is negligible against 30 minutes.
+  Tests prove an active cooldown never makes a scan `busy` and a released lease never deletes it.
 - **Explicit, observable scan-outcome metrics** (`lib/diagnostics.ts`, `reportScanOutcome`). Every
   invocation of `app/api/goldmine/scheduled/route.ts` (both GET and POST) now emits one structured
   `coin_radar.scan_outcome` JSON log line with its route, mode (`daily`/`detection`) and status
-  (`checked`/`busy`/`provider_unavailable`) - mirroring `reportFailure`'s existing shape and
-  redaction discipline, so an operator can grep Vercel function logs for the split across a day's
-  96 invocations without a new table, a database read, or waiting for something to actually fail.
-  No candidates, addresses or secrets are ever included.
+  (`checked`/`busy`/`provider_unavailable`), plus `durationMs`, candidate/opportunity/new-signal
+  counts, `outcomesSettled` and a `safety` block (`eligible`, `verified`/`unsafe`/`unavailable`,
+  RugCheck `requests`/`cacheHits`, `rateLimited`, `cooldown`, `unchecked`). The scan response
+  carries the same `safety` block. `checked` means the pipeline ran; it does **not** mean safety
+  checks ran. A rate-limited or cooling-down RugCheck stage still reports `checked`, and `safety`
+  is what shows it. The fields are copied one by one from counts, so no candidate, address,
+  provider body or secret can reach the line. Unauthorized requests and 503 failures emit no scan
+  outcome (a failure still emits its `coin_radar.failure` record).
 
 Both are covered by `tests/goldmine-contract-safety.test.mjs` and
 `tests/goldmine-scheduled.test.mjs`, including a 96-invocation simulation against a RugCheck that
