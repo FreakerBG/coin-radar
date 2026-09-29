@@ -31,6 +31,7 @@ function outcomeDetails(result: GoldmineScanResult, started: number): ScanOutcom
     opportunities: result.opportunities ?? 0,
     newSignals: result.tracking.newSignals,
     outcomesSettled: result.tracking.outcomes !== null,
+    ...(result.alerts ? { alertsQueued: result.alerts.queued } : {}),
     ...(safety ? { safety: {
       eligible: safety.eligible, verified: safety.verified, unsafe: safety.unsafe, unavailable: safety.unavailable,
       requests: safety.requests, cacheHits: safety.cacheHits, rateLimited: safety.rateLimited, cooldown: safety.cooldown, unchecked: safety.unchecked,

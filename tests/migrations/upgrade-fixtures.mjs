@@ -194,4 +194,31 @@ export const upgradeFixtures = {
       assert.deepEqual(d1.rows('SELECT id FROM research_locks WHERE id = ?', 'goldmine:scan'), []);
     },
   },
+
+  // Additive: two new tables, nothing existing is rewritten. Rows written right after 0002 (a queued alert,
+  // a delivered one and per-mint state) must survive later migrations and keep enforcing the 24-hour policy.
+  '0002_goldmine_alert_outbox': {
+    seed(sqlite) {
+      const now = Date.now(), hour = 3600000;
+      insert(sqlite, 'goldmine_alert_outbox', {id: 'alert:momentum-v2.1.0:fixture-a:BREAKOUT:1', address: addresses.tokenA, signal_id: 'momentum-v2.1.0:fixture-a:BREAKOUT:1', model_version: 'momentum-v2.1.0', reason: 'first', created_at: now - hour});
+      insert(sqlite, 'goldmine_alert_outbox', {id: 'alert:momentum-v2.1.0:fixture-b:BREAKOUT:1', address: addresses.tokenB, signal_id: 'momentum-v2.1.0:fixture-b:BREAKOUT:1', model_version: 'momentum-v2.1.0', reason: 'first', created_at: now - 2 * hour, status: 'delivered', delivered_at: now - 2 * hour + 5000});
+      insert(sqlite, 'goldmine_alert_state', {address: addresses.tokenA, last_qualifying_at: now - hour, last_genuine_nonqualifying_at: null, updated_at: now - hour});
+    },
+
+    async verify(sqlite) {
+      const health = await import('../../app/api/health/route.ts');
+      const {recordAlertEligibility} = await import('../../lib/goldmine/alerts.ts');
+      const d1 = createD1(sqlite);
+      runtime.env.DB = d1;
+      signIn(userA);
+      assert.equal((await body(await health.GET())).schema, 'compatible');
+      assert.deepEqual(d1.rows('SELECT address, status FROM goldmine_alert_outbox ORDER BY created_at').map(row => row.status), ['delivered', 'pending']);
+      // The seeded alert for tokenA is inside its 24 hours, so a still-qualifying observation queues nothing.
+      const qualifying = {
+        snapshot: {contractSafety: {status: 'verified'}},
+        assessment: {address: addresses.tokenA, modelVersion: 'momentum-v2.1.0', state: 'BREAKOUT', opportunity: true, priceUsd: 1},
+      };
+      assert.equal(await recordAlertEligibility(d1, [qualifying], Date.now()), 0);
+    },
+  },
 };

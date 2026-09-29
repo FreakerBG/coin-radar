@@ -66,6 +66,7 @@ export type ScanOutcomeDetails = {
   opportunities?: number;
   newSignals?: number;
   outcomesSettled?: boolean;
+  alertsQueued?: number | null;
   safety?: {eligible: number; verified: number; unsafe: number; unavailable: number; requests: number; cacheHits: number; rateLimited: boolean; cooldown: string; unchecked: number};
 };
 

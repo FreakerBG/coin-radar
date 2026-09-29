@@ -11,6 +11,7 @@ import {DISCLAIMER, MODEL_VERSION, scoreCandidate, type Assessment} from './scor
 import {attachSocialEvidence, evaluateOutcomes, recordSignals, type OutcomeRun} from './signals';
 import {bestPoolSnapshots, contractSafetySummary} from './snapshot';
 import {withContractSafetyCoverage, type SafetyCoverage} from './contract-safety';
+import {recordAlertEligibility} from './alerts';
 
 // Lease length for the shared `goldmine:scan` lock (lib/research-db.ts). It must exceed the worst
 // case runtime of runGoldmineScan(), because acquireLock() hands out a lease, not a mutex: a scan
@@ -50,6 +51,9 @@ export type GoldmineScanResult = {
   // a `checked` scan whose RugCheck stage was rate-limited or cooling down is still `checked`, and this
   // is what says so. Absent when discovery failed and nothing was scored.
   safety?: SafetyCoverage;
+  // Trade alerts newly queued in the durable outbox by this run (lib/goldmine/alerts.ts); null when
+  // recording failed. `delivery: 'not_configured'` states plainly that no unattended sender exists yet.
+  alerts?: {queued: number | null; delivery: 'not_configured'};
   warnings?: string[];
   coverage?: string;
   message?: string;
@@ -85,6 +89,14 @@ async function detect(database: D1Database, now: number, outcomes: OutcomeRun | 
   const prescored = snapshots.map(snapshot => ({snapshot, assessment: scoreCandidate(snapshot)}));
   const {scored, safety} = await withContractSafetyCoverage(prescored, now, database);
   const newSignals = await recordSignals(database, scored, now);
+  // Alert eligibility is recorded after the signals it points at. It never blocks detection: a failure
+  // (including a database not yet migrated to 0002) is reported and shows as `alerts.queued: null`.
+  let alertsQueued: number | null = null;
+  try {
+    alertsQueued = await recordAlertEligibility(database, scored, now);
+  } catch (error) {
+    reportFailure('goldmine', 'alert-eligibility', error);
+  }
   // Response-shaping only: storage above (recordSignals) still gets the full scored snapshot, including
   // the raw contractSafety facts. Here, for the client, contractSafety is reduced to the same minimal
   // shape GET already returns (lib/goldmine/snapshot.ts contractSafetySummary), so this response never
@@ -96,6 +108,6 @@ async function detect(database: D1Database, now: number, outcomes: OutcomeRun | 
   return {
     status: 'checked', modelVersion: MODEL_VERSION, asOf: new Date(now).toISOString(), candidates,
     opportunities: candidates.filter(candidate => candidate.opportunity).length,
-    tracking: {newSignals, outcomes}, safety, warnings: discovered.warnings, coverage: COVERAGE, disclaimer: DISCLAIMER,
+    tracking: {newSignals, outcomes}, safety, alerts: {queued: alertsQueued, delivery: 'not_configured'}, warnings: discovered.warnings, coverage: COVERAGE, disclaimer: DISCLAIMER,
   };
 }

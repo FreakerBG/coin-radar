@@ -83,6 +83,28 @@ export const requiredTables: Record<string, TableRequirement> = {
     defaults: {status: 'pending', observed_at: null, price: null, liquidity: null},
     shared: true,
   },
+  // lib/goldmine/alerts.ts: per-mint alert-eligibility memory, upserted ON CONFLICT(address) with MAX() so a
+  // retried or out-of-order run can never move a timestamp backwards. Shared; holds no user data.
+  goldmine_alert_state: {
+    columns: {address: 'TEXT', last_qualifying_at: 'INTEGER', last_genuine_nonqualifying_at: 'INTEGER', updated_at: 'INTEGER'},
+    nullable: ['last_qualifying_at', 'last_genuine_nonqualifying_at'],
+    key: ['address'],
+    inserted: ['address', 'last_qualifying_at', 'last_genuine_nonqualifying_at', 'updated_at'],
+    shared: true,
+  },
+  // One queued trade alert per deterministic id (ON CONFLICT(id) DO NOTHING). Created pending; a sender's
+  // confirmed delivery is the only way to 'delivered'. Times are epoch ms. Shared; holds no user data.
+  goldmine_alert_outbox: {
+    columns: {
+      id: 'TEXT', address: 'TEXT', signal_id: 'TEXT', model_version: 'TEXT', reason: 'TEXT', created_at: 'INTEGER', status: 'TEXT',
+      attempts: 'INTEGER', next_attempt_at: 'INTEGER', lease_owner: 'TEXT', lease_expires: 'INTEGER', delivered_at: 'INTEGER', last_error: 'TEXT',
+    },
+    nullable: ['lease_owner', 'lease_expires', 'delivered_at', 'last_error'],
+    key: ['id'],
+    inserted: ['id', 'address', 'signal_id', 'model_version', 'reason', 'created_at'],
+    defaults: {status: 'pending', attempts: 0, next_attempt_at: 0, lease_owner: null, lease_expires: null, delivered_at: null, last_error: null},
+    shared: true,
+  },
 };
 
 // One read-only statement per required table that fails to compile if the table or a column is missing.
