@@ -3,11 +3,12 @@
 // lib/goldmine/scheduled-auth.ts - never by sign-in or sameOrigin(), since there is no browser here.
 import assert from 'node:assert/strict';
 import { afterEach, beforeEach, describe, test } from 'node:test';
-import { addresses, body, createD1, failures, installFetch, runtime, startClock } from './helpers/harness.mjs';
+import { addresses, body, createD1, failures, installFetch, runtime, scanOutcomes, startClock } from './helpers/harness.mjs';
 import { pair } from './helpers/goldmine-fixtures.mjs';
 
 const { GET, POST } = await import('../app/api/goldmine/scheduled/route.ts');
 const { MODEL_VERSION } = await import('../lib/goldmine/score.ts');
+const { RUGCHECK_COOLDOWN_MS } = await import('../lib/goldmine/contract-safety.ts');
 
 const ORIGIN = 'https://coin-radar.test';
 const ORIGINAL_CRON = process.env.GOLDMINE_CRON_SECRET;
@@ -24,6 +25,7 @@ beforeEach(() => {
   d1 = createD1();
   runtime.env.DB = d1;
   failures.length = 0;
+  scanOutcomes.length = 0;
   process.env.GOLDMINE_CRON_SECRET = 'header-secret';
   process.env.CRON_SECRET = 'bearer-secret';
   calls = installFetch(url => {
@@ -122,6 +124,29 @@ describe('pipeline and lock, once authorized', () => {
     assert.equal(calls.filter(call => call.url.includes('/latest/dex/pairs/')).length, 0);
   });
 
+  test('96 intraday invocations against a RugCheck that always 429s: detection keeps working, and the persisted cooldown roughly halves the wasted requests', async () => {
+    const credential = {'x-goldmine-cron-secret': 'header-secret'};
+    const providerCalls = installFetch(url => {
+      if (url.startsWith('https://api.dexscreener.com/token-profiles/')) return Response.json([{ chainId: 'solana', tokenAddress: addresses.tokenA }]);
+      if (url.startsWith('https://api.dexscreener.com/token-boosts/')) return Response.json([]);
+      if (url.startsWith('https://api.dexscreener.com/tokens/v1/solana/')) return Response.json([pair({ pairCreatedAt: Date.now() - 48 * 3600000 })]);
+      if (url.startsWith('https://api.rugcheck.xyz/v1/tokens/')) return new Response('rate limited', { status: 429 });
+      throw new Error('Unexpected request ' + url);
+    });
+    for (let index = 0; index < 96; index++) {
+      const result = await body(await POST(request('POST', credential)));
+      assert.equal(result.status, 'checked', 'a rate-limited safety provider never blocks detection itself');
+      clock.advance(15 * 60_000);
+    }
+    const rugcheckAttempts = providerCalls.filter(call => call.url.includes('rugcheck.xyz')).length;
+    // Without the persisted cooldown this would be 96 (one wasted request per invocation, since each is a
+    // fresh call with no shared in-memory rate-limit state). RUGCHECK_COOLDOWN_MS is twice the 15-minute
+    // cadence (see its comment in lib/goldmine/contract-safety.ts), so a request is retried roughly every
+    // other invocation once a cooldown is active: 48 attempts across the day, not an exact guarantee for
+    // every possible timing, but well under half of doing nothing at all.
+    assert.ok(rugcheckAttempts > 0 && rugcheckAttempts <= 50, `expected roughly 48 attempts, got ${rugcheckAttempts}`);
+  });
+
   // The reverse direction (a scheduled scan blocking the interactive route) is proven by
   // tests/goldmine-route.test.mjs's "another scan holding the lock makes this one busy" test:
   // acquireLock() (lib/research-db.ts) is a plain lease keyed only by lock id, indifferent to which
@@ -140,5 +165,123 @@ describe('pipeline and lock, once authorized', () => {
     assert.deepEqual([response.status, await body(response)], [503, { error: 'Goldmine scan failed.' }]);
     assert.equal(calls.length, 0);
     assert.deepEqual(failures.map(failure => [failure.route, failure.operation]), [['goldmine', 'scheduled-scan']]);
+  });
+});
+
+// installFetch fully replaces global fetch, so discovery/outcome/RugCheck all need re-declaring together
+// whenever a test wants to vary just one of them (here, RugCheck's response).
+function installProviders(rugcheck) {
+  return installFetch(url => {
+    if (url.startsWith('https://api.dexscreener.com/token-profiles/')) return Response.json([{ chainId: 'solana', tokenAddress: addresses.tokenA }]);
+    if (url.startsWith('https://api.dexscreener.com/token-boosts/')) return Response.json([]);
+    if (url.startsWith('https://api.dexscreener.com/tokens/v1/solana/')) return Response.json([pair({ pairCreatedAt: Date.now() - 48 * 3600000 })]);
+    if (url.startsWith('https://api.dexscreener.com/latest/dex/pairs/solana/')) return Response.json({ pairs: [pair({ pairCreatedAt: Date.now() - 48 * 3600000 })] });
+    if (url.startsWith('https://api.rugcheck.xyz/v1/tokens/')) return rugcheck();
+    throw new Error('Unexpected request ' + url);
+  });
+}
+const rugcheckVerified = () => Response.json({ token: { mintAuthority: null, freezeAuthority: null }, rugged: false });
+const rugcheckRateLimited = () => new Response('rate limited', { status: 429 });
+
+describe('explicit scan-outcome metrics (lib/diagnostics.ts reportScanOutcome)', () => {
+  const outcome = (mode, status) => ({ event: 'coin_radar.scan_outcome', route: 'goldmine-scheduled', mode, status });
+  const head = record => ({ event: record.event, route: record.route, mode: record.mode, status: record.status });
+
+  test('a checked GET and a checked POST each log their own route/mode/status, once', async () => {
+    await GET(request('GET', { authorization: 'Bearer bearer-secret' }));
+    await POST(request('POST', { 'x-goldmine-cron-secret': 'header-secret' }));
+    assert.deepEqual(scanOutcomes.map(head), [outcome('daily', 'checked'), outcome('detection', 'checked')]);
+  });
+
+  test('a checked outcome carries duration, counts and contract-safety coverage - numbers and enums only, never an address or a secret', async () => {
+    await GET(request('GET', { authorization: 'Bearer bearer-secret' }));
+    await POST(request('POST', { 'x-goldmine-cron-secret': 'header-secret' }));
+    const [daily, detection] = scanOutcomes;
+    assert.equal(daily.outcomesSettled, true, 'the daily GET settles outcomes');
+    assert.equal(detection.outcomesSettled, false, 'the detection POST never does');
+    for (const record of [daily, detection]) {
+      assert.equal(typeof record.durationMs, 'number');
+      assert.equal(record.candidates, 1);
+      assert.equal(record.opportunities, 0);
+      assert.deepEqual(Object.keys(record.safety).sort(), ['cacheHits', 'cooldown', 'eligible', 'rateLimited', 'requests', 'unavailable', 'unchecked', 'unsafe', 'verified']);
+      assert.equal(record.safety.cooldown, 'none');
+      const text = JSON.stringify(record);
+      for (const secret of [addresses.tokenA, addresses.pairA, 'header-secret', 'bearer-secret']) assert.equal(text.includes(secret), false, secret);
+    }
+    assert.equal(daily.newSignals, 1);
+    assert.equal(detection.newSignals, 0, 'the same six-hour bucket collapses the repeat');
+    assert.equal(daily.safety.requests + daily.safety.cacheHits, daily.safety.eligible - daily.safety.unchecked);
+  });
+
+  test('a lock already held logs busy and never reaches the pipeline', async () => {
+    d1.sqlite.prepare('INSERT INTO research_locks (id, owner, expires) VALUES (?, ?, ?)').run('goldmine:scan', 'other', Date.now() + 30000);
+    await GET(request('GET', { authorization: 'Bearer bearer-secret' }));
+    assert.deepEqual(scanOutcomes.map(head), [outcome('daily', 'busy')]);
+    assert.equal(typeof scanOutcomes[0].durationMs, 'number');
+    assert.equal(scanOutcomes[0].safety, undefined);
+    assert.equal(calls.length, 0);
+  });
+
+  test('a discovery-provider failure logs provider_unavailable, not checked', async () => {
+    installFetch(() => { throw new Error('network down'); });
+    await POST(request('POST', { 'x-goldmine-cron-secret': 'header-secret' }));
+    assert.deepEqual(scanOutcomes.map(head), [outcome('detection', 'provider_unavailable')]);
+    assert.equal(scanOutcomes[0].safety, undefined, 'nothing was scored, so there is no safety coverage to claim');
+    assert.equal(scanOutcomes[0].newSignals, 0);
+  });
+
+  test('an unauthorized request, or one that fails before a result exists, logs no scan outcome at all', async () => {
+    await GET(request('GET'));
+    delete runtime.env.DB;
+    await GET(request('GET', { authorization: 'Bearer bearer-secret' }));
+    assert.deepEqual(scanOutcomes, []);
+  });
+});
+
+describe('the persisted RugCheck cooldown (lib/goldmine/contract-safety.ts) across scheduled invocations', () => {
+  test('a 429 on one intraday POST suppresses RugCheck on the next scheduled invocation 15 minutes later, then resumes once the cooldown elapses', async () => {
+    const credential = { 'x-goldmine-cron-secret': 'header-secret' };
+    installProviders(rugcheckRateLimited);
+    await POST(request('POST', credential)); // gets 429, starts the persisted cooldown
+
+    clock.advance(15 * 60_000); // the target intraday cadence
+    const stillCoolingDown = installProviders(rugcheckVerified); // would happily verify, if asked
+    const midCooldown = await body(await POST(request('POST', credential)));
+    assert.equal(midCooldown.status, 'checked', 'detection itself keeps running; only the RugCheck check is skipped');
+    assert.equal(stillCoolingDown.filter(call => call.url.includes('rugcheck.xyz')).length, 0);
+
+    clock.advance(RUGCHECK_COOLDOWN_MS);
+    const afterCooldown = installProviders(rugcheckVerified);
+    await POST(request('POST', credential));
+    assert.ok(afterCooldown.some(call => call.url.includes('rugcheck.xyz')), 'the cooldown has elapsed, so RugCheck is asked again');
+  });
+
+  test('the response and log report the 429 and then the active cooldown, so a checked scan never hides missing safety coverage', async () => {
+    const credential = { 'x-goldmine-cron-secret': 'header-secret' };
+    installProviders(rugcheckRateLimited);
+    const limited = await body(await POST(request('POST', credential)));
+    assert.equal(limited.status, 'checked');
+    assert.equal(limited.safety.rateLimited, true);
+    assert.equal(limited.safety.requests, 1);
+    assert.equal(limited.safety.verified, 0);
+
+    clock.advance(15 * 60_000);
+    installProviders(rugcheckVerified);
+    const cooling = await body(await POST(request('POST', credential)));
+    assert.equal(cooling.safety.cooldown, 'active');
+    assert.equal(cooling.safety.requests, 0);
+    assert.deepEqual(scanOutcomes.map(record => [record.status, record.safety.rateLimited, record.safety.cooldown]), [['checked', true, 'none'], ['checked', false, 'active']]);
+  });
+
+  test('the cooldown row never interferes with the goldmine:scan lease: the lease is released after a 429 scan and is not held by an active cooldown', async () => {
+    const credential = { 'x-goldmine-cron-secret': 'header-secret' };
+    installProviders(rugcheckRateLimited);
+    await POST(request('POST', credential));
+    assert.deepEqual(d1.rows('SELECT id FROM research_locks ORDER BY id'), [{ id: 'goldmine:rugcheck-cooldown' }], 'only the cooldown remains; the scan lease was released');
+
+    // With the cooldown still active, the next scan is not "busy" - the lease is keyed only by its own id.
+    const next = await body(await POST(request('POST', credential)));
+    assert.equal(next.status, 'checked');
+    assert.deepEqual(d1.rows('SELECT id FROM research_locks ORDER BY id'), [{ id: 'goldmine:rugcheck-cooldown' }], 'releasing the lease never deletes the cooldown');
   });
 });

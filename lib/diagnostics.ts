@@ -47,3 +47,32 @@ export function reportFailure(route: string, operation: string, error: unknown, 
     // Reporting is best effort; the caller's response must not change.
   }
 }
+
+export type ScanStatus = 'checked' | 'busy' | 'provider_unavailable';
+
+// One structured JSON line per scan invocation (app/api/goldmine/scheduled/route.ts), so an operator
+// can tell how many of a day's invocations actually ran the pipeline versus found the shared lock held
+// versus hit a discovery-provider failure - without a new table or a database read. This exists because
+// a future 96-invocation/day detector makes that split worth watching for capacity, not just debugging a
+// single failure; a normal day is expected to be almost entirely `checked`, and a sustained run of
+// `busy` or `provider_unavailable` is the signal an operator would otherwise only see by reading every
+// invocation's raw HTTP response individually. Carries no candidates, addresses or secrets - only the
+// route, which method produced it, the outcome and, when given, numeric/enum details (duration, counts,
+// contract-safety coverage) that the caller builds from counts alone. Best effort, like reportFailure: it
+// must never throw or change the caller's response.
+export type ScanOutcomeDetails = {
+  durationMs: number;
+  candidates?: number;
+  opportunities?: number;
+  newSignals?: number;
+  outcomesSettled?: boolean;
+  safety?: {eligible: number; verified: number; unsafe: number; unavailable: number; requests: number; cacheHits: number; rateLimited: boolean; cooldown: string; unchecked: number};
+};
+
+export function reportScanOutcome(route: string, mode: 'daily' | 'detection', status: ScanStatus, details?: ScanOutcomeDetails) {
+  try {
+    console.log(JSON.stringify({event: 'coin_radar.scan_outcome', route, mode, status, ...details}));
+  } catch {
+    // Reporting is best effort; the caller's response must not change.
+  }
+}
