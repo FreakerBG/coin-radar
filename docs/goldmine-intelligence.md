@@ -107,7 +107,7 @@ RugCheck's own score or verdict is never read. Instead its facts feed our own de
   - `missed`: no scan ran inside the window. A later price is never recorded as the horizon's price;
   - a provider failure leaves the outcome pending for the next scan.
 - Outcomes are **not** settled at exact 24h/72h/168h. Each is "the first daily snapshot at or after the target age". `observed_at` is stored and exposed, and every read path reports the **actual elapsed time** between detection and observation (`observedAfterHours`). Section 4b explains why that distinction is not cosmetic.
-- Due outcomes are grouped by recorded pool and read in batches of at most 30 pools, earliest-closing window first (then pool and token), with at most 5 requests per scan, sent in parallel. A failed batch leaves only its own outcomes pending; pools beyond the cap are reported as `deferred` and read by the next scan while their windows are open.
+- Due outcomes are grouped by recorded pool and read in batches of at most 30 pools, earliest-closing window first (then pool and token), with at most 40 requests (1,200 pools) per scan, sent in parallel (sized for intraday detection; see docs/capacity-96-per-day.md). A failed batch leaves only its own outcomes pending; pools beyond the cap are reported as `deferred` and read by the next scan while their windows are open.
 - Evaluation runs only when someone scans, so without a scheduler many outcomes will be `missed`. Prices are provider quotes, not executable prices; returns ignore fees, slippage and liquidity.
 
 ### 4b. Cadence-honest outcome evaluation (Stage 06)
@@ -232,7 +232,7 @@ Both env vars fail closed like every other secret check in this codebase: if uns
 - Discovery covers up to 30 recently profiled or promoted tokens, not the whole market. Promoted tokens are over-represented and receive no social points.
 - Social momentum exists only where someone already ran an X search for the contract.
 - The detection price is the discovery response, which the shared provider cache may have fetched up to 60 seconds before `detected_at`; outcome prices may be up to 10 seconds old.
-- More than 150 due pools in one scan are deferred; if scans stop, deferred outcomes still become `missed` when their windows close.
+- More than 1,200 due pools in one scan are deferred; if scans stop, deferred outcomes still become `missed` when their windows close.
 - The scan lock expires after 300,000 ms (five minutes, `SCAN_LOCK_TTL_MS`); an overlapping scan cannot duplicate signals (IDs) or outcomes (primary key).
 - Signals and outcomes currently have no retention or archival policy. Historical records are retained for backtesting and calibration; any future pruning design must preserve the aggregate evidence required by those features.
 - An active horizon's observation is guaranteed to exist, not to be punctual. The proof in section 4b bounds the observation to `[target, target + 26h]`, and because every target is an exact multiple of the daily cadence, an observation legitimately lands near the target or roughly a day past it. Read `observedAfterHours`, never the horizon's name, as the holding period a return describes.

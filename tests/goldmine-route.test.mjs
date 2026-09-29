@@ -10,6 +10,7 @@ const {GET, POST} = await import('../app/api/goldmine/route.ts');
 const {MODEL_VERSION} = await import('../lib/goldmine/score.ts');
 const {ACTIVE_HORIZON_IDS, MAX_SCAN_GAP_MS, MIN_SCAN_GAP_MS, OBSERVATION_GRACE_MS, SCAN_CADENCE_MS} = await import('../lib/goldmine/cadence.ts');
 const {contractSafetySummary} = await import('../lib/goldmine/snapshot.ts');
+const {MAX_OUTCOME_BATCHES, MAX_PAIRS_PER_REQUEST} = await import('../lib/goldmine/signals.ts');
 
 // A realistic populated RugCheck report that verifies cleanly (same shape as the Stage 03B provider
 // preflight and tests/goldmine-contract-safety.test.mjs's own `report()`), and a rugged variant of it.
@@ -472,12 +473,13 @@ describe('outcome batches', () => {
   let requests;
 
   // `count` signals detected 16 minutes ago, one pool each, whose 15m outcomes are due now. Signal i was
-  // detected i seconds earlier than signal i+1, so its window closes first.
+  // detected 100 ms earlier than signal i+1, so its window closes first; the spacing is small enough that
+  // even the capacity-sized seeds (1,200+ pools) all still have an open 5-minute window at scan time.
   function seedDue(count) {
     const now = clock.now();
     for (let index = 0; index < count; index++) {
-      const detected = now - 16 * MINUTE - (count - index) * 1000;
-      const id = `batch-signal-${String(index).padStart(3, '0')}`;
+      const detected = now - 16 * MINUTE - (count - index) * 100;
+      const id = `batch-signal-${String(index).padStart(4, '0')}`;
       d1.sqlite.prepare('INSERT INTO goldmine_signals (id, address, pair, symbol, model_version, state, score, opportunity, detected_at, detected_price, snapshot, assessment) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
         .run(id, addresses.tokenA, pairAddress(index), 'FIX', MODEL_VERSION, 'BUILDING', 60, 0, detected, 1, '{}', '{}');
       d1.sqlite.prepare('INSERT INTO goldmine_outcomes (signal_id, horizon, due_at, deadline_at) VALUES (?, ?, ?, ?)').run(id, '15m', detected + 15 * MINUTE, detected + 20 * MINUTE);
@@ -537,18 +539,29 @@ describe('outcome batches', () => {
   });
 
   test('provider requests stay bounded; pools beyond the cap are deferred, not skipped into missed', async () => {
-    const pools = seedDue(170);
+    const cap = MAX_OUTCOME_BATCHES * MAX_PAIRS_PER_REQUEST;
+    const pools = seedDue(cap + 20);
     const first = await body(await scan());
-    assert.equal(requests.length, 5, 'at most five requests per scan');
+    assert.equal(requests.length, MAX_OUTCOME_BATCHES, 'at most MAX_OUTCOME_BATCHES requests per scan');
     assert.ok(requests.every(batch => batch.length <= 30));
-    assert.deepEqual(first.tracking.outcomes, {provider: 'ok', observed: 150, unavailable: 0, missed: 0, deferred: 20});
-    assert.deepEqual([statusOf(pools[149]), statusOf(pools[150])], ['observed', 'pending'], 'the most urgent windows are read first');
+    assert.deepEqual(first.tracking.outcomes, {provider: 'ok', observed: cap, unavailable: 0, missed: 0, deferred: 20});
+    assert.deepEqual([statusOf(pools[cap - 1]), statusOf(pools[cap])], ['observed', 'pending'], 'the most urgent windows are read first');
 
     clock.advance(MINUTE);
     requests = [];
     assert.deepEqual((await body(await scan())).tracking.outcomes, {provider: 'ok', observed: 20, unavailable: 0, missed: 0, deferred: 0});
-    assert.deepEqual(requests, [pools.slice(150)]);
-    assert.deepEqual(statusCounts(), {observed: 170});
+    assert.deepEqual(requests, [pools.slice(cap)]);
+    assert.deepEqual(statusCounts(), {observed: cap + 20});
+  });
+
+  test('one daily run settles a 15-minute detector\'s worth of distinct pools: 3 horizons x 400 distinct pairs/day fits in one run', async () => {
+    // 400 distinct pairs detected per day is the design point (docs/capacity-96-per-day.md): each is due at
+    // d1, d3 and d7, but on any one day only one of those horizons is due per pair, so a steady state has
+    // about 3 x 400 = 1,200 pools due per daily run - exactly MAX_OUTCOME_BATCHES x MAX_PAIRS_PER_REQUEST.
+    assert.equal(MAX_OUTCOME_BATCHES * MAX_PAIRS_PER_REQUEST, 3 * 400);
+    seedDue(1200);
+    const run = (await body(await scan())).tracking.outcomes;
+    assert.deepEqual(run, {provider: 'ok', observed: 1200, unavailable: 0, missed: 0, deferred: 0});
   });
 });
 

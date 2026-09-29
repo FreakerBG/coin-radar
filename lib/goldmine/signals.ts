@@ -23,10 +23,18 @@ const HOUR = 60 * 60000;
 // create a signal per scan.
 export const SIGNAL_BUCKET_MS = 6 * HOUR;
 // DEX Screener's pairs endpoint accepts up to 30 pair addresses per request. A scan sends at most
-// MAX_OUTCOME_BATCHES requests (150 pairs), in parallel so it stays well inside the scan lock lease
+// MAX_OUTCOME_BATCHES requests (1,200 pairs), in parallel so it stays well inside the scan lock lease
 // (lib/goldmine/scan.ts SCAN_LOCK_TTL_MS).
+//
+// Sized for intraday detection, not for the daily scan alone. Outcomes are settled only by the daily GET
+// (and manual full scans), while a 15-minute detector can record many distinct pairs a day. Every recorded
+// pair is due again at d1, d3 and d7, so a day's settlement demand is roughly 3x the distinct pairs detected
+// per day. The previous cap of 150 pairs/run would let most of those windows close unobserved (missed) once
+// detection outpaced it (docs/capacity-96-per-day.md). 40 requests is one burst, far under DEX Screener's
+// published 300 requests/minute for this endpoint. Each settled pair is one indexed UPDATE, so 1,200 pairs
+// costs seconds, not minutes, of the 300s lease. Pairs beyond the cap are still deferred, never dropped.
 export const MAX_PAIRS_PER_REQUEST = 30;
-export const MAX_OUTCOME_BATCHES = 5;
+export const MAX_OUTCOME_BATCHES = 40;
 // Signals written per INSERT. A signal with its snapshot and assessment is about 4 KB of JSON, so ten keep
 // each bound value far below D1's 100 KB statement and 2 MB value limits.
 export const SIGNALS_PER_INSERT = 10;
