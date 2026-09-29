@@ -78,8 +78,11 @@ Each scheduled invocation now logs `coin_radar.scan_outcome` with `newSignals`, 
 contract-safety block. The canary (bounded, detection-only POSTs) and the first lower-frequency trigger runs
 give:
 
-- **new signals per run -> N/day.** The gate: projected distinct pairs/day <= 300. This is an upper bound on
-  distinct pairs, since `newSignals` also counts state changes of known mints. Above 300 is a **NO-GO for
+- **`pairs24h` / `newPairs` -> distinct pairs/day.** Each scheduled run's `scan_outcome` line carries
+  `pairs24h`, the distinct (pool, token) pairs recorded in the rolling 24 hours up to that run (all runs,
+  all states, controls included), which is exactly what the daily settlement must price. It also carries
+  `newPairs`, this run's pairs unseen in the prior 24 hours. `newSignals` is **not** this measure: one pair
+  adds a signal per state and per six-hour bucket. The gate: `pairs24h` <= 300. Above it is a **NO-GO for
   15 minutes**; keep a lower cadence at which the measured rate fits.
 - **durationMs** well under the 300 s function limit and lock lease.
 - **safety coverage:** `requests`, `rateLimited`, `cooldown`. Sustained 429s mean the cooldown is suppressing

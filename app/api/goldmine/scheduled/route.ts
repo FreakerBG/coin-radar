@@ -16,6 +16,7 @@
 import { reportFailure, reportScanOutcome, type ScanOutcomeDetails } from '@/lib/diagnostics';
 import { acquireLock, db, releaseLock } from '@/lib/research-db';
 import { runGoldmineDetection, runGoldmineScan, SCAN_LOCK_TTL_MS, type GoldmineScanResult } from '@/lib/goldmine/scan';
+import { pairMetrics } from '@/lib/goldmine/signals';
 import { isAuthorizedScheduledScan } from '@/lib/goldmine/scheduled-auth';
 
 const noStore = { 'Cache-Control': 'no-store' };
@@ -23,10 +24,11 @@ const LOCK_ID = 'goldmine:scan';
 
 // Counts and enums only, copied field by field so nothing else from the result (candidates, addresses,
 // provider warnings) can ever reach the log line.
-function outcomeDetails(result: GoldmineScanResult, started: number): ScanOutcomeDetails {
+function outcomeDetails(result: GoldmineScanResult, started: number, pairs: { pairs24h: number | null; newPairs: number | null } | null): ScanOutcomeDetails {
   const safety = result.safety;
   return {
     durationMs: Date.now() - started,
+    ...(pairs ? { pairs24h: pairs.pairs24h, newPairs: pairs.newPairs } : {}),
     candidates: result.candidates.length,
     opportunities: result.opportunities ?? 0,
     newSignals: result.tracking.newSignals,
@@ -52,10 +54,23 @@ async function scan(request: Request, mode: 'daily' | 'detection'): Promise<Resp
       reportScanOutcome('goldmine-scheduled', mode, 'busy', { durationMs: Date.now() - started });
       return Response.json({ status: 'busy', candidates: [] }, { headers: noStore });
     }
+    // One detection timestamp for the run and for the pair metric that describes it.
+    const now = Date.now();
     const result = mode === 'daily'
-      ? await runGoldmineScan(database, Date.now())
-      : await runGoldmineDetection(database, Date.now());
-    reportScanOutcome('goldmine-scheduled', mode, result.status, outcomeDetails(result, started));
+      ? await runGoldmineScan(database, now)
+      : await runGoldmineDetection(database, now);
+    // Read-only settlement-demand metric (lib/goldmine/signals.ts pairMetrics). Observability only: a failure
+    // is reported and logged as null; it never changes the response or the scan.
+    let pairs: { pairs24h: number | null; newPairs: number | null } | null = null;
+    if (result.status === 'checked') {
+      try {
+        pairs = await pairMetrics(database, now);
+      } catch (error) {
+        reportFailure('goldmine', 'pair-metrics', error, 'warn');
+        pairs = { pairs24h: null, newPairs: null };
+      }
+    }
+    reportScanOutcome('goldmine-scheduled', mode, result.status, outcomeDetails(result, started, pairs));
     return Response.json(result, { headers: noStore });
   } catch (error) {
     reportFailure('goldmine', 'scheduled-scan', error);

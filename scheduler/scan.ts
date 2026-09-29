@@ -21,11 +21,18 @@
 
 export type SchedulerEnv = {
   SCAN_ENABLED?: string;
+  // ISO 8601 instant after which an enabled Worker stops scanning on its own (a hard, Cloudflare-side end to
+  // a ramp or canary, independent of whoever enabled it). Required whenever SCAN_ENABLED is "true": missing,
+  // unparseable or more than MAX_SCAN_WINDOW_MS ahead reads as disabled, and a past instant as expired.
+  SCAN_UNTIL?: string;
   GOLDMINE_CRON_SECRET?: string;
   VERCEL_BYPASS_SECRET?: string;
 };
 
-export type ScanResult = 'disabled' | 'checked' | 'busy' | 'provider_unavailable';
+export type ScanResult = 'disabled' | 'expired' | 'checked' | 'busy' | 'provider_unavailable';
+
+// The longest an enabled configuration may run before it must be deliberately re-armed.
+export const MAX_SCAN_WINDOW_MS = 7 * 24 * 3600_000;
 
 // Counts and enums from the scan response, validated one by one. Nothing else from the body is kept.
 export type ScanSummary = {
@@ -73,6 +80,9 @@ function summarize(status: ScanResult, body: Record<string, unknown>, httpStatus
 
 export async function runScheduledScan(env: SchedulerEnv, fetcher: typeof fetch = fetch, clock: () => number = Date.now): Promise<ScanSummary> {
   if (env.SCAN_ENABLED !== 'true') return {status: 'disabled'};
+  const until = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(:\d{2}(\.\d{1,3})?)?Z$/.test(env.SCAN_UNTIL ?? '') ? Date.parse(env.SCAN_UNTIL as string) : NaN;
+  if (!Number.isFinite(until) || until - clock() > MAX_SCAN_WINDOW_MS) return {status: 'disabled'};
+  if (clock() >= until) return {status: 'expired'};
   if (!usableSecret(env.GOLDMINE_CRON_SECRET) || !usableSecret(env.VERCEL_BYPASS_SECRET)) throw new Error('Scheduler secret is not configured.');
 
   const started = clock();

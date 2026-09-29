@@ -42,11 +42,14 @@ only `ok` lines. Vercel applies `GOLDMINE_CRON_SECRET` to the **next** productio
 
 ## Enabling (only after the activation gates in docs/capacity-96-per-day.md)
 
-Edit `wrangler.jsonc` in the deploying checkout (not committed to `main` unattended):
-`"vars": {"SCAN_ENABLED": "true"}` and a conservative first cadence such as `"crons": ["0 * * * *"]` (hourly),
-then `npx wrangler deploy --config scheduler/wrangler.jsonc`. Move to `*/15 * * * *` only once hourly runs have
-shown `checked`, acceptable `durationMs`, safety coverage, `newSignals` inside the capacity gate and flat
-Turso usage. Past runs: dashboard -> Trigger Events (last 100) and Workers Logs.
+Deploy a separate, uncommitted config (the committed file stays dormant) with
+`"vars": {"SCAN_ENABLED": "true", "SCAN_UNTIL": "<ISO instant, UTC, ending in Z>"}` and a conservative first
+cadence such as `"crons": ["0 * * * *"]` (hourly). `SCAN_UNTIL` is required: without a valid deadline no more
+than 7 days ahead the Worker stays `disabled`, and after it the Worker logs `expired` and sends nothing. That
+makes every enabled configuration end on its own, even if nobody turns it off. Move to `*/15 * * * *` only
+once hourly runs have shown `checked`, acceptable `durationMs`, safety coverage, a `pairs24h` inside the
+capacity gate (docs/capacity-96-per-day.md) and flat Turso usage. Past runs: dashboard -> Trigger Events
+(last 100) and Workers Logs; the app's `coin_radar.scan_outcome` lines in Vercel are kept for one hour on Hobby.
 
 ## Kill switch (fastest first)
 
