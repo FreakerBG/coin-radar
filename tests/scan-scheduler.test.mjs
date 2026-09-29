@@ -59,7 +59,7 @@ test('one request to the fixed HTTPS endpoint, with both secret headers, no redi
     assert.equal(SCAN_ENDPOINT.startsWith('https://'), true);
     assert.equal(init.method, 'POST');
     assert.deepEqual(init.headers, {'x-goldmine-cron-secret': secret, 'x-vercel-protection-bypass': bypass});
-    assert.equal(init.redirect, 'error');
+    assert.equal(init.redirect, 'manual', 'workerd rejects "error"; "manual" returns a redirect unfollowed');
     assert.ok(init.signal instanceof AbortSignal);
     assert.equal(init.body, undefined);
     return Response.json({status: 'checked'});
@@ -89,7 +89,7 @@ test('busy and provider_unavailable are reported as themselves, never as checked
   }
 });
 
-test('HTTP failures (including an SSO redirect turned into an error), malformed JSON and unknown statuses fail after one attempt', async () => {
+test('HTTP failures (including an SSO redirect returned as a 3xx), malformed JSON and unknown statuses fail after one attempt', async () => {
   let calls = 0;
   const fetcher = async () => { calls++; return new Response('sensitive response', {status: 503}); };
   await assert.rejects(runScheduledScan(enabled, fetcher), error => {
@@ -98,7 +98,13 @@ test('HTTP failures (including an SSO redirect turned into an error), malformed 
     return true;
   });
   assert.equal(calls, 1);
-  await assert.rejects(runScheduledScan(enabled, async () => { throw new TypeError('redirect mode is set to error'); }), /^Error: Scheduler request failed\.$/);
+  // With redirect: 'manual' a redirect is handed back, not followed; it must fail like any non-200.
+  for (const status of [301, 302, 303, 307, 308]) {
+    let redirectCalls = 0;
+    await assert.rejects(runScheduledScan(enabled, async () => { redirectCalls++; return new Response(null, {status, headers: {location: 'https://vercel.com/sso-api'}}); }), new RegExp(`HTTP ${status}`));
+    assert.equal(redirectCalls, 1);
+  }
+  await assert.rejects(runScheduledScan(enabled, async () => { throw new TypeError('network error'); }), /^Error: Scheduler request failed\.$/);
   await assert.rejects(runScheduledScan(enabled, async () => new Response('not json')), /response was invalid/);
   await assert.rejects(runScheduledScan(enabled, async () => Response.json({status: 'other'})), /unknown status/);
 });

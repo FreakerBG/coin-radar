@@ -10,10 +10,11 @@
 //   VERCEL_BYPASS_SECRET  a Protection Bypass for Automation secret dedicated to this Worker. Production
 //                         .vercel.app URLs sit behind Vercel Authentication (deployment protection); without
 //                         the bypass header the request never reaches the application and Vercel redirects
-//                         to its login page (which `redirect: 'error'` turns into a failure). Revocable on
-//                         its own, independent of every other bypass secret.
+//                         to its login page (a 3xx, which is never followed and fails the HTTP 200 check).
+//                         Revocable on its own, independent of every other bypass secret.
 //
-// Safety properties (tests/scan-scheduler.test.mjs): fixed HTTPS origin and path; no caller-supplied URL;
+// Safety properties (tests/scan-scheduler.test.mjs, and in the real workerd runtime
+// tests/scheduler-workerd.test.mjs): fixed HTTPS origin and path; no caller-supplied URL;
 // no redirects followed; one attempt, never a retry, and controller.noRetry() so the platform does not
 // retry a failed invocation into a rate limit either; a bounded timeout; errors and logs never contain a
 // secret, a URL with credentials or a response body - only the status and counts.
@@ -81,7 +82,11 @@ export async function runScheduledScan(env: SchedulerEnv, fetcher: typeof fetch 
       method: 'POST',
       headers: {'x-goldmine-cron-secret': env.GOLDMINE_CRON_SECRET, 'x-vercel-protection-bypass': env.VERCEL_BYPASS_SECRET},
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
-      redirect: 'error',
+      // 'manual', never 'error': workerd rejects redirect: 'error' outright ("won't be implemented ... use
+      // 'manual' and check the response status code"), which failed the 2026-09-29 production canary before
+      // any request was sent. With 'manual' a redirect comes back as its own 3xx response and is never
+      // followed, so the status check below rejects it like every other non-200.
+      redirect: 'manual',
     });
   } catch {
     // No URL, response body, or secret in logs or propagated errors.
