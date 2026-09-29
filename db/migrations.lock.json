@@ -12,6 +12,12 @@
       "when": 1789742890121,
       "sql": "e1c7f34ad45f9fa34b1b57590727301333cae253ea06d8ceb2cdf80e9ee6474c",
       "snapshot": "57588245d376fed567872a6e58addc0035d9dd350c38fa78d814dfa788fe4203"
+    },
+    {
+      "tag": "0002_goldmine_alert_outbox",
+      "when": 1790642945519,
+      "sql": "577375d544ab2018b1222042cad5af1c7c6a83dc5a612f94e8e099286f26fbbe",
+      "snapshot": "c53450e787d7129aa1ecc02a2ea32151ee1b389e10776978644ea1915e87ddb2"
     }
   ]
 }

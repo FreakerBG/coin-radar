@@ -15,6 +15,13 @@
       "when": 1789742890121,
       "tag": "0001_goldmine_signals",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1790642945519,
+      "tag": "0002_goldmine_alert_outbox",
+      "breakpoints": true
     }
   ]
 }
