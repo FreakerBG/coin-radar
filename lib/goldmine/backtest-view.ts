@@ -54,6 +54,12 @@ export type CalibrationResult = {
 export type DenominatorGroup = {signals: number; coverage: OutcomeCoverage; observedReturns: number};
 export type DenominatorSplit = {control: DenominatorGroup; strategy: DenominatorGroup; opportunity: DenominatorGroup};
 export type SignalTotals = {signals: number; opportunities: number; control: number; strategy: number};
+// Mirrors lib/goldmine/backtest.ts ReportCoverage (the API's `coverage`).
+export type ReportCoverage = {
+  signalsAnalyzed: number; storedSignals: number; truncated: boolean;
+  oldestAnalyzedAt: number | null; newestAnalyzedAt: number | null;
+  targetWindowDays: number; targetWindowFullyAnalyzed: boolean;
+};
 export type BacktestReport = {
   modelVersion: string;
   evaluationScheduleVersion: string;
@@ -65,6 +71,7 @@ export type BacktestReport = {
   skippedMalformedRows: number;
   skippedMalformedOutcomes: number;
   truncated: boolean;
+  coverage: ReportCoverage;
   replay: {
     currentVersionSignals: number;
     matched: number;
@@ -146,6 +153,29 @@ export function signalsSummaryLabel(report: {totalSignals: number; truncated: bo
   return report.truncated
     ? `${report.totalSignals} newest valid signals analyzed from the bounded history.`
     : `${report.totalSignals} valid signals analyzed.`;
+}
+
+// The exact window the report covers, in UTC, always shown with the report. States the detection-time span
+// of the rows actually analyzed, how many of the stored signals that is, and whether the 30-day research
+// target was reached - so a bounded read is never taken for "30 days" or "all history".
+const utc = (ms: number) => new Date(ms).toISOString().slice(0, 16).replace('T', ' ') + ' UTC';
+function span(ms: number): string {
+  const days = ms / (24 * 3600000);
+  if (days >= 1) return `${days.toFixed(1)} days`;
+  const h = ms / 3600000;
+  return `${h.toFixed(1)} hours`;
+}
+
+export function coverageWindowLabel(coverage: ReportCoverage | null | undefined): string {
+  if (!coverage || coverage.oldestAnalyzedAt === null || coverage.newestAnalyzedAt === null) return '';
+  const window = `detected ${utc(coverage.oldestAnalyzedAt)} to ${utc(coverage.newestAnalyzedAt)} (${span(coverage.newestAnalyzedAt - coverage.oldestAnalyzedAt)})`;
+  const target = `${coverage.targetWindowDays}-day research target`;
+  if (!coverage.truncated) {
+    return `Covers ${coverage.signalsAnalyzed} of ${coverage.storedSignals} stored signals, ${window}. Nothing was cut off by the read bound${coverage.newestAnalyzedAt - coverage.oldestAnalyzedAt < coverage.targetWindowDays * 24 * 3600000 ? `; the stored history is shorter than the ${target}` : ''}.`;
+  }
+  return `Covers only the newest ${coverage.signalsAnalyzed} of ${coverage.storedSignals} stored signals, ${window}. ${coverage.targetWindowFullyAnalyzed
+    ? `Every signal from the ${target} window is included; older stored signals are not.`
+    : `This is less than the ${target}: older stored signals were not read and are not reflected in this report.`}`;
 }
 
 // A short, honest label for a calibration cell's evidence status - never implies a claim the cell's own
