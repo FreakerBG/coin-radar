@@ -62,6 +62,8 @@ export type ScanStatus = 'checked' | 'busy' | 'provider_unavailable';
 // must never throw or change the caller's response.
 export type ScanOutcomeDetails = {
   durationMs: number;
+  pairs24h?: number | null;
+  newPairs?: number | null;
   candidates?: number;
   opportunities?: number;
   newSignals?: number;

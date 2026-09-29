@@ -93,6 +93,22 @@ export async function recordSignals(database: D1Database, scored: Scored[], dete
   return inserted;
 }
 
+// Settlement-demand metric for cadence decisions (docs/capacity-96-per-day.md). Read-only, two indexed
+// queries: `pairs24h` is the number of distinct (pool, token) pairs recorded in the 24 hours up to and
+// including `detectedAt` - every run and every state, controls included - which is what the daily run
+// must later price at d1/d3/d7. `newPairs` is how many of the pairs recorded at exactly `detectedAt` (one
+// detection run) had no signal in the preceding 24 hours. Neither is `newSignals`: that counts
+// (model, mint, state, six-hour bucket) rows, so one pair can add several per day.
+export const PAIR_METRIC_WINDOW_MS = 24 * HOUR;
+export async function pairMetrics(database: D1Database, detectedAt: number): Promise<{pairs24h: number; newPairs: number}> {
+  const since = detectedAt - PAIR_METRIC_WINDOW_MS;
+  const window = await database.prepare('SELECT COUNT(*) AS n FROM (SELECT 1 FROM goldmine_signals WHERE detected_at > ? AND detected_at <= ? GROUP BY pair, address)')
+    .bind(since, detectedAt).first<{n: number}>();
+  const fresh = await database.prepare('SELECT COUNT(*) AS n FROM (SELECT pair, address FROM goldmine_signals WHERE detected_at = ? GROUP BY pair, address) cur WHERE NOT EXISTS (SELECT 1 FROM goldmine_signals s WHERE s.pair = cur.pair AND s.address = cur.address AND s.detected_at > ? AND s.detected_at < ?)')
+    .bind(detectedAt, since, detectedAt).first<{n: number}>();
+  return {pairs24h: Number(window?.n ?? 0), newPairs: Number(fresh?.n ?? 0)};
+}
+
 // Settles due outcomes. Pending outcomes whose window has closed become missed. The rest are grouped by
 // recorded pool, ordered by the earliest closing window (then pool and token, so batches are
 // deterministic), and read in batches of at most 30 pools. For each pool a valid price is observed; a

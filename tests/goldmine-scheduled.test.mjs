@@ -168,6 +168,76 @@ describe('pipeline and lock, once authorized', () => {
   });
 });
 
+describe('settlement-demand metric: distinct pairs, not signals (lib/goldmine/signals.ts pairMetrics)', () => {
+  const credential = { 'x-goldmine-cron-secret': 'header-secret' };
+  const outcome = () => scanOutcomes.at(-1);
+  const discover = tokens => installFetch(url => {
+    if (url.startsWith('https://api.dexscreener.com/token-profiles/')) return Response.json(tokens.map(t => ({ chainId: 'solana', tokenAddress: t.token })));
+    if (url.startsWith('https://api.dexscreener.com/token-boosts/')) return Response.json([]);
+    if (url.startsWith('https://api.dexscreener.com/tokens/v1/solana/')) return Response.json(tokens.map(t => pair({ pairAddress: t.pair, baseToken: { address: t.token, name: 'T', symbol: 'T' }, pairCreatedAt: Date.now() - 48 * 3600000 })));
+    if (url.startsWith('https://api.dexscreener.com/latest/dex/pairs/solana/')) return Response.json({ pairs: [] });
+    if (url.startsWith('https://api.rugcheck.xyz/v1/tokens/')) return Response.json({ token: { mintAuthority: null, freezeAuthority: null }, rugged: false });
+    throw new Error('Unexpected request ' + url);
+  });
+  const A = { token: addresses.tokenA, pair: addresses.pairA }, B = { token: addresses.tokenB, pair: addresses.pairB };
+
+  test('a repeat of the same pair adds a signal in a new six-hour bucket but not a new pair; a second pair does', async () => {
+    discover([A]);
+    await POST(request('POST', credential));
+    assert.deepEqual([outcome().newSignals, outcome().pairs24h, outcome().newPairs], [1, 1, 1]);
+
+    clock.advance(15 * 60_000);
+    await POST(request('POST', credential));
+    assert.deepEqual([outcome().newSignals, outcome().pairs24h, outcome().newPairs], [0, 1, 0], 'same bucket: no signal, no pair');
+
+    clock.advance(6 * 3600_000);
+    await POST(request('POST', credential));
+    assert.deepEqual([outcome().newSignals, outcome().pairs24h, outcome().newPairs], [1, 1, 0], 'new bucket: a new SIGNAL, but the same PAIR');
+
+    discover([A, B]);
+    clock.advance(15 * 60_000);
+    await POST(request('POST', credential));
+    assert.deepEqual([outcome().pairs24h, outcome().newPairs], [2, 1]);
+  });
+
+  test('the window is a rolling 24 hours: pairs last seen more than 24 hours ago no longer count', async () => {
+    discover([A, B]);
+    await POST(request('POST', credential));
+    assert.equal(outcome().pairs24h, 2);
+    clock.advance(25 * 3600_000);
+    discover([A]);
+    await POST(request('POST', credential));
+    assert.deepEqual([outcome().pairs24h, outcome().newPairs], [1, 1], 'A counts as new again: its last signal is outside the window');
+  });
+
+  test('the daily GET reports the same metric; busy and provider_unavailable report none', async () => {
+    discover([A]);
+    await GET(request('GET', { authorization: 'Bearer bearer-secret' }));
+    assert.deepEqual([outcome().mode, outcome().pairs24h, outcome().newPairs], ['daily', 1, 1]);
+    d1.sqlite.prepare('INSERT INTO research_locks (id, owner, expires) VALUES (?, ?, ?)').run('goldmine:scan', 'other', Date.now() + 30000);
+    await POST(request('POST', credential));
+    assert.equal(outcome().status, 'busy');
+    assert.equal('pairs24h' in outcome(), false);
+    d1.sqlite.prepare('DELETE FROM research_locks').run();
+    clock.advance(5 * 60_000); // past lib/market.ts's discovery cache, so the outage is actually seen
+    installFetch(() => { throw new Error('network down'); });
+    await POST(request('POST', credential));
+    assert.equal(outcome().status, 'provider_unavailable');
+    assert.equal('pairs24h' in outcome(), false);
+  });
+
+  test('a failed metric query never changes the scan: it is logged as null with a warn record', async () => {
+    discover([A]);
+    d1.beforeQuery = sql => { if (sql.includes('GROUP BY pair, address')) throw new Error('D1_ERROR: metric read failed'); };
+    const response = await POST(request('POST', credential));
+    d1.beforeQuery = null;
+    assert.equal(response.status, 200);
+    assert.equal((await body(response)).status, 'checked');
+    assert.deepEqual([outcome().pairs24h, outcome().newPairs], [null, null]);
+    assert.deepEqual(failures.map(f => [f.operation, f.level]), [['pair-metrics', 'warn']]);
+  });
+});
+
 // installFetch fully replaces global fetch, so discovery/outcome/RugCheck all need re-declaring together
 // whenever a test wants to vary just one of them (here, RugCheck's response).
 function installProviders(rugcheck) {

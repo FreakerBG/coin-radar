@@ -26,7 +26,9 @@ after(async () => { await Promise.all(running.map(mf => mf.dispose())); });
 
 // Runs one scheduled event against `respond` (the mock origin). Returns the event result, every outbound
 // request the Worker made, and everything the runtime wrote to stdout/stderr.
-async function runScheduled(respond, bindings = {SCAN_ENABLED: 'true', GOLDMINE_CRON_SECRET: CRON_SECRET, VERCEL_BYPASS_SECRET: BYPASS_SECRET}) {
+const ENABLED = () => ({SCAN_ENABLED: 'true', SCAN_UNTIL: new Date(Date.now() + 3600_000).toISOString(), GOLDMINE_CRON_SECRET: CRON_SECRET, VERCEL_BYPASS_SECRET: BYPASS_SECRET});
+
+async function runScheduled(respond, bindings = ENABLED()) {
   const requests = [];
   let output = '';
   const mf = new Miniflare({
@@ -106,5 +108,12 @@ describe('scheduler Worker enabled path in workerd', () => {
     assert.equal(result.outcome, 'ok');
     assert.equal(requests.length, 0);
     assert.equal(record.status, 'disabled');
+  });
+  test('an enabled Worker past its SCAN_UNTIL deadline sends nothing and logs expired (a Cloudflare-side hard stop for any ramp)', async () => {
+    const {result, requests, record, output} = await runScheduled(() => { throw new Error('must not be called'); }, {...ENABLED(), SCAN_UNTIL: new Date(Date.now() - 60_000).toISOString()});
+    assert.equal(result.outcome, 'ok');
+    assert.equal(requests.length, 0);
+    assert.equal(record.status, 'expired');
+    noSecrets(output);
   });
 });

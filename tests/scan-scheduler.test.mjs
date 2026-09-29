@@ -6,11 +6,12 @@ import {test} from 'node:test';
 import './helpers/harness.mjs'; // registers the extensionless-import loader the Worker's './scan' import needs
 
 const {default: worker} = await import('../scheduler/worker.ts');
-const {handleScheduled, runScheduledScan, REQUEST_TIMEOUT_MS, SCAN_ENDPOINT} = await import('../scheduler/scan.ts');
+const {handleScheduled, runScheduledScan, REQUEST_TIMEOUT_MS, SCAN_ENDPOINT, MAX_SCAN_WINDOW_MS} = await import('../scheduler/scan.ts');
 
 const secret = 'unit-test-secret';
 const bypass = 'unitTestBypassSecret0123456789ab';
-const enabled = {SCAN_ENABLED: 'true', GOLDMINE_CRON_SECRET: secret, VERCEL_BYPASS_SECRET: bypass};
+const inAnHour = () => new Date(Date.now() + 3600_000).toISOString();
+const enabled = {SCAN_ENABLED: 'true', SCAN_UNTIL: inAnHour(), GOLDMINE_CRON_SECRET: secret, VERCEL_BYPASS_SECRET: bypass};
 const controller = (noRetry = () => {}) => ({cron: '*/15 * * * *', scheduledTime: 1_790_000_000_000, noRetry});
 
 function captureLogs(fn) {
@@ -27,6 +28,29 @@ test('inert by default, even with both secrets', async () => {
   assert.deepEqual(await runScheduledScan({...enabled, SCAN_ENABLED: 'TRUE'}, fetcher), {status: 'disabled'});
   assert.deepEqual(await runScheduledScan({...enabled, SCAN_ENABLED: 'false'}, fetcher), {status: 'disabled'});
   assert.equal(calls, 0);
+});
+
+test('SCAN_UNTIL is a hard, Worker-side end: enabled without a valid deadline, or past it, sends nothing', async () => {
+  let calls = 0;
+  const fetcher = async () => { calls++; throw new Error('Unexpected request'); };
+  const now = Date.now();
+  for (const SCAN_UNTIL of [undefined, '', 'tomorrow', '2026-09-30', '2026-09-30T10:00:00+03:00', new Date(now + MAX_SCAN_WINDOW_MS + 60_000).toISOString()]) {
+    assert.deepEqual(await runScheduledScan({...enabled, SCAN_UNTIL}, fetcher), {status: 'disabled'}, String(SCAN_UNTIL));
+  }
+  assert.deepEqual(await runScheduledScan({...enabled, SCAN_UNTIL: new Date(now - 1000).toISOString()}, fetcher), {status: 'expired'});
+  // Exactly at the deadline is already expired.
+  const at = now + 5000;
+  assert.deepEqual(await runScheduledScan({...enabled, SCAN_UNTIL: new Date(at).toISOString()}, fetcher, () => at), {status: 'expired'});
+  assert.equal(calls, 0);
+  // Just inside the window, the request is made.
+  let made = 0;
+  await runScheduledScan({...enabled, SCAN_UNTIL: new Date(now + MAX_SCAN_WINDOW_MS - 60_000).toISOString()}, async () => { made++; return Response.json({status: 'busy'}); });
+  assert.equal(made, 1);
+});
+
+test('the shipped config never sets SCAN_UNTIL, so the committed Worker cannot be armed by a leftover deadline', () => {
+  const config = JSON.parse(readFileSync(new URL('../scheduler/wrangler.jsonc', import.meta.url), 'utf8').replace(/^\s*\/\/.*$/gm, ''));
+  assert.equal('SCAN_UNTIL' in config.vars, false);
 });
 
 test('the shipped wrangler config has no cron trigger, SCAN_ENABLED "false", no workers.dev or preview URL', () => {
@@ -70,7 +94,7 @@ test('one request to the fixed HTTPS endpoint, with both secret headers, no redi
 
 test('a checked response is summarized as counts and enums only; addresses and provider text are dropped', async () => {
   let t = 1000;
-  const summary = await runScheduledScan(enabled, async () => Response.json({
+  const summary = await runScheduledScan({...enabled, SCAN_UNTIL: '1970-01-01T01:00:00Z'}, async () => Response.json({
     status: 'checked', candidates: [{address: 'SecretMintAddress111', snapshot: {symbol: 'X'}}], opportunities: 1,
     tracking: {newSignals: 1, outcomes: null}, alerts: {queued: 1, delivery: 'not_configured'},
     safety: {eligible: 1, verified: 1, unsafe: 0, unavailable: 0, requests: 1, cacheHits: 0, rateLimited: false, cooldown: 'none', unchecked: 0},
