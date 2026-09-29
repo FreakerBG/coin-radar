@@ -32,7 +32,39 @@ export const BACKTEST_LIMITATIONS = [
   'Evidence sufficiency is judged per threshold/horizon cell, from the actual observed returns used in that cell\'s distribution, not from how many signals were evaluated: descriptiveOnly stays true unless every reported, evaluable cell (one with at least one eligible signal) individually meets the observed-return requirement - one strong cell can never make the whole result read as validated.',
   'Samples are not statistically independent: the same token can be recorded again in a later scan, and one signal contributes to every one of its horizon buckets at once (three overlapping buckets under the active schedule, four under the legacy one). Treat every mean, median and stdev here as descriptive of this recorded history, not as an estimate from independent trials - and treat any mean computed from a single observed return (n=1) as a single data point, not a statistic.',
   'History is read newest-first and bounded per request; if `truncated` is true, only the most recently detected signals within that bound are reflected below, not the full stored history. Rows or outcomes that fail structural validation are excluded and counted (skippedMalformedRows/skippedMalformedOutcomes), never guessed at or silently folded into any status.',
+  'The report states the exact detection-time window it covers (`coverage`): the oldest and newest analyzed signal, how many of the stored signals were read, and whether every signal from the last 30 days - the research target - is included. A bounded read that reaches back less than 30 days says so; it is never described as 30 days or as all history.',
 ];
+
+// The research-window target (docs/detection-rollout-decisions.md). A target, not a guarantee: coverage
+// below says whether this particular read actually reached it.
+export const RESEARCH_TARGET_DAYS = 30;
+const DAY_MS = 24 * 3600000;
+
+export type ReportCoverage = {
+  signalsAnalyzed: number;
+  storedSignals: number;          // all stored rows, from an independent COUNT (readSignalTotals)
+  truncated: boolean;
+  oldestAnalyzedAt: number | null;
+  newestAnalyzedAt: number | null;
+  targetWindowDays: number;
+  // True only when every stored signal detected in the last targetWindowDays was read: either nothing was
+  // cut off, or the oldest row read is itself at least that old. A young history that was read in full is
+  // covered even though it spans fewer days; the span is reported separately so nobody reads it as 30 days.
+  targetWindowFullyAnalyzed: boolean;
+};
+
+export function reportCoverage(signals: StoredSignalRow[], storedSignals: number, truncated: boolean, now: number): ReportCoverage {
+  let oldest: number | null = null, newest: number | null = null;
+  for (const signal of signals) {
+    if (oldest === null || signal.detectedAt < oldest) oldest = signal.detectedAt;
+    if (newest === null || signal.detectedAt > newest) newest = signal.detectedAt;
+  }
+  return {
+    signalsAnalyzed: signals.length, storedSignals, truncated, oldestAnalyzedAt: oldest, newestAnalyzedAt: newest,
+    targetWindowDays: RESEARCH_TARGET_DAYS,
+    targetWindowFullyAnalyzed: !truncated || (oldest !== null && oldest <= now - RESEARCH_TARGET_DAYS * DAY_MS),
+  };
+}
 
 // --- Historical replay ------------------------------------------------------------------------------
 

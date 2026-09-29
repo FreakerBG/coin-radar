@@ -4,7 +4,7 @@ import {Gem,RefreshCw,ShieldCheck,ShieldAlert,ArrowUpRight,Radio,History} from '
 import {toast} from 'sonner';
 import {axiomTokenUrl} from '@/lib/axiom';
 import {isStale,latestBatchCountsLabel,latestBatchStalenessNote,latestBatchStatesLabel,opportunitiesOf,scanState,type LatestBatch,type PostedCandidate} from '@/lib/goldmine/dashboard-view';
-import {allHistoryOpportunityLabel,cadenceSummary,cellStatusLabel,coverageLabel,dataQualityWarning,denominatorNote,hasDataQualityWarning,hasEnoughData,horizonLabel,horizonScheduleNote,legacyHorizonWarning,observedAfterLabel,performanceRowsWithData,signalsSummaryLabel,type BacktestReport} from '@/lib/goldmine/backtest-view';
+import {allHistoryOpportunityLabel,cadenceSummary,coverageWindowLabel,cellStatusLabel,coverageLabel,dataQualityWarning,denominatorNote,hasDataQualityWarning,hasEnoughData,horizonLabel,horizonScheduleNote,legacyHorizonWarning,observedAfterLabel,performanceRowsWithData,signalsSummaryLabel,type BacktestReport} from '@/lib/goldmine/backtest-view';
 import type {ContractSafetySummary} from '@/lib/goldmine/snapshot';
 
 type ScanResponse = {
@@ -130,6 +130,9 @@ function BacktestingSection({report, error, onRetry}: {report: BacktestReport | 
           leave exactly the wrong impression in exactly the case where it matters most. */}
       {!error && report && (
         <>
+          {coverageWindowLabel(report.coverage) && (
+            <p className="muted" data-testid="backtest-coverage" style={{fontSize: 12, margin: '16px 22px 0'}}>{coverageWindowLabel(report.coverage)}</p>
+          )}
           <p className="muted" style={{fontSize: 12, margin: '16px 22px 0'}}>{cadenceSummary(report.cadence)}</p>
           {legacyHorizonWarning(report.cadence) && (
             <div className="banner" role="status" style={{margin: '10px 22px 0'}}>{legacyHorizonWarning(report.cadence)}</div>
