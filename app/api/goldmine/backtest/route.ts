@@ -7,7 +7,7 @@ import {db} from '@/lib/research-db';
 import {DISCLAIMER, MODEL_VERSION} from '@/lib/goldmine/score';
 import {cadenceReport, EVALUATION_SCHEDULE_VERSION} from '@/lib/goldmine/cadence';
 import {readAllSignalsWithOutcomes, readSignalTotals} from '@/lib/goldmine/signals';
-import {BACKTEST_LIMITATIONS, calibrationSweep, defaultCutoff, denominatorSplit, performanceReport, replayAll} from '@/lib/goldmine/backtest';
+import {BACKTEST_LIMITATIONS, calibrationSweep, defaultCutoff, denominatorSplit, performanceReport, replayAll, reportCoverage} from '@/lib/goldmine/backtest';
 
 const noStore = {'Cache-Control': 'no-store'};
 
@@ -52,6 +52,9 @@ export async function GET() {
       skippedMalformedRows: skippedMalformedSignals,
       skippedMalformedOutcomes,
       truncated,
+      // The detection-time window this report actually covers, and whether it reaches the 30-day research
+      // target. A bounded read is never described as 30 days or as all history.
+      coverage: reportCoverage(signals, totals.signals, truncated, now),
       replay: {
         currentVersionSignals: replay.currentVersionSignals,
         matched: replay.matched,
