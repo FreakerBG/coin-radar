@@ -46,3 +46,4 @@ next-env.d.ts
 /work/
 /test-results/
 /playwright-report/
+scheduler/.wrangler/
