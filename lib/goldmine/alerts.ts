@@ -59,22 +59,26 @@ export async function recordAlertEligibility(database: D1Database, scored: Score
       // deliberately not the signal id alone: a genuine transition can land in the same six-hour bucket as
       // the mint's earlier alert and must still get its own row. Duplicate *runs* are stopped by the NOT
       // EXISTS policy below, which is one atomic statement.
-      const result = await database.prepare(`INSERT INTO goldmine_alert_outbox (id, address, signal_id, model_version, reason, created_at)
-SELECT ?1, ?2, ?3, ?4,
-  CASE WHEN NOT EXISTS (SELECT 1 FROM goldmine_alert_outbox WHERE address = ?2) THEN 'first'
-       WHEN NOT EXISTS (SELECT 1 FROM goldmine_alert_outbox WHERE address = ?2 AND created_at > ?5 - ?6) THEN 'window'
+      // Plain positional parameters only (a CTE names them): numbered ?NNN parameters are not bound the same
+      // way by every SQLite driver in use (Node 22's node:sqlite rejects them), and D1/libSQL need no more.
+      const result = await database.prepare(`WITH p AS (SELECT ? AS id, ? AS address, ? AS signal_id, ? AS model_version, ? AS t, ? AS since)
+INSERT INTO goldmine_alert_outbox (id, address, signal_id, model_version, reason, created_at)
+SELECT p.id, p.address, p.signal_id, p.model_version,
+  CASE WHEN NOT EXISTS (SELECT 1 FROM goldmine_alert_outbox o WHERE o.address = p.address) THEN 'first'
+       WHEN NOT EXISTS (SELECT 1 FROM goldmine_alert_outbox o WHERE o.address = p.address AND o.created_at > p.since) THEN 'window'
        ELSE 'transition' END,
-  ?5
-WHERE NOT EXISTS (SELECT 1 FROM goldmine_alert_outbox WHERE address = ?2 AND created_at > ?5 - ?6)
-   OR (EXISTS (SELECT 1 FROM goldmine_alert_state st WHERE st.address = ?2
+  p.t
+FROM p
+WHERE NOT EXISTS (SELECT 1 FROM goldmine_alert_outbox o WHERE o.address = p.address AND o.created_at > p.since)
+   OR (EXISTS (SELECT 1 FROM goldmine_alert_state st WHERE st.address = p.address
                AND st.last_genuine_nonqualifying_at IS NOT NULL
                AND st.last_genuine_nonqualifying_at > COALESCE(st.last_qualifying_at, 0)
-               AND st.last_genuine_nonqualifying_at > (SELECT MAX(created_at) FROM goldmine_alert_outbox WHERE address = ?2))
-       AND NOT EXISTS (SELECT 1 FROM goldmine_alert_outbox WHERE address = ?2 AND reason = 'transition' AND created_at > ?5 - ?6))
-ON CONFLICT(id) DO NOTHING`).bind(`alert:${signal}:${detectedAt}`, assessment.address, signal, assessment.modelVersion, detectedAt, ALERT_WINDOW_MS).run();
+               AND st.last_genuine_nonqualifying_at > (SELECT MAX(o.created_at) FROM goldmine_alert_outbox o WHERE o.address = p.address))
+       AND NOT EXISTS (SELECT 1 FROM goldmine_alert_outbox o WHERE o.address = p.address AND o.reason = 'transition' AND o.created_at > p.since))
+ON CONFLICT(id) DO NOTHING`).bind(`alert:${signal}:${detectedAt}`, assessment.address, signal, assessment.modelVersion, detectedAt, detectedAt - ALERT_WINDOW_MS).run();
       queued += result.meta.changes ?? 0;
     }
-    await database.prepare(`INSERT INTO goldmine_alert_state (address, last_qualifying_at, last_genuine_nonqualifying_at, updated_at) VALUES (?1, ?2, ?3, ?4)
+    await database.prepare(`INSERT INTO goldmine_alert_state (address, last_qualifying_at, last_genuine_nonqualifying_at, updated_at) VALUES (?, ?, ?, ?)
 ON CONFLICT(address) DO UPDATE SET
   last_qualifying_at = CASE WHEN excluded.last_qualifying_at IS NULL THEN last_qualifying_at ELSE MAX(COALESCE(last_qualifying_at, 0), excluded.last_qualifying_at) END,
   last_genuine_nonqualifying_at = CASE WHEN excluded.last_genuine_nonqualifying_at IS NULL THEN last_genuine_nonqualifying_at ELSE MAX(COALESCE(last_genuine_nonqualifying_at, 0), excluded.last_genuine_nonqualifying_at) END,
@@ -89,11 +93,11 @@ export type QueuedAlert = {id: string; address: string; signalId: string; modelV
 export async function claimNextAlert(database: D1Database, now: number, leaseMs = ALERT_LEASE_MS): Promise<QueuedAlert | null> {
   await database.prepare("UPDATE goldmine_alert_outbox SET status = 'expired', lease_owner = NULL, lease_expires = NULL WHERE status = 'pending' AND created_at < ?").bind(now - ALERT_MAX_AGE_MS).run();
   const owner = crypto.randomUUID();
-  const row = await database.prepare(`UPDATE goldmine_alert_outbox SET lease_owner = ?1, lease_expires = ?2 + ?3
-    WHERE id = (SELECT id FROM goldmine_alert_outbox WHERE status = 'pending' AND next_attempt_at <= ?2 AND (lease_expires IS NULL OR lease_expires < ?2) ORDER BY created_at, id LIMIT 1)
-      AND status = 'pending' AND (lease_expires IS NULL OR lease_expires < ?2)
+  const row = await database.prepare(`UPDATE goldmine_alert_outbox SET lease_owner = ?, lease_expires = ?
+    WHERE id = (SELECT id FROM goldmine_alert_outbox WHERE status = 'pending' AND next_attempt_at <= ? AND (lease_expires IS NULL OR lease_expires < ?) ORDER BY created_at, id LIMIT 1)
+      AND status = 'pending' AND (lease_expires IS NULL OR lease_expires < ?)
     RETURNING id, address, signal_id, model_version, reason, created_at, attempts`)
-    .bind(owner, now, leaseMs).first<{id: string; address: string; signal_id: string; model_version: string; reason: string; created_at: number; attempts: number}>();
+    .bind(owner, now + leaseMs, now, now, now).first<{id: string; address: string; signal_id: string; model_version: string; reason: string; created_at: number; attempts: number}>();
   return row ? {id: row.id, address: row.address, signalId: row.signal_id, modelVersion: row.model_version, reason: row.reason, createdAt: row.created_at, attempts: row.attempts, owner} : null;
 }
 
