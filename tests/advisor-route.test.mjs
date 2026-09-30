@@ -117,3 +117,29 @@ test('cached X evidence and usage have no influence on allocation', async () => 
   assert.equal(d1.queries.some(sql => /social_/.test(sql)), false, 'social tables are never read');
   assert.equal(calls.some(call => new URL(call.url).hostname.endsWith('x.com')), false);
 });
+
+// A Goldmine handoff names the exact pool. Its evidence must come from that pool only: the position it may
+// lead to is monitored on that pool, so sizing it on a deeper sibling pool would describe another market.
+test('an exact pool parameter selects that pool, even when a sibling pool is deeper', async () => {
+  reply = () => Response.json([
+    pool({pairAddress: addresses.pairA, liquidity: {usd: 40000}}),
+    pool({pairAddress: addresses.pairA2, liquidity: {usd: 250000}}),
+  ]);
+  const data = await body(await GET(jsonRequest(`/api/advisor?address=${TOKEN}&pair=${addresses.pairA}`)));
+  assert.deepEqual([data.coin.address, data.coin.pair, data.coin.liquidity], [TOKEN, addresses.pairA, 40000]);
+});
+
+test('an exact pool the provider did not return yields no evidence, never a substitute pool', async () => {
+  reply = () => Response.json([pool({pairAddress: addresses.pairA2, liquidity: {usd: 250000}})]);
+  const data = await body(await GET(jsonRequest(`/api/advisor?address=${TOKEN}&pair=${addresses.pairA}`)));
+  assert.deepEqual([data.coin, data.allocation.amount, data.allocation.status], [null, 0, 'No selection']);
+});
+
+test('an invalid pool parameter is rejected before any provider call', async () => {
+  for (const pair of ['', 'short', '0OIl0OIl0OIl0OIl0OIl0OIl0OIl0OIl0OIl', addresses.pairA + '/../x', addresses.pairA + '&address=x']) {
+    const response = await GET(jsonRequest(`/api/advisor?address=${TOKEN}&pair=${encodeURIComponent(pair)}`));
+    assert.equal(response.status, 400, pair);
+    assert.deepEqual(await body(response), {error: 'Invalid pool address.'});
+  }
+  assert.equal(calls.length, 0);
+});

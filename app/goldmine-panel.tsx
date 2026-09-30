@@ -1,8 +1,10 @@
 'use client';
 import {useCallback,useEffect,useRef,useState} from 'react';
-import {Gem,RefreshCw,ShieldCheck,ShieldAlert,ArrowUpRight,Radio,History} from 'lucide-react';
+import {Gem,RefreshCw,ShieldCheck,ShieldAlert,Radio,History} from 'lucide-react';
 import {toast} from 'sonner';
-import {axiomTokenUrl} from '@/lib/axiom';
+import {goldmineTarget,type TradeTarget} from '@/lib/trade-handoff';
+import {fetchTracking,newOpportunitiesAnnouncement,refreshDue,trackNewOpportunities,TRACKING_REFRESH_MS} from '@/lib/goldmine/live-refresh';
+import TradeActions from './trade-actions';
 import {isStale,latestBatchCountsLabel,latestBatchStalenessNote,latestBatchStatesLabel,opportunitiesOf,scanState,type LatestBatch,type PostedCandidate} from '@/lib/goldmine/dashboard-view';
 import {allHistoryOpportunityLabel,cadenceSummary,coverageWindowLabel,cellStatusLabel,coverageLabel,dataQualityWarning,denominatorNote,hasDataQualityWarning,hasEnoughData,horizonLabel,horizonScheduleNote,legacyHorizonWarning,observedAfterLabel,performanceRowsWithData,signalsSummaryLabel,type BacktestReport} from '@/lib/goldmine/backtest-view';
 import type {ContractSafetySummary} from '@/lib/goldmine/snapshot';
@@ -33,7 +35,6 @@ type TrackedSignal = {
 type Tracking = {signals: TrackedSignal[]; latest?: LatestBatch | null; disclaimer?: string};
 
 const money = (n: number | null) => n === null ? '—' : new Intl.NumberFormat('en-US', {style: 'currency', currency: 'USD', maximumFractionDigits: n < 0.01 ? 9 : n < 1 ? 5 : 2}).format(n);
-const smallAddress = (a: string) => a.slice(0, 5) + '…' + a.slice(-5);
 const safetyEvidence = (candidate: PostedCandidate) => candidate.components.find(c => c.id === 'safety_risk')?.evidence[0] ?? '';
 
 // Accepts either the full POST-response ContractSafety or the reduced GET-tracking ContractSafetySummary:
@@ -44,17 +45,23 @@ function SafetyBadge({contractSafety}: {contractSafety: {status: 'unavailable' |
   return <span className="pill"><ShieldAlert size={13} /> Safety unchecked</span>;
 }
 
-function OpportunityCard({candidate}: {candidate: PostedCandidate}) {
-  const axiomUrl = axiomTokenUrl(candidate.address);
+// Only a signal whose mint and pool both validate can be handed to the Advisor: the position it may lead
+// to is monitored on exactly that pool.
+const planHandler = (signal: {address: string; pair: string; symbol: string; detectedAt: string | number}, onPlanTrade?: (target: TradeTarget) => void) => {
+  const target = goldmineTarget(signal);
+  return target && onPlanTrade ? () => onPlanTrade(target) : undefined;
+};
+
+function OpportunityCard({candidate, onPlanTrade}: {candidate: PostedCandidate; onPlanTrade?: (target: TradeTarget) => void}) {
   return (
     <div className="feed-item" key={candidate.address}>
       <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 10}}>
         <div>
           <strong>{candidate.symbol.slice(0, 14)}</strong>
-          <small className="muted mono" style={{display: 'block', marginTop: 4}} title={candidate.address}>{smallAddress(candidate.address)}</small>
+          <small className="muted" style={{display: 'block', marginTop: 4}}>Opportunity signal · not a trade instruction</small>
         </div>
         <div style={{textAlign: 'right'}}>
-          <span className="mono">{money(candidate.priceUsd)}</span>
+          <span className="mono" title="Provider price when scanned, not an executable quote">{money(candidate.priceUsd)}</span>
           <small className="muted" style={{display: 'block'}}>{candidate.state} · {candidate.score}/100</small>
         </div>
       </div>
@@ -64,29 +71,10 @@ function OpportunityCard({candidate}: {candidate: PostedCandidate}) {
         {candidate.snapshot.promoted && <span className="tag" title="Paid DEX Screener promotion">AD</span>}
       </div>
       {safetyEvidence(candidate) && <p className="muted" style={{fontSize: 12, marginTop: 8}}>{safetyEvidence(candidate)}</p>}
-      <div style={{display: 'flex', flexWrap: 'wrap', gap: 12, alignItems: 'center'}}>
-        {axiomUrl && <a className="source-link" href={axiomUrl} target="_blank" rel="noopener noreferrer">Review in Axiom <ArrowUpRight size={13} /></a>}
-        <a className="source-link" href={`https://phantom.com/tokens/solana/${candidate.address}`} target="_blank" rel="noopener noreferrer">Open in Phantom <ArrowUpRight size={13} /></a>
-        <button className="source-link" type="button" onClick={() => navigator.clipboard.writeText(candidate.address).then(() => toast.success('Contract address copied')).catch(() => toast.error('Could not copy. Select the address manually.'))}>Copy contract address</button>
-        <a className="source-link" href={`https://dexscreener.com/solana/${candidate.pair}`} target="_blank" rel="noopener noreferrer">Pool data & chart <ArrowUpRight size={13} /></a>
-      </div>
-      <small className="muted" style={{display: 'block', marginTop: 6}}>Confirm the contract and current price in Axiom before placing an order. If the token page does not open, paste the copied address into Axiom search.</small>
+      <TradeActions mint={candidate.address} pool={candidate.pair} symbol={candidate.symbol} evidenceAt={candidate.observedAt}
+        onPlan={planHandler({...candidate, detectedAt: candidate.observedAt}, onPlanTrade)} />
     </div>
   );
-}
-
-// Fetches the recorded signal history. A plain function, not a hook: both the mount effect and the
-// retry button call it and set state themselves, so state updates always happen in an event/callback,
-// never synchronously in an effect body.
-async function fetchTracking(): Promise<Tracking | {error: string}> {
-  try {
-    const r = await fetch('/api/goldmine');
-    const d = await r.json() as Tracking & {error?: string};
-    if (!r.ok || d.error) return {error: d.error || 'Signal history unavailable.'};
-    return d;
-  } catch {
-    return {error: 'Cannot reach Goldmine. Check your connection and retry.'};
-  }
 }
 
 // Fetches the read-only backtesting/calibration report. Same plain-function pattern as fetchTracking:
@@ -236,9 +224,17 @@ function BacktestingSection({report, error, onRetry}: {report: BacktestReport | 
   );
 }
 
-export default function GoldminePanel() {
+export default function GoldminePanel({onPlanTrade}: {onPlanTrade?: (target: TradeTarget) => void}) {
   const [tracking, setTracking] = useState<Tracking | null>(null);
   const [historyError, setHistoryError] = useState('');
+  // Read-only refresh bookkeeping (lib/goldmine/live-refresh.ts). `lastAttempt` paces the automatic
+  // reads, success or not, so a failing read is retried at the refresh interval, never in a tight loop.
+  const [lastUpdated, setLastUpdated] = useState<number | null>(null);
+  const [refreshing, setRefreshing] = useState(false);
+  const [newIds, setNewIds] = useState<ReadonlySet<string>>(() => new Set());
+  const [announcement, setAnnouncement] = useState('');
+  const lastAttempt = useRef<number | null>(null);
+  const seenOpportunities = useRef<Set<string> | null>(null);
   const [scan, setScan] = useState<ScanResponse | null>(null);
   const [scanError, setScanError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -255,12 +251,31 @@ export default function GoldminePanel() {
 
   const applyTracking = useCallback((id: number, result: Tracking | {error: string}) => {
     if (id !== historyId.current) return;
+    setRefreshing(false);
     if ('error' in result) { setHistoryError(result.error); return; }
     setTracking(result);
     setHistoryError('');
+    setLastUpdated(Date.now());
+    const {seen, fresh} = trackNewOpportunities(seenOpportunities.current, result.signals ?? []);
+    seenOpportunities.current = seen;
+    if (fresh.length) {
+      setNewIds(old => new Set([...old, ...fresh]));
+      setAnnouncement(newOpportunitiesAnnouncement(fresh.length));
+    }
   }, []);
-  const retryHistory = useCallback(() => { const id = ++historyId.current; void fetchTracking().then(result => applyTracking(id, result)); }, [applyTracking]);
-  useEffect(() => { const id = ++historyId.current; void fetchTracking().then(result => applyTracking(id, result)); }, [applyTracking]);
+  // Every path here is GET /api/goldmine only. Neither the timer nor the button can start a scan.
+  const loadHistory = useCallback((id: number) => {
+    lastAttempt.current = Date.now();
+    void fetchTracking<Tracking>().then(result => applyTracking(id, result));
+  }, [applyTracking]);
+  const retryHistory = useCallback(() => { setRefreshing(true); loadHistory(++historyId.current); }, [loadHistory]);
+  useEffect(() => { loadHistory(++historyId.current); }, [loadHistory]);
+  useEffect(() => {
+    const tick = () => { if (refreshDue(lastAttempt.current, Date.now(), document.visibilityState === 'visible')) retryHistory(); };
+    const timer = setInterval(tick, 30000);
+    document.addEventListener('visibilitychange', tick);
+    return () => { clearInterval(timer); document.removeEventListener('visibilitychange', tick); };
+  }, [retryHistory]);
 
   const applyBacktest = useCallback((id: number, result: BacktestReport | {error: string}) => {
     if (id !== backtestId.current) return;
@@ -354,7 +369,7 @@ export default function GoldminePanel() {
         </div>
       )}
       <div className="feed">
-        {status === 'opportunities' && opportunities.map(candidate => <OpportunityCard candidate={candidate} key={candidate.address} />)}
+        {status === 'opportunities' && opportunities.map(candidate => <OpportunityCard candidate={candidate} onPlanTrade={onPlanTrade} key={candidate.address} />)}
         {status === 'idle' && <div className="empty"><Gem size={30} /><h3>Scan for opportunities</h3><span>Run a scan to see verified candidates.</span></div>}
         {status === 'empty' && <div className="empty"><Gem size={30} /><h3>No opportunities right now</h3><span>Every scanned candidate is missing a hard gate or verified safety evidence. Try again after the market moves.</span></div>}
         {status === 'busy' && <div className="empty"><Gem size={30} /><h3>Scan already running</h3><span>Only one scan runs at a time. Try again in a moment.</span></div>}
@@ -365,6 +380,21 @@ export default function GoldminePanel() {
       <div className="panel-head" style={{marginTop: 0}}>
         <h2 style={{margin: 0}}>Recent opportunities</h2>
         <span className="muted" style={{fontSize: 13}}>Recorded at detection · outcomes observed at the first daily scan at or after each 1-day, 3-day and 7-day target</span>
+      </div>
+      {/* Reads what the scheduled or manual scans already recorded. Never scans: that is "Scan now" above. */}
+      <div className="refresh-line">
+        <History size={12} />
+        <span data-testid="history-last-updated">
+          {lastUpdated
+            ? <>List updated <time dateTime={new Date(lastUpdated).toISOString()}>{new Date(lastUpdated).toLocaleTimeString()}</time></>
+            : 'Loading recorded opportunities…'}
+          {' '}· rechecks every {TRACKING_REFRESH_MS / 60000} min while this tab is visible · read-only, never runs a scan
+        </span>
+        <button type="button" className="btn" style={{padding: '6px 10px', fontSize: 12}} onClick={retryHistory} disabled={refreshing}
+          aria-label="Refresh list of recorded opportunities (read-only, does not run a scan)">
+          <RefreshCw size={13} className={refreshing ? 'loading-icon' : ''} /> Refresh list
+        </button>
+        <span className="muted" role="status" aria-live="polite" aria-atomic="true">{announcement}</span>
       </div>
       {historyError && (
         <div className="banner" role="alert" style={{margin: '16px 22px 0'}}>
@@ -378,7 +408,8 @@ export default function GoldminePanel() {
             <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 10}}>
               <div>
                 <strong>{signal.symbol.slice(0, 14)}</strong>
-                <small className="muted" style={{display: 'block', marginTop: 4}}>{new Date(signal.detectedAt).toLocaleString()}</small>
+                {newIds.has(signal.id) && <span className="new-pill">New since this page loaded</span>}
+                <small className="muted" style={{display: 'block', marginTop: 4}}>Recorded {new Date(signal.detectedAt).toLocaleString()} · research signal, not a trade instruction</small>
               </div>
               <SafetyBadge contractSafety={signal.contractSafety} />
             </div>
@@ -395,12 +426,8 @@ export default function GoldminePanel() {
                 </span>
               ))}
             </div>
-            <div style={{display: 'flex', flexWrap: 'wrap', gap: 12, alignItems: 'center'}}>
-              {axiomTokenUrl(signal.address) && <a className="source-link" href={axiomTokenUrl(signal.address)!} target="_blank" rel="noopener noreferrer">Review in Axiom <ArrowUpRight size={13} /></a>}
-              <a className="source-link" href={`https://phantom.com/tokens/solana/${signal.address}`} target="_blank" rel="noopener noreferrer">Open in Phantom <ArrowUpRight size={13} /></a>
-              <button className="source-link" type="button" onClick={() => navigator.clipboard.writeText(signal.address).then(() => toast.success('Contract address copied')).catch(() => toast.error('Could not copy. Select the address manually.'))}>Copy contract address</button>
-              <a className="source-link" href={`https://dexscreener.com/solana/${signal.pair}`} target="_blank" rel="noopener noreferrer">Pool data & chart <ArrowUpRight size={13} /></a>
-            </div>
+            <TradeActions mint={signal.address} pool={signal.pair} symbol={signal.symbol} evidenceAt={signal.detectedAt}
+              onPlan={planHandler(signal, onPlanTrade)} />
           </div>
         ))}
         {/* Two genuinely different situations that used to render the same sentence, which is how a
