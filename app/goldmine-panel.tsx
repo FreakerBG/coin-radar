@@ -1,14 +1,17 @@
 'use client';
 import {useCallback,useEffect,useRef,useState} from 'react';
-import {Gem,RefreshCw,ShieldCheck,ShieldAlert,Radio,History} from 'lucide-react';
+import {Copy,ExternalLink,Gem,RefreshCw,ShieldCheck,ShieldAlert,Radio,History} from 'lucide-react';
 import {toast} from 'sonner';
 import {goldmineTarget,type TradeTarget} from '@/lib/trade-handoff';
 import {fetchTracking,newOpportunitiesAnnouncement,refreshDue,trackNewOpportunities,TRACKING_REFRESH_MS} from '@/lib/goldmine/live-refresh';
 import TradeActions from './trade-actions';
-import CandidateReview from './candidate-review';
+import CandidateEvidence from './candidate-evidence';
 import {isStale,latestBatchCountsLabel,latestBatchStalenessNote,latestBatchStatesLabel,opportunitiesOf,scanState,type LatestBatch,type PostedCandidate} from '@/lib/goldmine/dashboard-view';
 import {allHistoryOpportunityLabel,cadenceSummary,coverageWindowLabel,cellStatusLabel,coverageLabel,dataQualityWarning,denominatorNote,hasDataQualityWarning,hasEnoughData,horizonLabel,horizonScheduleNote,legacyHorizonWarning,observedAfterLabel,performanceRowsWithData,signalsSummaryLabel,type BacktestReport} from '@/lib/goldmine/backtest-view';
+import {NEAR_MISS_DISPLAY_LIMIT,nearMisses,RECENT_SIGNALS_READ} from '@/lib/goldmine/evidence-view';
+import type {ReviewEvidence} from '@/lib/goldmine/review-evidence';
 import type {ContractSafetySummary} from '@/lib/goldmine/snapshot';
+import {dexscreenerPoolUrl} from '@/lib/trade-links';
 
 type ScanResponse = {
   status: 'checked' | 'busy' | 'provider_unavailable';
@@ -22,8 +25,10 @@ type ScanResponse = {
   error?: string;
 };
 type TrackedSignal = {
-  id: string; address: string; pair: string; symbol: string; state: string; score: number; opportunity: boolean;
+  id: string; address: string; pair: string; symbol: string; modelVersion?: string; state: string; score: number; opportunity: boolean;
   detectedAt: string; detectedPrice: number; contractSafety: ContractSafetySummary;
+  // Null for REJECTED rows (never rendered as cards) and absent from an older API response.
+  reviewEvidence?: ReviewEvidence | null;
   assessment: {summary: string};
   // `state` is the derived outcome state as of the read (lib/goldmine/cadence.ts), which is what separates a
   // live pending outcome from one whose window has already closed. `observedAfterHours` is how long after
@@ -36,14 +41,14 @@ type TrackedSignal = {
 type Tracking = {signals: TrackedSignal[]; latest?: LatestBatch | null; disclaimer?: string};
 
 const money = (n: number | null) => n === null ? '—' : new Intl.NumberFormat('en-US', {style: 'currency', currency: 'USD', maximumFractionDigits: n < 0.01 ? 9 : n < 1 ? 5 : 2}).format(n);
-const safetyEvidence = (candidate: PostedCandidate) => candidate.components.find(c => c.id === 'safety_risk')?.evidence[0] ?? '';
-
 // Accepts either the full POST-response ContractSafety or the reduced GET-tracking ContractSafetySummary:
-// both carry `status`, which is all this badge ever reads.
+// both carry `status`, which is all this badge ever reads. The wording is scoped to what was actually
+// checked, and when: eight contract checks at one past moment, not a verdict on the token.
+const CHECKS_MET_TITLE = 'RugCheck facts met Coin Radar’s 8 contract checks when this signal was recorded. Not checked: transfer fees, mutable metadata and Token-2022 extension authorities. Recheck before trading.';
 function SafetyBadge({contractSafety}: {contractSafety: {status: 'unavailable' | 'unsafe' | 'verified'}}) {
-  if (contractSafety.status === 'verified') return <span className="pill" style={{borderColor: '#3f5a3a', color: '#b7ee82'}}><ShieldCheck size={13} /> RugCheck verified</span>;
+  if (contractSafety.status === 'verified') return <span className="pill" title={CHECKS_MET_TITLE} style={{borderColor: '#3f5a3a', color: '#b7ee82'}}><ShieldCheck size={13} /> Checks met at scan</span>;
   if (contractSafety.status === 'unsafe') return <span className="pill" style={{borderColor: '#4a3727', color: '#edc59b'}}><ShieldAlert size={13} /> Failed safety check</span>;
-  return <span className="pill"><ShieldAlert size={13} /> Safety unchecked</span>;
+  return <span className="pill"><ShieldAlert size={13} /> Safety not verified</span>;
 }
 
 // Only a signal whose mint and pool both validate can be handed to the Advisor: the position it may lead
@@ -53,7 +58,7 @@ const planHandler = (signal: {address: string; pair: string; symbol: string; det
   return target && onPlanTrade ? () => onPlanTrade(target) : undefined;
 };
 
-function OpportunityCard({candidate, onPlanTrade}: {candidate: PostedCandidate; onPlanTrade?: (target: TradeTarget) => void}) {
+function OpportunityCard({candidate, now, onPlanTrade}: {candidate: PostedCandidate; now: number; onPlanTrade?: (target: TradeTarget) => void}) {
   return (
     <div className="feed-item" key={candidate.address}>
       <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 10}}>
@@ -71,11 +76,60 @@ function OpportunityCard({candidate, onPlanTrade}: {candidate: PostedCandidate; 
         <SafetyBadge contractSafety={candidate.snapshot.contractSafety} />
         {candidate.snapshot.promoted && <span className="tag" title="Paid DEX Screener promotion">AD</span>}
       </div>
-      {safetyEvidence(candidate) && <p className="muted" style={{fontSize: 12, marginTop: 8}}>{safetyEvidence(candidate)}</p>}
-      <CandidateReview mint={candidate.address} safetyStatus={candidate.snapshot.contractSafety.status}/>
+      <CandidateEvidence evidence={candidate.reviewEvidence} mint={candidate.address} safetyStatus={candidate.snapshot.contractSafety.status} now={now}/>
       <TradeActions mint={candidate.address} pool={candidate.pair} symbol={candidate.symbol} evidenceAt={candidate.observedAt}
         onPlan={planHandler({...candidate, detectedAt: candidate.observedAt}, onPlanTrade)} />
     </div>
+  );
+}
+
+// Recent signals that cleared every hard gate but still missed one or more opportunity gates. Research
+// only: no trading-app or Advisor action is offered here, and every blocker is listed first.
+function NearMissList({signals, loaded, anyRecorded, now}: {signals: TrackedSignal[]; loaded: boolean; anyRecorded: boolean; now: number}) {
+  const all = nearMisses(signals);
+  const shown = all.slice(0, NEAR_MISS_DISPLAY_LIMIT);
+  const copy = (mint: string) => navigator.clipboard.writeText(mint)
+    .then(() => toast.success('Mint copied. Paste it into Axiom search to research it.'))
+    .catch(() => toast.error('Could not copy. Select the mint manually.'));
+  return (
+    <details className="near-miss-list" data-testid="near-miss-list">
+      <summary>
+        <span>Not trade-ready: recent signals that missed a gate ({all.length})</span>
+        <small className="muted">From the most recent {RECENT_SIGNALS_READ} recorded signals · current model · one per mint and pool{all.length > shown.length ? ` · showing ${shown.length} of ${all.length}` : ''}</small>
+      </summary>
+      <p className="muted near-miss-intro">These cleared the hard gates but were not opportunities. They are listed for research only. Each one still has at least one blocker below, and nothing here is a trade instruction.</p>
+      {!loaded && <p className="muted near-miss-intro">Loading recorded signals…</p>}
+      {loaded && !all.length && (
+        <div className="empty near-miss-empty"><h3>No near misses in the most recent {RECENT_SIGNALS_READ} recorded signals</h3>
+          <span>{signals.length
+            ? 'Every signal in that read was rejected by a hard gate, recorded under another model version, or already an opportunity. An empty list here is a result, not a missing scan.'
+            : anyRecorded
+              ? 'This read returned no recent signals to check.'
+              : 'Nothing has been recorded on this deployment yet.'}</span>
+        </div>
+      )}
+      <div className="feed">
+        {shown.map(signal => {
+          const pool = dexscreenerPoolUrl(signal.pair);
+          return (
+            <div className="feed-item near-miss-item" key={signal.id}>
+              <div style={{display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: 10}}>
+                <div>
+                  <strong>{signal.symbol.slice(0, 14)}</strong>
+                  <small className="muted" style={{display: 'block', marginTop: 4}}>Recorded {new Date(signal.detectedAt).toLocaleString()} · {signal.state} · {signal.score}/100 · not trade-ready</small>
+                </div>
+                <SafetyBadge contractSafety={signal.contractSafety} />
+              </div>
+              <CandidateEvidence evidence={signal.reviewEvidence} mint={signal.address} safetyStatus={signal.contractSafety.status} now={now}/>
+              <div className="near-miss-links">
+                <button type="button" className="btn" onClick={() => void copy(signal.address)} aria-label={`Copy mint for ${signal.symbol}`}><Copy size={14}/> Copy mint</button>
+                {pool && <a className="btn" href={pool} target="_blank" rel="noopener noreferrer">Pool data &amp; chart <ExternalLink size={14}/></a>}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </details>
   );
 }
 
@@ -324,12 +378,12 @@ export default function GoldminePanel({onPlanTrade}: {onPlanTrade?: (target: Tra
 
   const statusText: Record<typeof status, string> = {
     idle: 'No scan run yet this session.',
-    loading: 'Scanning the market for verified opportunities…',
+    loading: 'Scanning the market for candidates that meet every gate…',
     busy: 'Another scan is already running. Try again shortly.',
     unavailable: 'Market data provider is unavailable right now. No candidates were scored.',
     error: scanError || 'Goldmine scan failed.',
     empty: `Scanned ${scan?.candidates?.length ?? 0} candidate${scan?.candidates?.length === 1 ? '' : 's'}. None currently pass every safety and momentum gate.`,
-    opportunities: `${opportunities.length} verified opportunit${opportunities.length === 1 ? 'y' : 'ies'} found.`,
+    opportunities: `${opportunities.length} opportunit${opportunities.length === 1 ? 'y' : 'ies'} met every gate at scan.`,
   };
 
   return (
@@ -337,7 +391,7 @@ export default function GoldminePanel({onPlanTrade}: {onPlanTrade?: (target: Tra
       <div className="panel-head">
         <div>
           <h2 style={{margin: 0, display: 'flex', gap: 9, alignItems: 'center'}}><Gem size={17} />Goldmine</h2>
-          <p className="muted" style={{fontSize: 13, margin: '7px 0 0', maxWidth: 520}}>Momentum candidates whose contract safety RugCheck has verified. A screening heuristic, not a probability of profit - always your own research before acting.</p>
+          <p className="muted" style={{fontSize: 13, margin: '7px 0 0', maxWidth: 520}}>Momentum candidates whose recorded RugCheck facts met Coin Radar’s contract checks at scan time. A screening heuristic, not a probability of profit - always your own research before acting.</p>
         </div>
         <button className="btn btn-primary" onClick={() => void runScan()} disabled={loading}>
           <RefreshCw size={15} className={loading ? 'loading-icon' : ''} />
@@ -371,8 +425,8 @@ export default function GoldminePanel({onPlanTrade}: {onPlanTrade?: (target: Tra
         </div>
       )}
       <div className="feed">
-        {status === 'opportunities' && opportunities.map(candidate => <OpportunityCard candidate={candidate} onPlanTrade={onPlanTrade} key={candidate.address} />)}
-        {status === 'idle' && <div className="empty"><Gem size={30} /><h3>Scan for opportunities</h3><span>Run a scan to see verified candidates.</span></div>}
+        {status === 'opportunities' && opportunities.map(candidate => <OpportunityCard candidate={candidate} now={now} onPlanTrade={onPlanTrade} key={candidate.address} />)}
+        {status === 'idle' && <div className="empty"><Gem size={30} /><h3>Scan for opportunities</h3><span>Run a scan to see candidates that meet every gate.</span></div>}
         {status === 'empty' && <div className="empty"><Gem size={30} /><h3>No opportunities right now</h3><span>Every scanned candidate is missing a hard gate or verified safety evidence. Try again after the market moves.</span></div>}
         {status === 'busy' && <div className="empty"><Gem size={30} /><h3>Scan already running</h3><span>Only one scan runs at a time. Try again in a moment.</span></div>}
         {status === 'unavailable' && <div className="empty"><Gem size={30} /><h3>Provider unavailable</h3><span>Try again shortly.</span></div>}
@@ -428,7 +482,7 @@ export default function GoldminePanel({onPlanTrade}: {onPlanTrade?: (target: Tra
                 </span>
               ))}
             </div>
-            <CandidateReview mint={signal.address} safetyStatus={signal.contractSafety.status}/>
+            <CandidateEvidence evidence={signal.reviewEvidence} mint={signal.address} safetyStatus={signal.contractSafety.status} now={now}/>
             <TradeActions mint={signal.address} pool={signal.pair} symbol={signal.symbol} evidenceAt={signal.detectedAt}
               onPlan={planHandler(signal, onPlanTrade)} />
           </div>
@@ -440,10 +494,13 @@ export default function GoldminePanel({onPlanTrade}: {onPlanTrade?: (target: Tra
           <div className="empty"><Gem size={28} /><h3>No opportunities recorded yet</h3>
             <span>{latest
               ? 'Signals have been recorded, but none of the most recent 50 met every safety and momentum gate. That is a result, not a missing scan.'
-              : 'Verified opportunities from past scans, with their tracked outcomes, will appear here.'}</span>
+              : 'Opportunities from past scans, with their tracked outcomes, will appear here.'}</span>
           </div>
         )}
       </div>
+      {/* The same read-only GET result as the list above; no extra request. Hidden while that read is in
+          error, so a failed read never looks like "no near misses". */}
+      {!historyError && <NearMissList signals={tracking?.signals ?? []} loaded={tracking !== null} anyRecorded={Boolean(latest)} now={now} />}
       <div className="table-footer">
         {(scan?.disclaimer || tracking?.disclaimer) ?? 'Research signal from provider snapshots, not an executable price, a prediction or financial advice. No outcome or profit is implied.'}
         {' '}Outcome tracking is retrospective model evaluation, not a live price feed.

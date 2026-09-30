@@ -12,6 +12,7 @@ import {attachSocialEvidence, evaluateOutcomes, recordSignals, type OutcomeRun} 
 import {bestPoolSnapshots, contractSafetySummary} from './snapshot';
 import {withContractSafetyCoverage, type SafetyCoverage} from './contract-safety';
 import {recordAlertEligibility} from './alerts';
+import {reviewEvidence} from './review-evidence';
 
 // Lease length for the shared `goldmine:scan` lock (lib/research-db.ts). It must exceed the worst
 // case runtime of runGoldmineScan(), because acquireLock() hands out a lease, not a mutex: a scan
@@ -60,10 +61,15 @@ export type GoldmineScanResult = {
   disclaimer: string;
 };
 
+// Response-shaping options. `reviewEvidence` adds the allow-listed review view (lib/goldmine/
+// review-evidence.ts) to each candidate. Only the signed-in interactive route asks for it; the scheduled
+// routes never pass it, so their responses (read by the scheduler Worker) are unchanged.
+export type ScanResponseOptions = {reviewEvidence?: boolean};
+
 // The existing daily and interactive behavior is preserved: settle due outcomes before detection.
-export async function runGoldmineScan(database: D1Database, now: number): Promise<GoldmineScanResult> {
+export async function runGoldmineScan(database: D1Database, now: number, options: ScanResponseOptions = {}): Promise<GoldmineScanResult> {
   const outcomes = await evaluateOutcomes(database, now);
-  return detect(database, now, outcomes);
+  return detect(database, now, outcomes, options);
 }
 
 // Intraday scheduler path. Never calls evaluateOutcomes, including on provider failure; pending
@@ -73,7 +79,7 @@ export async function runGoldmineDetection(database: D1Database, now: number): P
   return detect(database, now, null);
 }
 
-async function detect(database: D1Database, now: number, outcomes: OutcomeRun | null): Promise<GoldmineScanResult> {
+async function detect(database: D1Database, now: number, outcomes: OutcomeRun | null, options: ScanResponseOptions = {}): Promise<GoldmineScanResult> {
   let discovered;
   try {
     discovered = await discoverSolanaPairs();
@@ -101,9 +107,11 @@ async function detect(database: D1Database, now: number, outcomes: OutcomeRun | 
   // the raw contractSafety facts. Here, for the client, contractSafety is reduced to the same minimal
   // shape GET already returns (lib/goldmine/snapshot.ts contractSafetySummary), so this response never
   // leaks provider facts/scores/risk text that GET withholds. Defensive against malformed/legacy values.
+  // reviewEvidence is built from the unreduced snapshot, and only on request (ScanResponseOptions).
   const candidates = scored.sort((a, b) => byRank(a.assessment, b.assessment)).map(({snapshot, assessment}) => ({
     ...assessment,
     snapshot: {...snapshot, contractSafety: contractSafetySummary(snapshot.contractSafety)},
+    ...(options.reviewEvidence ? {reviewEvidence: reviewEvidence(snapshot, assessment)} : {}),
   }));
   return {
     status: 'checked', modelVersion: MODEL_VERSION, asOf: new Date(now).toISOString(), candidates,

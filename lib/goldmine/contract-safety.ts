@@ -83,8 +83,9 @@ async function startRugCheckCooldown(database: D1Database, until: number): Promi
 }
 // How old a report (cached or not) may be and still back a safety decision. Kept well above
 // CACHE_TTL_MS so normal cache reuse is never stale by this rule; it exists for deriveContractSafety
-// callers that pass an explicit, older checkedAt.
-const MAX_FACT_AGE_MS = 15 * 60000;
+// callers that pass an explicit, older checkedAt. Exported so tests can pin the review view's "recent"
+// boundary (lib/goldmine/evidence-view.ts EVIDENCE_RECENT_MS) to this same value.
+export const MAX_FACT_AGE_MS = 15 * 60000;
 
 // Deterministic thresholds. RugCheck supplies facts; these bars are ours, not RugCheck's own score.
 export const LP_LOCKED_MIN_PCT = 80;

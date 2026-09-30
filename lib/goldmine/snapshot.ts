@@ -45,7 +45,9 @@ export type ContractSafety =
 // 'unsafe', a concise reason. Never the stored object itself - no facts, no RugCheck's own
 // providerScoreNormalized/providerRisks, no checkedAt/source provenance. `reason` is built only from our
 // own deterministic check messages (lib/goldmine/contract-safety.ts safetyChecks), never from provider
-// text, so it is always safe to render as plain text.
+// text, so it is always safe to render as plain text. This shape is deliberately not widened: the deeper,
+// allow-listed view of the same stored evidence (our derived facts and the report time) is a separate
+// field, `reviewEvidence` (lib/goldmine/review-evidence.ts).
 export type ContractSafetySummary =
   | {status: 'unavailable'}
   | {status: 'unsafe'; reason: string}
@@ -94,8 +96,9 @@ export type CandidateSnapshot = {
 };
 
 export const SOLANA_ADDRESS = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
-// A pool timestamp more than this far in the future is a provider error, not a new pool.
-const CLOCK_SKEW_MS = 5 * 60000;
+// A pool timestamp more than this far in the future is a provider error, not a new pool. The review view
+// (lib/goldmine/evidence-view.ts) uses the same tolerance to tell a small clock difference from an invalid time.
+export const CLOCK_SKEW_MS = 5 * 60000;
 
 function finite(value: unknown): number | null {
   const number = typeof value === 'string' && value.trim() !== '' ? Number(value) : value;

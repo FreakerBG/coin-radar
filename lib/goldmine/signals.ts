@@ -17,6 +17,7 @@ import {
 } from './cadence';
 import {MODEL_VERSION, STATES, type Assessment} from './score';
 import {at, contractSafetySummary, socialEvidence, WINDOWS, type CandidateSnapshot, type ContractSafety, type ContractSafetyFacts} from './snapshot';
+import {reviewEvidence} from './review-evidence';
 
 const HOUR = 60 * 60000;
 // A token can be recorded again in the same state once per bucket, so a pattern that persists does not
@@ -506,53 +507,61 @@ export async function readTracking(database: D1Database, now: number = Date.now(
   }
 
   return {
-    signals: signals.map(signal => ({
-      id: signal.id,
-      address: signal.address,
-      pair: signal.pair,
-      symbol: signal.symbol,
-      modelVersion: signal.model_version,
-      state: signal.state,
-      score: signal.score,
-      opportunity: signal.opportunity === 1,
-      detectedAt: new Date(signal.detected_at).toISOString(),
-      detectedPrice: signal.detected_price,
-      // From the snapshot recorded at detection time, never recomputed: a dashboard can show exactly
-      // what safety evidence backed this signal without querying RugCheck again. Reduced to the minimal
-      // client-facing shape (lib/goldmine/snapshot.ts contractSafetySummary) - never the stored facts,
-      // provider score or provider risk text - and defensively parsed so a malformed or legacy-shaped
-      // stored snapshot can never crash this read or be read as safe.
-      contractSafety: contractSafetySummary(at(parseSnapshot(signal.snapshot), 'contractSafety')),
-      assessment: JSON.parse(signal.assessment) as Assessment,
-      outcomes: outcomes.filter(outcome => outcome.signal_id === signal.id).sort(byHorizon).map(outcome => {
-        const definition = horizonById(outcome.horizon);
-        const elapsedMs = observationAgeMs(signal.detected_at, outcome.observed_at);
-        return {
-          horizon: outcome.horizon,
-          // A friendly name for the horizon ('1-day target', '15m (legacy)'), so the dashboard never has to
-          // invent one and a legacy row is never displayed as if it were part of the active schedule.
-          horizonLabel: definition?.label ?? outcome.horizon,
-          horizonActive: definition !== null && isActiveHorizon(definition),
-          horizonSchedule: definition?.schedule ?? null,
-          observableUnderCadence: definition !== null && isObservableUnderCadence(definition),
-          targetHours: definition ? hoursOf(definition.after) : null,
-          // The stored status, unchanged - and, separately, what that status means as of this read. A
-          // pending row past its deadline is 'expired_unswept', never live pending work, and storage is not
-          // touched to say so.
-          status: outcome.status,
-          state: derivedOutcomeState({status: outcome.status, deadlineAt: outcome.deadline_at}, now),
-          dueAt: new Date(outcome.due_at).toISOString(),
-          deadlineAt: new Date(outcome.deadline_at).toISOString(),
-          observedAt: outcome.observed_at === null ? null : new Date(outcome.observed_at).toISOString(),
-          // How long after detection this price was actually read. On a daily cadence this is the only
-          // honest answer to "is this the target-age price?" - the horizon id alone cannot give one.
-          observedAfterHours: hoursOf(elapsedMs),
-          price: outcome.price,
-          liquidity: outcome.liquidity,
-          returnPct: outcome.status === 'observed' && outcome.price !== null ? percent(outcome.price / signal.detected_price - 1) : null,
-        };
-      }),
-    })),
+    signals: signals.map(signal => {
+      const snapshot = parseSnapshot(signal.snapshot);
+      return {
+        id: signal.id,
+        address: signal.address,
+        pair: signal.pair,
+        symbol: signal.symbol,
+        modelVersion: signal.model_version,
+        state: signal.state,
+        score: signal.score,
+        opportunity: signal.opportunity === 1,
+        detectedAt: new Date(signal.detected_at).toISOString(),
+        detectedPrice: signal.detected_price,
+        // From the snapshot recorded at detection time, never recomputed: a dashboard can show exactly
+        // what safety evidence backed this signal without querying RugCheck again. Reduced to the minimal
+        // client-facing shape (lib/goldmine/snapshot.ts contractSafetySummary) - never the stored facts,
+        // provider score or provider risk text - and defensively parsed so a malformed or legacy-shaped
+        // stored snapshot can never crash this read or be read as safe.
+        contractSafety: contractSafetySummary(at(snapshot, 'contractSafety')),
+        // The deliberately scoped deeper view (lib/goldmine/review-evidence.ts): allow-listed facts, their
+        // times, and the stored assessment's own classification, never rescored. Built only for non-REJECTED
+        // rows, the only ones the dashboard renders as cards (opportunities and near misses), so the fixed
+        // 50-row read stays small; a REJECTED row carries null.
+        reviewEvidence: signal.state === 'REJECTED' ? null : reviewEvidence(snapshot, parseAssessment(signal.assessment)),
+        assessment: JSON.parse(signal.assessment) as Assessment,
+        outcomes: outcomes.filter(outcome => outcome.signal_id === signal.id).sort(byHorizon).map(outcome => {
+          const definition = horizonById(outcome.horizon);
+          const elapsedMs = observationAgeMs(signal.detected_at, outcome.observed_at);
+          return {
+            horizon: outcome.horizon,
+            // A friendly name for the horizon ('1-day target', '15m (legacy)'), so the dashboard never has to
+            // invent one and a legacy row is never displayed as if it were part of the active schedule.
+            horizonLabel: definition?.label ?? outcome.horizon,
+            horizonActive: definition !== null && isActiveHorizon(definition),
+            horizonSchedule: definition?.schedule ?? null,
+            observableUnderCadence: definition !== null && isObservableUnderCadence(definition),
+            targetHours: definition ? hoursOf(definition.after) : null,
+            // The stored status, unchanged - and, separately, what that status means as of this read. A
+            // pending row past its deadline is 'expired_unswept', never live pending work, and storage is not
+            // touched to say so.
+            status: outcome.status,
+            state: derivedOutcomeState({status: outcome.status, deadlineAt: outcome.deadline_at}, now),
+            dueAt: new Date(outcome.due_at).toISOString(),
+            deadlineAt: new Date(outcome.deadline_at).toISOString(),
+            observedAt: outcome.observed_at === null ? null : new Date(outcome.observed_at).toISOString(),
+            // How long after detection this price was actually read. On a daily cadence this is the only
+            // honest answer to "is this the target-age price?" - the horizon id alone cannot give one.
+            observedAfterHours: hoursOf(elapsedMs),
+            price: outcome.price,
+            liquidity: outcome.liquidity,
+            returnPct: outcome.status === 'observed' && outcome.price !== null ? percent(outcome.price / signal.detected_price - 1) : null,
+          };
+        }),
+      };
+    }),
     stats: [...summary.values()].sort((a, b) => a.state.localeCompare(b.state) || byHorizon(a, b)),
   };
 }
