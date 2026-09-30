@@ -5,6 +5,7 @@ import {toast} from 'sonner';
 import {goldmineTarget,type TradeTarget} from '@/lib/trade-handoff';
 import {fetchTracking,newOpportunitiesAnnouncement,refreshDue,trackNewOpportunities,TRACKING_REFRESH_MS} from '@/lib/goldmine/live-refresh';
 import TradeActions from './trade-actions';
+import CandidateReview from './candidate-review';
 import {isStale,latestBatchCountsLabel,latestBatchStalenessNote,latestBatchStatesLabel,opportunitiesOf,scanState,type LatestBatch,type PostedCandidate} from '@/lib/goldmine/dashboard-view';
 import {allHistoryOpportunityLabel,cadenceSummary,coverageWindowLabel,cellStatusLabel,coverageLabel,dataQualityWarning,denominatorNote,hasDataQualityWarning,hasEnoughData,horizonLabel,horizonScheduleNote,legacyHorizonWarning,observedAfterLabel,performanceRowsWithData,signalsSummaryLabel,type BacktestReport} from '@/lib/goldmine/backtest-view';
 import type {ContractSafetySummary} from '@/lib/goldmine/snapshot';
@@ -71,6 +72,7 @@ function OpportunityCard({candidate, onPlanTrade}: {candidate: PostedCandidate; 
         {candidate.snapshot.promoted && <span className="tag" title="Paid DEX Screener promotion">AD</span>}
       </div>
       {safetyEvidence(candidate) && <p className="muted" style={{fontSize: 12, marginTop: 8}}>{safetyEvidence(candidate)}</p>}
+      <CandidateReview mint={candidate.address} safetyStatus={candidate.snapshot.contractSafety.status}/>
       <TradeActions mint={candidate.address} pool={candidate.pair} symbol={candidate.symbol} evidenceAt={candidate.observedAt}
         onPlan={planHandler({...candidate, detectedAt: candidate.observedAt}, onPlanTrade)} />
     </div>
@@ -426,6 +428,7 @@ export default function GoldminePanel({onPlanTrade}: {onPlanTrade?: (target: Tra
                 </span>
               ))}
             </div>
+            <CandidateReview mint={signal.address} safetyStatus={signal.contractSafety.status}/>
             <TradeActions mint={signal.address} pool={signal.pair} symbol={signal.symbol} evidenceAt={signal.detectedAt}
               onPlan={planHandler(signal, onPlanTrade)} />
           </div>

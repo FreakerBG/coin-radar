@@ -390,6 +390,19 @@ test('Goldmine: a verified opportunity renders as a card; an empty successful sc
   await expect(page.getByRole('alert')).toHaveCount(0);
 });
 
+test('opportunity review exposes exact-mint social and holder checks without claiming independent wallets', async ({page}) => {
+  await mockApis(page, {'goldmine:post': {status: 200, json: goldmineChecked({candidates: [goldmineCandidate()], opportunities: 1})}});
+  await openDashboard(page);
+  await tab(page, 'Goldmine').click();
+  await page.getByRole('button', {name: 'Scan now'}).click();
+  const review = page.getByText('Research socials and wallets before trading');
+  await review.click();
+  await expect(page.getByText('Coin Radar has no verified follower count or independent-wallet count for this mint.', {exact: false})).toBeVisible();
+  await expect(page.getByRole('link', {name: 'Open Solscan holders and flows'})).toHaveAttribute('href', 'https://solscan.io/token/' + coin.address);
+  await expect(page.getByRole('link', {name: 'Open RugCheck'})).toHaveAttribute('href', 'https://rugcheck.xyz/tokens/' + coin.address);
+  await expect(page.getByRole('link', {name: 'Search the exact mint on X'})).toHaveAttribute('href', 'https://x.com/search?q=' + encodeURIComponent(coin.address) + '&f=live');
+});
+
 test('Goldmine: a candidate the backend did not mark opportunity never appears as one', async ({page}) => {
   const rejected = goldmineCandidate({opportunity: false, state: 'REJECTED', score: 20, summary: 'REJECTED. Thin liquidity.', snapshot: {contractSafety: {status: 'unsafe', source: 'rugcheck'}, promoted: false}});
   await mockApis(page, {'goldmine:post': {status: 200, json: goldmineChecked({candidates: [rejected], opportunities: 0})}});
