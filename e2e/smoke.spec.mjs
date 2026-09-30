@@ -103,6 +103,20 @@ test('initial dashboard renders market fixtures', async ({page}) => {
   await expect(page.getByRole('heading', {name: 'Market radar'})).toBeVisible();
 });
 
+test('Axiom setup is a manual guide with documented fields and no trading request', async ({page}) => {
+  const posts = [];
+  await mockApis(page);
+  page.on('request', request => { if (request.method() === 'POST') posts.push(request.url()); });
+  await openDashboard(page);
+  await tab(page, 'Axiom setup').click();
+  await expect(page.getByRole('heading', {name: 'Set up Axiom Pulse'})).toBeVisible();
+  await expect(page.getByRole('rowheader', {name: 'Dev Holding %'})).toBeVisible();
+  await expect(page.getByRole('rowheader', {name: 'Market Cap ($)'})).toBeVisible();
+  await expect(page.getByRole('link', {name: /Open Axiom Pulse/})).toHaveAttribute('href', 'https://axiom.trade/pulse');
+  await expect(page.getByText('Coin Radar cannot change your Axiom settings or place orders.')).toBeVisible();
+  expect(posts).toEqual([]);
+});
+
 test('provider outage shows an unavailable state', async ({page}) => {
   await mockApis(page, {market: {status: 502, json: {coins: [], asOf: null, error: 'Market provider unavailable. Retry shortly; no trading signals are being generated.'}}});
   await page.goto('/');
