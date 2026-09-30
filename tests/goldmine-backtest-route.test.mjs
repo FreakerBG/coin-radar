@@ -54,6 +54,7 @@ describe('empty history', () => {
     assert.equal(data.modelVersion, MODEL_VERSION);
     assert.equal(data.evaluationScheduleVersion, 'daily-snapshot-v1');
     assert.equal(data.totalSignals, 0);
+    assert.equal(data.filterFunnel.sampledSignals, 0);
     assert.deepEqual(data.totals, {signals: 0, opportunities: 0, control: 0, strategy: 0});
     assert.deepEqual(data.performance, []);
     assert.equal(data.calibration, null);
@@ -76,6 +77,9 @@ describe('replay', () => {
       currentVersionSignals: 1, matched: 1, mismatchedCount: 0, mismatchedSample: [], mismatchedSampleTruncated: false,
       unsupportedCount: 0, unsupportedModelVersions: [], invalidCount: 0,
     });
+    assert.equal(data.filterFunnel.sampledSignals, 1);
+    assert.equal(data.filterFunnel.rejected + data.filterFunnel.actionable <= 1, true);
+    assert.equal(data.filterFunnel.excludedOtherVersions, 0);
     assert.deepEqual(d1.rows('SELECT * FROM goldmine_signals'), before, 'replay never mutates the stored signal row');
   });
 

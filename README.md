@@ -132,5 +132,7 @@ Migration rules:
 
 - https://docs.dexscreener.com/api/reference
 - https://docs.phantom.com/developer-powertools/token-pages
+- https://docs.phantom.com/phantom-deeplinks/other-methods/swap
+- https://docs.axiom.trade/axiom/swap/market (contract-address search; see docs/manual-trading-handoff.md for what is and is not verified about Axiom links)
 - https://docs.x.com/x-api/getting-started/pricing
 - https://developers.cloudflare.com/workers/configuration/cron-triggers/

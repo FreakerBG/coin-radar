@@ -8,6 +8,7 @@ import {DISCLAIMER, MODEL_VERSION} from '@/lib/goldmine/score';
 import {cadenceReport, EVALUATION_SCHEDULE_VERSION} from '@/lib/goldmine/cadence';
 import {readAllSignalsWithOutcomes, readSignalTotals} from '@/lib/goldmine/signals';
 import {BACKTEST_LIMITATIONS, calibrationSweep, defaultCutoff, denominatorSplit, performanceReport, replayAll, reportCoverage} from '@/lib/goldmine/backtest';
+import {filterFunnel} from '@/lib/goldmine/filter-funnel';
 
 const noStore = {'Cache-Control': 'no-store'};
 
@@ -49,6 +50,7 @@ export async function GET() {
       // Control (REJECTED) versus strategy (actionable) versus opportunity counts, kept apart so a control
       // observation is never read as evidence about the strategy.
       denominators,
+      filterFunnel: filterFunnel(signals),
       skippedMalformedRows: skippedMalformedSignals,
       skippedMalformedOutcomes,
       truncated,

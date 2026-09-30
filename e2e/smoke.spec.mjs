@@ -103,6 +103,37 @@ test('initial dashboard renders market fixtures', async ({page}) => {
   await expect(page.getByRole('heading', {name: 'Market radar'})).toBeVisible();
 });
 
+test('Axiom setup is a manual guide with documented fields and no trading request', async ({page}) => {
+  const posts = [];
+  await mockApis(page);
+  page.on('request', request => { if (request.method() === 'POST') posts.push(request.url()); });
+  await openDashboard(page);
+  await tab(page, 'Axiom setup').click();
+  await expect(page.getByRole('heading', {name: 'Set up Axiom Pulse'})).toBeVisible();
+  await expect(page.getByRole('rowheader', {name: 'Dev Holding %'})).toBeVisible();
+  await expect(page.getByRole('rowheader', {name: 'Market Cap ($)'})).toBeVisible();
+  await expect(page.getByText('The observed Pulse screen mixed SOL and ETH cards even in Migrated;', {exact:false})).toBeVisible();
+  await expect(page.getByRole('link', {name: /Open Axiom Pulse/})).toHaveAttribute('href', 'https://axiom.trade/pulse');
+  await expect(page.getByText('Coin Radar cannot change your Axiom settings or place orders.')).toBeVisible();
+  expect(posts).toEqual([]);
+});
+
+test('full-loss planner caps spend and never sends a trade', async ({page}) => {
+  const posts = [];
+  await mockApis(page);
+  page.on('request', request => { if (request.method() === 'POST') posts.push(request.url()); });
+  await openDashboard(page);
+  await tab(page, 'Axiom setup').click();
+  await expect(page.getByRole('heading', {name: 'Full-loss trade planner'})).toBeVisible();
+  await page.getByRole('spinbutton', {name: /Speculative trading budget/}).fill('1000');
+  await page.getByRole('spinbutton', {name: /Live exact-pool liquidity/}).fill('50000');
+  await expect(page.getByText('Full-loss budget is binding.')).toBeVisible();
+  await expect(page.getByText('$4.45', {exact:true})).toBeVisible();
+  await page.getByRole('spinbutton', {name: /Maximum full loss of budget/}).fill('0.01');
+  await expect(page.getByText('Estimated fixed costs use the entire loss budget; skip this setup.')).toBeVisible();
+  expect(posts).toEqual([]);
+});
+
 test('provider outage shows an unavailable state', async ({page}) => {
   await mockApis(page, {market: {status: 502, json: {coins: [], asOf: null, error: 'Market provider unavailable. Retry shortly; no trading signals are being generated.'}}});
   await page.goto('/');
@@ -358,6 +389,19 @@ test('Goldmine: a verified opportunity renders as a card; an empty successful sc
   await expect(page.getByRole('status').getByText('Scanned 0 candidates. None currently pass every safety and momentum gate.')).toBeVisible();
   await expect(page.getByRole('heading', {name: 'No opportunities right now'})).toBeVisible();
   await expect(page.getByRole('alert')).toHaveCount(0);
+});
+
+test('opportunity review exposes exact-mint social and holder checks without claiming independent wallets', async ({page}) => {
+  await mockApis(page, {'goldmine:post': {status: 200, json: goldmineChecked({candidates: [goldmineCandidate()], opportunities: 1})}});
+  await openDashboard(page);
+  await tab(page, 'Goldmine').click();
+  await page.getByRole('button', {name: 'Scan now'}).click();
+  const review = page.getByText('Research socials and wallets before trading');
+  await review.click();
+  await expect(page.getByText('Coin Radar has no verified follower count or independent-wallet count for this mint.', {exact: false})).toBeVisible();
+  await expect(page.getByRole('link', {name: 'Open Solscan holders and flows'})).toHaveAttribute('href', 'https://solscan.io/token/' + coin.address);
+  await expect(page.getByRole('link', {name: 'Open RugCheck'})).toHaveAttribute('href', 'https://rugcheck.xyz/tokens/' + coin.address);
+  await expect(page.getByRole('link', {name: 'Search the exact mint on X'})).toHaveAttribute('href', 'https://x.com/search?q=' + encodeURIComponent(coin.address) + '&f=live');
 });
 
 test('Goldmine: a candidate the backend did not mark opportunity never appears as one', async ({page}) => {
@@ -625,4 +669,224 @@ test.describe('Goldmine: the most recent recorded batch is visible without runni
     await expect(page.getByText('28 signals recorded, none met every safety and momentum gate.')).toBeVisible();
     await expect(page.getByText(/Nothing new recorded in over 26 hours/)).toHaveCount(0);
   });
+});
+
+// --- Manual trading handoff ---------------------------------------------------------------------------------
+// A Goldmine opportunity leads to a trading app and, separately, to the Advisor for the same exact mint and
+// pool. Opening a trading app never records anything; only the manual form with an actual fill does.
+const HANDOFF_MINT = 'TokenBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB';
+const HANDOFF_POOL = 'PairBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB';
+const recordedSignal = (overrides = {}) => ({
+  id: 'sig-handoff', address: HANDOFF_MINT, pair: HANDOFF_POOL, symbol: 'GOLDB', state: 'BREAKOUT', score: 81, opportunity: true,
+  detectedAt: '2026-01-01T00:00:00.000Z', detectedPrice: 0.25, contractSafety: {status: 'verified', source: 'rugcheck'},
+  assessment: {summary: 'BREAKOUT · score 81/100. Passes every gate.'}, outcomes: [],
+  ...overrides,
+});
+const signedInPortfolio = {status: 200, json: {
+  config: {bankroll: 1000, riskPct: 1, maxAllocationPct: 5, takeProfitPct: 50, stopPct: 20, trailingPct: 15, liquidityDropPct: 30, xDailyRequests: 0},
+  positions: [], events: [], monitoring: 'browser_open_only',
+}};
+const handoffCard = page => page.getByRole('group', {name: 'Manual trade options for GOLDB'});
+
+test.describe('Goldmine: manual trading handoff', () => {
+  test('Axiom is the primary action, Phantom secondary, with the full mint and pool shown distinctly', async ({page}) => {
+    await mockApis(page, {goldmine: {status: 200, json: goldmineTracking({signals: [recordedSignal()]})}});
+    await openDashboard(page);
+    await tab(page, 'Goldmine').click();
+    const card = handoffCard(page);
+    await expect(card.getByTestId('trade-mint')).toHaveText(HANDOFF_MINT);
+    await expect(card.getByTestId('trade-pool')).toHaveText(HANDOFF_POOL);
+    await expect(card.getByText('Mint (token contract)')).toBeVisible();
+    await expect(card.getByText('Detected pool')).toBeVisible();
+
+    const actions = card.locator('.trade-buttons > *');
+    await expect(actions.first()).toHaveAccessibleName(/^Review in Axiom: GOLDB/);
+    await expect(actions.first()).toHaveClass(/btn-primary/);
+    await expect(actions.nth(1)).toHaveAccessibleName(/^Open in Phantom: GOLDB/);
+    await expect(actions.nth(1)).not.toHaveClass(/btn-primary/);
+    await expect(actions.first()).toHaveAttribute('href', `https://axiom.trade/meme/${HANDOFF_MINT}`);
+    await expect(actions.nth(1)).toHaveAttribute('href', `https://phantom.com/tokens/solana/${HANDOFF_MINT}`);
+    for (const link of await card.getByRole('link').all()) {
+      await expect(link).toHaveAttribute('target', '_blank');
+      await expect(link).toHaveAttribute('rel', 'noopener noreferrer');
+    }
+    // Desktop: no app-only swap deeplink; the Axiom search fallback is always there.
+    await expect(card.getByRole('link', {name: /Swap in Phantom app/})).toHaveCount(0);
+    await expect(card.getByRole('link', {name: 'Copy mint and search Axiom ↗'})).toHaveAttribute('href', 'https://axiom.trade/pulse');
+    await expect(card.getByText('Price and safety evidence are snapshots from', {exact: false})).toBeVisible();
+    await expect(card.getByText('check the live token, contract, liquidity, fees, slippage and order details', {exact: false})).toBeVisible();
+    await expect(card.getByText('Opening Axiom or Phantom does not place, record or confirm a trade.', {exact: false})).toBeVisible();
+  });
+
+  test('a fresh scan opportunity gets the same handoff block', async ({page}) => {
+    await mockApis(page, {'goldmine:post': {status: 200, json: goldmineChecked({candidates: [goldmineCandidate()], opportunities: 1})}});
+    await openDashboard(page);
+    await tab(page, 'Goldmine').click();
+    await page.getByRole('button', {name: 'Scan now'}).click();
+    const card = page.getByRole('group', {name: 'Manual trade options for FIXA'});
+    await expect(card.getByTestId('trade-mint')).toHaveText(coin.address);
+    await expect(card.getByTestId('trade-pool')).toHaveText(coin.pair);
+    await expect(card.getByRole('button', {name: /^Plan in Advisor: FIXA/})).toBeVisible();
+  });
+
+  test('opening Axiom or Phantom copies the mint for search and records nothing', async ({page, context}) => {
+    await context.grantPermissions(['clipboard-read', 'clipboard-write']);
+    const portfolioWrites = [];
+    await mockApis(page, {goldmine: {status: 200, json: goldmineTracking({signals: [recordedSignal()]})}, portfolio: signedInPortfolio});
+    page.on('request', request => { if (request.url().includes('/api/portfolio') && request.method() !== 'GET') portfolioWrites.push(request.url()); });
+    await openDashboard(page);
+    await tab(page, 'Goldmine').click();
+    const card = handoffCard(page);
+    const axiomTab = page.waitForEvent('popup');
+    await card.getByRole('link', {name: /^Review in Axiom/}).click();
+    await (await axiomTab).close();
+    await expect.poll(() => page.evaluate(() => navigator.clipboard.readText())).toBe(HANDOFF_MINT);
+    const phantomTab = page.waitForEvent('popup');
+    await card.getByRole('link', {name: /^Open in Phantom/}).click();
+    await (await phantomTab).close();
+    await page.waitForTimeout(500);
+    expect(portfolioWrites).toEqual([]);
+    await expect(page.getByText('Manual position recorded')).toHaveCount(0);
+  });
+
+  test('an invalid stored mint renders no trading links at all', async ({page}) => {
+    await mockApis(page, {goldmine: {status: 200, json: goldmineTracking({signals: [recordedSignal({address: 'not-a-mint/../x'})]})}});
+    await openDashboard(page);
+    await tab(page, 'Goldmine').click();
+    await expect(page.getByText('contract address failed validation, so no trading links are shown', {exact: false})).toBeVisible();
+    // Scoped to the Goldmine panel: the Research brief sidebar links the (valid) Discover selection.
+    const goldminePanel = page.locator('section.panel', {has: page.getByRole('heading', {name: 'Goldmine', exact: true})});
+    await expect(goldminePanel.getByRole('link', {name: /Axiom|Phantom/})).toHaveCount(0);
+    await expect(goldminePanel.getByRole('button', {name: /Plan in Advisor/})).toHaveCount(0);
+  });
+
+  test('recorded opportunities refresh read-only: manual and timed reads are GETs, never a scan', async ({page}) => {
+    await page.clock.install({time: new Date('2026-09-29T12:00:00Z')});
+    const goldmineRequests = [];
+    let signals = [recordedSignal()];
+    await mockApis(page);
+    await page.route('**/api/goldmine', route => {
+      goldmineRequests.push(route.request().method());
+      return route.fulfill({status: 200, json: goldmineTracking({signals})});
+    });
+    await openDashboard(page);
+    await tab(page, 'Goldmine').click();
+    await expect(page.getByTestId('history-last-updated')).toContainText('List updated');
+    await expect(page.getByText('New since this page loaded')).toHaveCount(0);
+    const initialReads = goldmineRequests.length;
+
+    // A new opportunity recorded by the scheduler, picked up by the manual button.
+    signals = [recordedSignal({id: 'sig-later', symbol: 'LATER', address: 'TokenCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC'}), recordedSignal()];
+    await page.getByRole('button', {name: /^Refresh list/}).click();
+    await expect(page.getByText('New since this page loaded')).toHaveCount(1);
+    await expect(page.getByRole('status').filter({hasText: '1 newly recorded opportunity since this page loaded.'})).toBeVisible();
+    expect(goldmineRequests.length).toBe(initialReads + 1);
+
+    // The timer rereads after the interval with no click, and the same signal is not announced again.
+    await page.clock.fastForward('05:30');
+    await expect.poll(() => goldmineRequests.length).toBeGreaterThanOrEqual(initialReads + 2);
+    await expect(page.getByText('New since this page loaded')).toHaveCount(1);
+    expect(goldmineRequests.every(method => method === 'GET'), `requests: ${goldmineRequests.join(',')}`).toBe(true);
+    // No toast or desktop notification is raised for a newly recorded signal.
+    await expect(page.locator('[data-sonner-toast]')).toHaveCount(0);
+  });
+
+  test('Plan in Advisor hands over the exact mint and pool, and only an entered fill records a position', async ({page}) => {
+    const advisorQueries = [];
+    const portfolioPosts = [];
+    await mockApis(page, {goldmine: {status: 200, json: goldmineTracking({signals: [recordedSignal()]})}, portfolio: signedInPortfolio});
+    await page.route('**/api/advisor**', route => {
+      const url = new URL(route.request().url());
+      advisorQueries.push(Object.fromEntries(url.searchParams));
+      return route.fulfill({status: 200, json: {coin: {...coin, address: url.searchParams.get('address'), pair: url.searchParams.get('pair'), symbol: 'GOLDB'}, allocation: {amount: 0, ceiling: 10, reason: 'Review required.', status: 'Review required'}, safety: 'unverified', socialInfluence: 'excluded', asOf: '2026-09-29T12:00:00.000Z'}});
+    });
+    await page.route('**/api/portfolio', route => {
+      if (route.request().method() !== 'POST') return route.fulfill(signedInPortfolio);
+      portfolioPosts.push(route.request().postDataJSON());
+      return route.fulfill({status: 200, json: {ok: true}});
+    });
+    await openDashboard(page);
+    await tab(page, 'Goldmine').click();
+    await handoffCard(page).getByRole('button', {name: /^Plan in Advisor: GOLDB/}).click();
+
+    await expect(tab(page, 'Advisor')).toHaveAttribute('aria-selected', 'true');
+    const banner = page.getByRole('region', {name: 'Goldmine signal handed to the Advisor'});
+    await expect(banner).toBeFocused();
+    await expect(banner.getByTestId('handoff-mint')).toHaveText(HANDOFF_MINT);
+    await expect(banner.getByTestId('handoff-pool')).toHaveText(HANDOFF_POOL);
+    await expect(banner).toContainText('not a trade recommendation');
+    await expect(page.getByRole('heading', {name: 'GOLDB · Entry assessment'})).toBeVisible();
+    await expect.poll(() => advisorQueries.at(-1)).toEqual({address: HANDOFF_MINT, pair: HANDOFF_POOL});
+    await expect(page.getByTestId('record-target')).toHaveText(`Mint ${HANDOFF_MINT} · Pool ${HANDOFF_POOL}`);
+
+    // Nothing is recorded by the handoff itself, and the form stays disabled until a fill is entered.
+    const recordButton = page.getByRole('button', {name: 'Record manual position'});
+    await expect(recordButton).toBeDisabled();
+    expect(portfolioPosts).toEqual([]);
+    await page.getByLabel('Actual fill price · USD').fill('0.0002');
+    await expect(recordButton).toBeDisabled();
+    await page.getByLabel('Amount spent · USD').fill('25');
+    await recordButton.click();
+    await expect(page.getByText('Manual position recorded. No trade was executed.')).toBeVisible();
+    expect(portfolioPosts).toHaveLength(1);
+    expect(portfolioPosts[0]).toMatchObject({action: 'position', position: {address: HANDOFF_MINT, pair: HANDOFF_POOL, symbol: 'GOLDB', entryPrice: 0.0002, amount: 25}});
+
+    // Choosing the Discover selection drops the handoff.
+    await page.getByRole('button', {name: 'Use my Discover selection instead'}).click();
+    await expect(page.getByRole('heading', {name: 'FIXA · Entry assessment'})).toBeVisible();
+    await expect(banner).toHaveCount(0);
+  });
+
+  test('selecting a coin in Discover replaces a handed-over Goldmine signal', async ({page}) => {
+    await mockApis(page, {goldmine: {status: 200, json: goldmineTracking({signals: [recordedSignal()]})}});
+    await openDashboard(page);
+    await tab(page, 'Goldmine').click();
+    await handoffCard(page).getByRole('button', {name: /^Plan in Advisor/}).click();
+    await expect(page.getByRole('heading', {name: 'GOLDB · Entry assessment'})).toBeVisible();
+    await tab(page, 'Discover').click();
+    await page.getByRole('button', {name: 'View score explanation for FIXA'}).click();
+    await tab(page, 'Advisor').click();
+    await expect(page.getByRole('heading', {name: 'FIXA · Entry assessment'})).toBeVisible();
+    await expect(page.getByRole('region', {name: 'Goldmine signal handed to the Advisor'})).toHaveCount(0);
+  });
+});
+
+test.describe('Goldmine: manual trading handoff on a phone', () => {
+  test.use({
+    viewport: {width: 390, height: 844}, isMobile: true, hasTouch: true,
+    userAgent: 'Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1',
+  });
+
+  test('offers the documented Phantom swap link (token prefilled, no amount) and keeps the token page', async ({page}) => {
+    await mockApis(page, {goldmine: {status: 200, json: goldmineTracking({signals: [recordedSignal()]})}});
+    await openDashboard(page);
+    await tab(page, 'Goldmine').click();
+    const card = handoffCard(page);
+    const swap = card.getByRole('link', {name: /^Swap in Phantom app: GOLDB/});
+    await expect(swap).toBeVisible();
+    const href = new URL(await swap.getAttribute('href'));
+    expect(href.origin + href.pathname).toBe('https://phantom.app/ul/v1/swap/');
+    expect([...href.searchParams.keys()]).toEqual(['buy', 'sell']);
+    expect(href.searchParams.get('buy')).toBe(`solana:101/address:${HANDOFF_MINT}`);
+    await expect(card.getByRole('link', {name: /^Open in Phantom/})).toHaveAttribute('href', `https://phantom.com/tokens/solana/${HANDOFF_MINT}`);
+    await expect(card.getByText('you enter the amount and confirm in Phantom', {exact: false})).toBeVisible();
+    const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+    expect(overflow, `handoff block overflows horizontally by ${overflow}px`).toBeLessThanOrEqual(0);
+  });
+
+  for (const width of [320, 360]) {
+    test(`${width}px: the handoff block and the Advisor banner fit without horizontal overflow`, async ({page}) => {
+      await page.setViewportSize({width, height: 800});
+      await mockApis(page, {goldmine: {status: 200, json: goldmineTracking({signals: [recordedSignal()]})}});
+      await openDashboard(page);
+      await tab(page, 'Goldmine').click();
+      await expect(handoffCard(page).getByTestId('trade-mint')).toBeVisible();
+      let overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+      expect(overflow).toBeLessThanOrEqual(0);
+      await handoffCard(page).getByRole('button', {name: /^Plan in Advisor/}).click();
+      await expect(page.getByRole('region', {name: 'Goldmine signal handed to the Advisor'})).toBeVisible();
+      overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+      expect(overflow).toBeLessThanOrEqual(0);
+    });
+  }
 });
