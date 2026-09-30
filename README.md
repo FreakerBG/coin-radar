@@ -138,3 +138,5 @@ For manual trading research, use the in-app Axiom setup tab with [the handoff no
 - https://docs.axiom.trade/axiom/swap/market (contract-address search; see docs/manual-trading-handoff.md for what is and is not verified about Axiom links)
 - https://docs.x.com/x-api/getting-started/pricing
 - https://developers.cloudflare.com/workers/configuration/cron-triggers/
+
+Manual trades require checking the live pool and order in Axiom or Phantom.
