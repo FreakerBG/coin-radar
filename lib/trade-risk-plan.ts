@@ -53,8 +53,9 @@ export function planTradeRisk(input: TradeRiskInputs): TradeRiskResult | null {
   const bindingCap = fixedCostsUsd >= fullLossBudgetUsd ? 'costs'
     : maximumSpendUsd === fullLossCap ? 'full_loss'
     : maximumSpendUsd === bankrollSpendCapUsd ? 'bankroll' : 'pool';
-  const fullLossExposureUsd = maximumSpendUsd * (1 + fee) + fixedCostsUsd;
-  const plannedStopLossUsd = maximumSpendUsd * stopLossFraction + fixedCostsUsd;
+  // There is no transaction, and thus no transaction cost, if the cap is zero.
+  const fullLossExposureUsd = maximumSpendUsd > 0 ? maximumSpendUsd * (1 + fee) + fixedCostsUsd : 0;
+  const plannedStopLossUsd = maximumSpendUsd > 0 ? maximumSpendUsd * stopLossFraction + fixedCostsUsd : 0;
   const breakEvenRisePct = maximumSpendUsd > 0
     ? 100 * (((1 + fee) + fixedCostsUsd / maximumSpendUsd) * (1 + buySlip) / ((1 - sellSlip) * (1 - fee)) - 1)
     : null;

@@ -36,6 +36,8 @@ test('fixed costs consuming the loss budget recommend no spend', () => {
   assert.equal(plan?.bindingCap, 'costs');
   assert.equal(plan.maximumSpendUsd, 0);
   assert.equal(plan.breakEvenRisePct, null);
+  assert.equal(plan.fullLossExposureUsd, 0);
+  assert.equal(plan.plannedStopLossUsd, 0);
 });
 
 test('rejects incomplete, negative, extreme and impossible scenarios', () => {
