@@ -130,6 +130,8 @@ Migration rules:
 
 ## Provider documentation
 
+For manual trading research, use the in-app Axiom setup tab with [the handoff notes](docs/manual-trading-handoff.md), [filter outcome audit](docs/filter-outcome-audit.md), and [strategy filter research](docs/strategy-filter-research.md). Those filters are study hypotheses; a live Axiom order is always a separate manual decision.
+
 - https://docs.dexscreener.com/api/reference
 - https://docs.phantom.com/developer-powertools/token-pages
 - https://docs.phantom.com/phantom-deeplinks/other-methods/swap
