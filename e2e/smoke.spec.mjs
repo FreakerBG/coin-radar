@@ -112,6 +112,7 @@ test('Axiom setup is a manual guide with documented fields and no trading reques
   await expect(page.getByRole('heading', {name: 'Set up Axiom Pulse'})).toBeVisible();
   await expect(page.getByRole('rowheader', {name: 'Dev Holding %'})).toBeVisible();
   await expect(page.getByRole('rowheader', {name: 'Market Cap ($)'})).toBeVisible();
+  await expect(page.getByText('The observed Pulse screen mixed SOL and ETH cards even in Migrated;', {exact:false})).toBeVisible();
   await expect(page.getByRole('link', {name: /Open Axiom Pulse/})).toHaveAttribute('href', 'https://axiom.trade/pulse');
   await expect(page.getByText('Coin Radar cannot change your Axiom settings or place orders.')).toBeVisible();
   expect(posts).toEqual([]);

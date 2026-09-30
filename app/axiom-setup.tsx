@@ -15,7 +15,8 @@ export default function AxiomSetup() {
       <div className="note caution"><strong>Study profile · not a proven strategy</strong>These numbers are starting groups for comparison, not Axiom defaults or a claim of profitable coins. Axiom documents the filter names; no provider publishes a winning configuration. Keep the exact contract and pool checks in the trade flow.</div>
       <ol className="axiom-steps">
         <li>Open <a href={AXIOM_PULSE_URL} target="_blank" rel="noopener noreferrer">Axiom Pulse <ArrowUpRight size={14}/></a> and sign in to your own account.</li>
-        <li>Choose the <strong>Migrated</strong> table (or its current equivalent), then open its <strong>Filters</strong> control.</li>
+        <li>Choose the <strong>Migrated</strong> column on the right, then open its sliders icon beside the P1/P2/P3 presets. Check which preset is active before entering values.</li>
+        <li>Use the chain control to show <strong>Solana only</strong>, if Axiom offers that option, and confirm the Solana badge on every result. The observed Pulse screen mixed SOL and ETH cards even in Migrated; a column name alone does not set the chain.</li>
         <li>Enter the study values below. Select the <strong>1h</strong> window for volume, transactions and sells if Axiom offers it. Leave any unavailable field unset; do not invent a zero.</li>
         <li>Review results in Axiom, then search the exact mint in Coin Radar. Check safety evidence and live liquidity before considering an order. Enter any real fill manually in Advisor.</li>
       </ol>
