@@ -2,13 +2,14 @@
 import {ArrowUpRight,Copy,SlidersHorizontal} from 'lucide-react';
 import {toast} from 'sonner';
 import {AXIOM_MARKET_DOCS_URL,AXIOM_PULSE_DOCS_URL,AXIOM_PULSE_URL,PULSE_PHASES,PULSE_STUDY_FIELDS,pulseStudyText} from '@/lib/axiom-pulse-guide';
+import TradeRiskPlanner from './trade-risk-planner';
 
 export default function AxiomSetup() {
   const copy = async () => {
     try { await navigator.clipboard.writeText(pulseStudyText()); toast.success('Research settings copied. Enter them manually in Axiom Pulse.'); }
     catch { toast.error('Could not copy. Select the settings on this page instead.'); }
   };
-  return <section className="panel axiom-setup" aria-labelledby="axiom-setup-title">
+  return <><section className="panel axiom-setup" aria-labelledby="axiom-setup-title">
     <div className="panel-head"><div><div className="eyebrow">Manual trading workspace</div><h2 id="axiom-setup-title" style={{margin:'6px 0'}}>Set up Axiom Pulse</h2><p className="muted" style={{margin:0}}>A research watchlist you can enter in your own Axiom account. Coin Radar cannot change your Axiom settings or place orders.</p></div><SlidersHorizontal size={20}/></div>
     <div className="settings">
       <div className="note caution"><strong>Study profile · not a proven strategy</strong>These numbers are starting groups for comparison, not Axiom defaults or a claim of profitable coins. Axiom documents the filter names; no provider publishes a winning configuration. Keep the exact contract and pool checks in the trade flow.</div>
@@ -26,5 +27,5 @@ export default function AxiomSetup() {
       <h3>Before pressing Buy</h3><ul className="axiom-checks"><li>Compare the mint and the exact pool with Coin Radar; reject missing or failed contract safety evidence.</li><li>Confirm current liquidity, holder and developer distribution, mint/freeze permissions, and whether sells actually execute.</li><li>Review the current price, trade size, priority fee, slippage and order details inside Axiom. The recorded signal price is a past snapshot.</li></ul>
       <p className="muted" style={{fontSize:13}}>Sources: <a href={AXIOM_PULSE_DOCS_URL} target="_blank" rel="noopener noreferrer">Axiom Pulse filters ↗</a> · <a href={AXIOM_MARKET_DOCS_URL} target="_blank" rel="noopener noreferrer">Axiom order flow ↗</a>. Research context: <a href="https://arxiv.org/abs/2608.20271" target="_blank" rel="noopener noreferrer">Solana rug-pull study ↗</a> and <a href="https://arxiv.org/abs/2507.01963" target="_blank" rel="noopener noreferrer">memecoin manipulation study ↗</a>. These do not validate this preset.</p>
     </div>
-  </section>;
+  </section><TradeRiskPlanner/></>;
 }

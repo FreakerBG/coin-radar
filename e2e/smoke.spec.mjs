@@ -117,6 +117,22 @@ test('Axiom setup is a manual guide with documented fields and no trading reques
   expect(posts).toEqual([]);
 });
 
+test('full-loss planner caps spend and never sends a trade', async ({page}) => {
+  const posts = [];
+  await mockApis(page);
+  page.on('request', request => { if (request.method() === 'POST') posts.push(request.url()); });
+  await openDashboard(page);
+  await tab(page, 'Axiom setup').click();
+  await expect(page.getByRole('heading', {name: 'Full-loss trade planner'})).toBeVisible();
+  await page.getByRole('spinbutton', {name: /Speculative trading budget/}).fill('1000');
+  await page.getByRole('spinbutton', {name: /Live exact-pool liquidity/}).fill('50000');
+  await expect(page.getByText('Full-loss budget is binding.')).toBeVisible();
+  await expect(page.getByText('$4.45', {exact:true})).toBeVisible();
+  await page.getByRole('spinbutton', {name: /Maximum full loss of budget/}).fill('0.01');
+  await expect(page.getByText('Estimated fixed costs use the entire loss budget; skip this setup.')).toBeVisible();
+  expect(posts).toEqual([]);
+});
+
 test('provider outage shows an unavailable state', async ({page}) => {
   await mockApis(page, {market: {status: 502, json: {coins: [], asOf: null, error: 'Market provider unavailable. Retry shortly; no trading signals are being generated.'}}});
   await page.goto('/');
