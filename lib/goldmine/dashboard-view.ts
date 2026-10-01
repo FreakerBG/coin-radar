@@ -2,9 +2,10 @@
 // it is directly testable with node:test, the same way lib/goldmine/score.ts is. Nothing here calls a
 // provider or recomputes a safety decision: it only classifies data the API already returned.
 import type {Assessment} from './score';
-import type {CandidateSnapshot} from './snapshot';
+import type {CandidateSnapshot, ContractSafetySummary} from './snapshot';
+import type {ReviewEvidence} from './review-evidence';
 
-export type PostedCandidate = Assessment & {snapshot: CandidateSnapshot};
+export type PostedCandidate = Assessment & {snapshot: Omit<CandidateSnapshot, 'contractSafety'> & {contractSafety: ContractSafetySummary}; reviewEvidence?: ReviewEvidence};
 export type ScanStatus = 'idle' | 'loading' | 'opportunities' | 'empty' | 'busy' | 'unavailable' | 'error';
 
 // How long a scan result is shown as current before the panel calls it stale and asks for a fresh scan.
@@ -99,3 +100,4 @@ export function latestBatchStalenessNote(latest: LatestBatch | null, now: number
   if (!isLatestBatchOverdue(latest, now)) return '';
   return 'Nothing new recorded in over 26 hours, which is longer than this deployment’s daily scan interval. A scan that finds nothing new to record also leaves this unchanged.';
 }
+

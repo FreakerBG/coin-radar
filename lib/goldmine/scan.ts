@@ -1,3 +1,4 @@
+import {reviewEvidence} from './review-evidence';
 // The Goldmine scan pipeline (Stage 03A-03D), extracted from app/api/goldmine/route.ts so a
 // scheduled entry point (app/api/goldmine/scheduled/route.ts) can share detection while choosing
 // whether to settle outcomes. The daily GET settles; the future intraday POST never does.
@@ -103,6 +104,7 @@ async function detect(database: D1Database, now: number, outcomes: OutcomeRun | 
   // leaks provider facts/scores/risk text that GET withholds. Defensive against malformed/legacy values.
   const candidates = scored.sort((a, b) => byRank(a.assessment, b.assessment)).map(({snapshot, assessment}) => ({
     ...assessment,
+    reviewEvidence: reviewEvidence(snapshot),
     snapshot: {...snapshot, contractSafety: contractSafetySummary(snapshot.contractSafety)},
   }));
   return {
@@ -111,3 +113,4 @@ async function detect(database: D1Database, now: number, outcomes: OutcomeRun | 
     tracking: {newSignals, outcomes}, safety, alerts: {queued: alertsQueued, delivery: 'not_configured'}, warnings: discovered.warnings, coverage: COVERAGE, disclaimer: DISCLAIMER,
   };
 }
+

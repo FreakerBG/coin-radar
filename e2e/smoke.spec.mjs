@@ -96,6 +96,53 @@ async function openDashboard(page) {
   await expect(page.getByRole('button', {name: 'View score explanation for FIXA'})).toBeVisible();
 }
 
+test('Stage 09: near misses stay collapsed and research-only; missing facts are explicit', async ({page}) => {
+  const evidence = {
+    market:{source:'dexscreener',checkedAt:1000,liquidityUsd:0,marketCapUsd:null,volume1hUsd:100,buys1h:0,sells1h:5,promoted:false},
+    contract:{source:null,checkedAt:null,mintAuthorityRenounced:null,freezeAuthorityRenounced:null,lpLockedPct:null,topHolderPct:null,topHoldersPct:null,creatorHoldingsPct:null,insiderNetworksDetected:null,rugged:null},
+  };
+  const signal={id:'miss',address:coin.address,pair:coin.pair,symbol:'MISS',state:'BUILDING',score:70,opportunity:false,
+    detectedAt:'2026-01-01T00:00:00Z',detectedPrice:coin.price,contractSafety:{status:'unavailable'},reviewEvidence:evidence,assessment:{summary:'Safety unavailable.'},outcomes:[]};
+  const writes=[];
+  await mockApis(page,{goldmine:{status:200,json:goldmineTracking({signals:[signal]})}});
+  page.on('request',r=>{if(r.method()==='POST')writes.push(r.url());});
+  await openDashboard(page);await tab(page,'Goldmine').click();
+  const misses=page.locator('.near-misses');await expect(misses).not.toHaveAttribute('open','');
+  await misses.locator('summary').first().click();
+  await expect(misses).toContainText('Safety unavailable.');
+  await expect(misses.getByRole('link')).toHaveCount(0);
+  await expect(misses.getByRole('button',{name:/Plan in Advisor/})).toHaveCount(0);
+  await misses.locator('.stored-evidence summary').click();
+  await expect(misses).toContainText('Unknown');await expect(misses).toContainText('0 USD');
+  await expect(misses).toContainText('Observation time unknown');expect(writes).toEqual([]);
+});
+
+test('Stage 09: manual observations never create a position, and reset with the target', async ({page}) => {
+  const writes=[];
+  await mockApis(page,{goldmine:{status:200,json:goldmineTracking({signals:[{id:'review',address:coin.address,pair:'PairBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB',symbol:'REVIEW',state:'BREAKOUT',score:81,opportunity:true,detectedAt:'2026-01-01T00:00:00Z',detectedPrice:coin.price,contractSafety:{status:'verified'},assessment:{summary:'Fixture.'},outcomes:[]}]})}});
+  page.on('request',r=>{if(r.method()==='POST')writes.push(r.url());});
+  await openDashboard(page);await tab(page,'Goldmine').click();
+  await page.getByRole('button',{name:/Plan in Advisor: REVIEW/}).click();
+  const review=page.getByRole('region',{name:'Live manual review before recording a fill'});
+  await expect(review).toContainText('5 unknown');
+  await review.getByRole('radio',{name:'Manually reviewed'}).first().check();
+  await expect(review).toContainText('4 unknown');
+  await review.getByRole('radio',{name:'Blocker found'}).nth(1).check();
+  await expect(review).toContainText('Manual blocker recorded');
+  expect(writes).toEqual([]);
+  await page.getByRole('button',{name:'Use my Discover selection instead'}).click();
+  await expect(review).toContainText('5 unknown');await expect(review).toContainText('0 blocked');
+});
+
+test('Stage 09: six tabs do not widen the page at intermediate viewport widths', async ({page}) => {
+  await mockApis(page);await openDashboard(page);
+  for(const width of [390,600,640,768,900]){
+    await page.setViewportSize({width,height:900});
+    const overflow=await page.evaluate(()=>document.documentElement.scrollWidth>window.innerWidth);
+    expect(overflow,`page overflow at ${width}px`).toBe(false);
+  }
+});
+
 test('initial dashboard renders market fixtures', async ({page}) => {
   await mockApis(page);
   await openDashboard(page);

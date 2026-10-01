@@ -6,6 +6,8 @@ import {goldmineTarget,type TradeTarget} from '@/lib/trade-handoff';
 import {fetchTracking,newOpportunitiesAnnouncement,refreshDue,trackNewOpportunities,TRACKING_REFRESH_MS} from '@/lib/goldmine/live-refresh';
 import TradeActions from './trade-actions';
 import CandidateReview from './candidate-review';
+import StoredEvidence from './stored-evidence';
+import {nearMisses,type ReviewEvidence} from '@/lib/goldmine/review-evidence';
 import {isStale,latestBatchCountsLabel,latestBatchStalenessNote,latestBatchStatesLabel,opportunitiesOf,scanState,type LatestBatch,type PostedCandidate} from '@/lib/goldmine/dashboard-view';
 import {allHistoryOpportunityLabel,cadenceSummary,coverageWindowLabel,cellStatusLabel,coverageLabel,dataQualityWarning,denominatorNote,hasDataQualityWarning,hasEnoughData,horizonLabel,horizonScheduleNote,legacyHorizonWarning,observedAfterLabel,performanceRowsWithData,signalsSummaryLabel,type BacktestReport} from '@/lib/goldmine/backtest-view';
 import type {ContractSafetySummary} from '@/lib/goldmine/snapshot';
@@ -23,8 +25,8 @@ type ScanResponse = {
 };
 type TrackedSignal = {
   id: string; address: string; pair: string; symbol: string; state: string; score: number; opportunity: boolean;
-  detectedAt: string; detectedPrice: number; contractSafety: ContractSafetySummary;
-  assessment: {summary: string};
+  detectedAt: string; detectedPrice: number; contractSafety: ContractSafetySummary; reviewEvidence?: ReviewEvidence;
+  assessment: {summary: string; blockers?: {id: string; message: string}[]};
   // `state` is the derived outcome state as of the read (lib/goldmine/cadence.ts), which is what separates a
   // live pending outcome from one whose window has already closed. `observedAfterHours` is how long after
   // detection the price was actually read - never assumed to be the horizon's target age.
@@ -72,6 +74,7 @@ function OpportunityCard({candidate, onPlanTrade}: {candidate: PostedCandidate; 
         {candidate.snapshot.promoted && <span className="tag" title="Paid DEX Screener promotion">AD</span>}
       </div>
       {safetyEvidence(candidate) && <p className="muted" style={{fontSize: 12, marginTop: 8}}>{safetyEvidence(candidate)}</p>}
+      <StoredEvidence evidence={candidate.reviewEvidence}/>
       <CandidateReview mint={candidate.address} safetyStatus={candidate.snapshot.contractSafety.status}/>
       <TradeActions mint={candidate.address} pool={candidate.pair} symbol={candidate.symbol} evidenceAt={candidate.observedAt}
         onPlan={planHandler({...candidate, detectedAt: candidate.observedAt}, onPlanTrade)} />
@@ -321,6 +324,7 @@ export default function GoldminePanel({onPlanTrade}: {onPlanTrade?: (target: Tra
   const status = scanState({loading, error: scanError, status: scan?.status ?? null, opportunityCount: opportunities.length});
   const stale = scan?.asOf ? isStale(scan.asOf, now) : false;
   const history = (tracking?.signals ?? []).filter(s => s.opportunity);
+  const misses = nearMisses(tracking?.signals ?? []);
 
   const statusText: Record<typeof status, string> = {
     idle: 'No scan run yet this session.',
@@ -428,6 +432,7 @@ export default function GoldminePanel({onPlanTrade}: {onPlanTrade?: (target: Tra
                 </span>
               ))}
             </div>
+            <StoredEvidence evidence={signal.reviewEvidence}/>
             <CandidateReview mint={signal.address} safetyStatus={signal.contractSafety.status}/>
             <TradeActions mint={signal.address} pool={signal.pair} symbol={signal.symbol} evidenceAt={signal.detectedAt}
               onPlan={planHandler(signal, onPlanTrade)} />
@@ -449,7 +454,19 @@ export default function GoldminePanel({onPlanTrade}: {onPlanTrade?: (target: Tra
         {' '}Outcome tracking is retrospective model evaluation, not a live price feed.
       </div>
 
+      {!historyError && misses.length > 0 && <details className="near-misses">
+        <summary>Not trade-ready · {misses.length} near misses in the latest 50 records</summary>
+        <p className="muted">Actionable model state and score of at least 60, but the backend did not mark these as opportunities. This bounded list is for investigating missing evidence and blockers.</p>
+        {misses.map(signal => <div className="feed-item" key={signal.id}>
+          <strong>{signal.symbol.slice(0,14)} · {signal.state} · {signal.score}/100</strong>
+          <p>{signal.assessment.summary}</p>
+          <SafetyBadge contractSafety={signal.contractSafety}/>
+          <p className="muted mono" style={{overflowWrap:'anywhere'}}>Mint {signal.address} · Pool {signal.pair}</p>
+          <StoredEvidence evidence={signal.reviewEvidence}/>
+        </div>)}
+      </details>}
       <BacktestingSection report={backtest} error={backtestError} onRetry={retryBacktest} />
     </section>
   );
 }
+

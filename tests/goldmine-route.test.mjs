@@ -131,7 +131,8 @@ describe('scanning', () => {
       ['d7', 'pending', 7 * DAY, 7 * DAY + OBSERVATION_GRACE_MS],
     ]);
     const [stored] = d1.rows('SELECT snapshot, assessment FROM goldmine_signals WHERE address = ?', addresses.tokenA);
-    const {snapshot, ...assessment} = a;
+    const {snapshot, reviewEvidence: publicEvidence, ...assessment} = a;
+    assert.equal(publicEvidence.market.source, 'dexscreener');
     const storedSnapshot = JSON.parse(stored.snapshot);
     // Storage (recordSignals) keeps the full scored snapshot, including raw contractSafety facts, so a
     // later model version can re-score exactly what was observed; only the served response reduces
@@ -348,7 +349,7 @@ describe('GET contractSafety: minimal client shape, defensive against malformed 
   });
 
   test('unsafe contractSafety exposes {status, reason} built from our own check messages, never RugCheck facts or provider risk text', async () => {
-    seedSignal('sig-unsafe', JSON.stringify({contractSafety: {
+    seedSignal('sig-unsafe', JSON.stringify({address: addresses.tokenA, pair: addresses.pairA, contractSafety: {
       status: 'unsafe', source: 'rugcheck', checkedAt: clock.now(),
       facts: {mintAuthorityRenounced: false, providerRisks: [{name: 'Mutable metadata', level: 'danger', description: 'some RugCheck-authored text that must never reach the client verbatim as facts'}], providerScoreNormalized: 3},
       failedChecks: ['Mint authority is still active.', 'Freeze authority is still active.'],
@@ -359,8 +360,10 @@ describe('GET contractSafety: minimal client shape, defensive against malformed 
     assert.equal(json.includes('facts'), false, 'stored facts must never be serialized to the client');
     assert.equal(json.includes('providerRisks'), false);
     assert.equal(json.includes('providerScoreNormalized'), false);
-    assert.equal(json.includes('checkedAt'), false);
-    assert.equal(json.includes('rugcheck'), false, 'the provider source/name is not client-facing');
+    assert.equal(data.signals[0].reviewEvidence.contract.checkedAt, clock.now());
+    assert.equal(data.signals[0].reviewEvidence.contract.source, 'rugcheck');
+    assert.equal(data.signals[0].reviewEvidence.contract.mintAuthorityRenounced, false);
+    assert.equal(Object.hasOwn(data.signals[0].contractSafety, 'checkedAt'), false, 'badge remains minimized; provenance is allow-listed separately');
   });
 
   test('a high score never overrides an unsafe or unavailable status: both stay out of the opportunity set regardless of score/state columns', async () => {
@@ -437,6 +440,10 @@ describe('POST contractSafety: candidates[].snapshot.contractSafety matches GET\
     const got = await body(await read());
     const signal = got.signals.find(s => s.address === addresses.tokenA);
     assert.deepEqual(signal.contractSafety, candidate.snapshot.contractSafety);
+    assert.deepEqual(signal.reviewEvidence, candidate.reviewEvidence, 'GET and POST share the stored evidence allow-list');
+    assert.equal(signal.reviewEvidence.contract.mintAuthorityRenounced, true);
+    assert.equal(signal.reviewEvidence.market.source, 'dexscreener');
+    assert.ok(signal.reviewEvidence.market.checkedAt > 0);
     assert.deepEqual(candidate.snapshot.contractSafety, {status: 'verified'});
   });
 
@@ -453,14 +460,18 @@ describe('POST contractSafety: candidates[].snapshot.contractSafety matches GET\
     assert.deepEqual(contractSafetySummary({status: 'unsafe', failedChecks: ['Mint authority is still active.']}), {status: 'unsafe', reason: 'Mint authority is still active.'});
   });
 
-  test('no ContractSafety-only field leaks anywhere in the full serialized POST body, not just inside snapshot.contractSafety', async () => {
+  test('raw safety reports stay server-side; only the separate evidence allow-list extends the response', async () => {
     // Matched as JSON object keys ("key":), not substrings: snapshot.source ('dexscreener') and
     // assessment evidence text naming the provider ("rugcheck") are legitimate and unrelated to this
     // check, which targets only field names unique to the stored ContractSafety/ContractSafetyFacts
     // shape (lib/goldmine/snapshot.ts). A future change that spreads or nests the raw object anywhere in
     // the response - not only into candidates[].snapshot.contractSafety - would be caught here.
     feeds.safety = () => Response.json(safetyReport({rugged: true}));
-    const raw = await (await scan()).text();
+    const payload = await body(await scan());
+    const full = JSON.stringify(payload);
+    for (const forbidden of ['providerRisks', 'providerScoreNormalized', 'facts', 'totalMarketLiquidityUsd']) assert.equal(full.includes(forbidden), false, forbidden);
+    assert.equal(payload.candidates[0].reviewEvidence.contract.rugged, true);
+    const raw = JSON.stringify({...payload, candidates: payload.candidates.map(({reviewEvidence, ...candidate}) => candidate)});
     for (const key of ['facts', 'providerRisks', 'providerScoreNormalized', 'checkedAt', 'failedChecks', 'mintAuthorityRenounced', 'freezeAuthorityRenounced', 'lpLockedPct', 'totalMarketLiquidityUsd', 'topHolderPct', 'topHoldersPct', 'creatorHoldingsPct', 'insiderNetworksDetected', 'rugged']) {
       assert.equal(raw.includes(`"${key}"`), false, key);
     }
@@ -633,3 +644,4 @@ describe('GET latest: the most recent recorded batch, from storage, independent 
     assert.ok(d1.queries.every(query => /^\s*SELECT/i.test(query)), 'every statement this read issues is a SELECT');
   });
 });
+

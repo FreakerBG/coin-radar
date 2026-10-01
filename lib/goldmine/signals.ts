@@ -1,3 +1,4 @@
+import {reviewEvidence} from './review-evidence';
 // Goldmine signal tracking in D1. A signal records a scored candidate at detection: its snapshot, its
 // assessment and the provider price at that moment. Each signal gets one outcome row per *active* horizon
 // (lib/goldmine/cadence.ts ACTIVE_HORIZONS), evaluated once, only inside that horizon's window: a check
@@ -523,6 +524,7 @@ export async function readTracking(database: D1Database, now: number = Date.now(
       // provider score or provider risk text - and defensively parsed so a malformed or legacy-shaped
       // stored snapshot can never crash this read or be read as safe.
       contractSafety: contractSafetySummary(at(parseSnapshot(signal.snapshot), 'contractSafety')),
+      reviewEvidence: reviewEvidence(parseSnapshot(signal.snapshot), signal),
       assessment: JSON.parse(signal.assessment) as Assessment,
       outcomes: outcomes.filter(outcome => outcome.signal_id === signal.id).sort(byHorizon).map(outcome => {
         const definition = horizonById(outcome.horizon);
@@ -644,3 +646,4 @@ export async function readLatestBatch(database: D1Database): Promise<LatestBatch
     byState,
   };
 }
+
