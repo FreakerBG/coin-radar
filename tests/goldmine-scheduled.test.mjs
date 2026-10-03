@@ -94,6 +94,18 @@ describe('pipeline and lock, once authorized', () => {
     assert.deepEqual(d1.rows('SELECT id FROM research_locks'), [], 'the shared lock is released');
   });
 
+  // Stage 09A adds reviewEvidence to the signed-in interactive response only. The scheduled responses,
+  // which the scheduler Worker receives, must not change shape.
+  test('neither scheduled response carries reviewEvidence', async () => {
+    const daily = await (await GET(request('GET', { authorization: 'Bearer bearer-secret' }))).text();
+    clock.advance(6 * 3600000);
+    const detection = await (await POST(request('POST', { 'x-goldmine-cron-secret': 'header-secret' }))).text();
+    for (const raw of [daily, detection]) {
+      assert.ok(JSON.parse(raw).candidates.length > 0, 'the fixture produces candidates, so absence is meaningful');
+      assert.equal(raw.includes('reviewEvidence'), false);
+    }
+  });
+
   test('POST records detections but does not evaluate due outcomes; the daily GET does', async () => {
     const credential = { 'x-goldmine-cron-secret': 'header-secret' };
     const first = await body(await POST(request('POST', credential)));

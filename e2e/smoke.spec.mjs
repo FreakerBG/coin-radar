@@ -96,27 +96,6 @@ async function openDashboard(page) {
   await expect(page.getByRole('button', {name: 'View score explanation for FIXA'})).toBeVisible();
 }
 
-test('Stage 09: near misses stay collapsed and research-only; missing facts are explicit', async ({page}) => {
-  const evidence = {
-    market:{source:'dexscreener',checkedAt:1000,liquidityUsd:0,marketCapUsd:null,volume1hUsd:100,buys1h:0,sells1h:5,promoted:false},
-    contract:{source:null,checkedAt:null,mintAuthorityRenounced:null,freezeAuthorityRenounced:null,lpLockedPct:null,topHolderPct:null,topHoldersPct:null,creatorHoldingsPct:null,insiderNetworksDetected:null,rugged:null},
-  };
-  const signal={id:'miss',address:coin.address,pair:coin.pair,symbol:'MISS',state:'BUILDING',score:70,opportunity:false,
-    detectedAt:'2026-01-01T00:00:00Z',detectedPrice:coin.price,contractSafety:{status:'unavailable'},reviewEvidence:evidence,assessment:{summary:'Safety unavailable.'},outcomes:[]};
-  const writes=[];
-  await mockApis(page,{goldmine:{status:200,json:goldmineTracking({signals:[signal]})}});
-  page.on('request',r=>{if(r.method()==='POST')writes.push(r.url());});
-  await openDashboard(page);await tab(page,'Goldmine').click();
-  const misses=page.locator('.near-misses');await expect(misses).not.toHaveAttribute('open','');
-  await misses.locator('summary').first().click();
-  await expect(misses).toContainText('Safety unavailable.');
-  await expect(misses.getByRole('link')).toHaveCount(0);
-  await expect(misses.getByRole('button',{name:/Plan in Advisor/})).toHaveCount(0);
-  await misses.locator('.stored-evidence summary').click();
-  await expect(misses).toContainText('Unknown');await expect(misses).toContainText('0 USD');
-  await expect(misses).toContainText('Observation time unknown');expect(writes).toEqual([]);
-});
-
 test('Stage 09: manual observations never create a position, and reset with the target', async ({page}) => {
   const writes=[];
   await mockApis(page,{goldmine:{status:200,json:goldmineTracking({signals:[{id:'review',address:coin.address,pair:'PairBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB',symbol:'REVIEW',state:'BREAKOUT',score:81,opportunity:true,detectedAt:'2026-01-01T00:00:00Z',detectedPrice:coin.price,contractSafety:{status:'verified'},assessment:{summary:'Fixture.'},outcomes:[]}]})}});
@@ -426,8 +405,8 @@ test('Goldmine: a verified opportunity renders as a card; an empty successful sc
   await openDashboard(page);
   await tab(page, 'Goldmine').click();
   await page.getByRole('button', {name: 'Scan now'}).click();
-  await expect(page.getByText('1 verified opportunity found.')).toBeVisible();
-  await expect(page.getByText('RugCheck verified')).toBeVisible();
+  await expect(page.getByText('1 opportunity met every gate at scan.')).toBeVisible();
+  await expect(page.getByText('Checks met at scan')).toBeVisible();
   await expect(page.getByText('BREAKOUT · score 81/100. Passes every gate.')).toBeVisible();
 
   // A second scan with zero opportunities is an honest empty result, not an error banner.
@@ -443,13 +422,192 @@ test('opportunity review exposes exact-mint social and holder checks without cla
   await openDashboard(page);
   await tab(page, 'Goldmine').click();
   await page.getByRole('button', {name: 'Scan now'}).click();
-  const review = page.getByText('Research socials and wallets before trading');
-  await review.click();
+  // Stage 09A: the PR #39 checklist now lives inside the card's evidence panel, under what Coin Radar cannot measure.
+  await page.getByText('Evidence & unknowns').click();
+  await expect(page.getByText('Research socials and wallets before trading')).toBeVisible();
   await expect(page.getByText('Coin Radar has no verified follower count or independent-wallet count for this mint.', {exact: false})).toBeVisible();
   await expect(page.getByRole('link', {name: 'Open Solscan holders and flows'})).toHaveAttribute('href', 'https://solscan.io/token/' + coin.address);
   await expect(page.getByRole('link', {name: 'Open RugCheck'})).toHaveAttribute('href', 'https://rugcheck.xyz/tokens/' + coin.address);
   await expect(page.getByRole('link', {name: 'Search the exact mint on X'})).toHaveAttribute('href', 'https://x.com/search?q=' + encodeURIComponent(coin.address) + '&f=live');
 });
+
+// Stage 09A review evidence, shaped like lib/goldmine/review-evidence.ts output. Times are relative to the
+// real clock because the panel computes ages from Date.now().
+const evidenceFactor = (id, value, status, source, asOf) => ({id, value, status, source, asOf});
+function reviewEvidenceFixture({marketAt = Date.now() - 5 * HOUR, reportAt = marketAt - 2 * 60000, status = 'verified', hardFailures = [], notVerified = [], flags = [], state = 'BREAKOUT'} = {}) {
+  const at = status === 'unavailable' ? null : reportAt;
+  const contract = (id, value) => evidenceFactor(id, at === null ? null : value, at === null ? 'not_measured' : status === 'verified' ? 'within_check' : 'recorded', 'rugcheck', at);
+  return {
+    version: 1, readable: true, modelVersion: 'momentum-v2.1.0', state, marketObservedAt: marketAt,
+    safety: {status, reportAt: at, unavailableReason: status === 'unavailable' ? 'not_checked_or_incomplete' : null},
+    hardFailures, notVerified, flags,
+    factors: [
+      contract('mint_authority', true), contract('freeze_authority', true), contract('lp_locked', 95), contract('largest_holder', 8),
+      contract('top_holders', 16), contract('creator_holding', 1.2), contract('insider_networks', 0), contract('rugged_flag', false),
+      evidenceFactor('liquidity_usd', 150000, 'recorded', 'dexscreener', marketAt),
+      evidenceFactor('market_cap_usd', null, 'not_measured', 'dexscreener', null),
+      evidenceFactor('buys_h1', 30, 'recorded', 'dexscreener', marketAt),
+      evidenceFactor('sells_h1', 10, 'recorded', 'dexscreener', marketAt),
+      evidenceFactor('x_distinct_authors', null, 'not_measured', 'x_cache', null),
+    ],
+  };
+}
+const trackedSignal = (overrides = {}) => ({
+  id: 'sig-tracked', address: coin.address, pair: coin.pair, symbol: coin.symbol, modelVersion: 'momentum-v2.1.0', state: 'BREAKOUT', score: 81, opportunity: true,
+  detectedAt: new Date(Date.now() - 5 * HOUR).toISOString(), detectedPrice: coin.price, contractSafety: {status: 'verified'},
+  reviewEvidence: reviewEvidenceFixture(), assessment: {summary: 'BREAKOUT · score 81/100. Passes every gate.'}, outcomes: [], ...overrides,
+});
+const NEAR_MINT = 'NearMissMintAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', NEAR_POOL = 'NearMissPairAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA';
+const nearMissSignal = (overrides = {}) => trackedSignal({
+  id: 'sig-near', address: NEAR_MINT, pair: NEAR_POOL, symbol: 'NEAR', state: 'BUILDING', score: 64, opportunity: false,
+  contractSafety: {status: 'unsafe', reason: 'Creator holds 15% of supply.'},
+  reviewEvidence: reviewEvidenceFixture({status: 'unsafe', state: 'BUILDING', hardFailures: ['Creator holds 15% of supply.'], flags: ['Pool younger than one hour.']}),
+  assessment: {summary: 'BUILDING · score 64/100. Not an opportunity: Contract safety checks failed.'}, ...overrides,
+});
+const opportunityCard = page => page.locator('.feed-item', {hasText: 'Opportunity signal · not a trade instruction'});
+
+test('Goldmine: an opportunity card shows recorded evidence with sources and ages, and names what Coin Radar cannot measure', async ({page}) => {
+  await mockApis(page, {'goldmine:post': {status: 200, json: goldmineChecked({candidates: [goldmineCandidate({reviewEvidence: reviewEvidenceFixture()})], opportunities: 1})}});
+  await openDashboard(page);
+  await tab(page, 'Goldmine').click();
+  await page.getByRole('button', {name: 'Scan now'}).click();
+  const card = opportunityCard(page);
+  // Collapsed, the summary still states counts and age, so risk is visible without opening anything.
+  await expect(card.getByTestId('evidence-summary')).toContainText('0 hard failures recorded');
+  await expect(card.getByTestId('evidence-summary')).toContainText('(past snapshot)');
+  await card.getByText('Evidence & unknowns').click();
+  await expect(card.getByTestId('evidence-market-time')).toContainText('(past snapshot)');
+  await expect(card.getByTestId('evidence-report-time')).toContainText('(past snapshot)');
+  await expect(card.getByText('Past snapshot. Liquidity, holders, authorities and price can change within minutes.', {exact: false})).toBeVisible();
+  await expect(card.getByText('None recorded by the stored assessment. That is not a safety guarantee.')).toBeVisible();
+  const creator = card.locator('[data-factor="creator_holding"]');
+  await expect(creator).toContainText('1.2%');
+  await expect(creator).toContainText('Within check at scan');
+  await expect(creator).toContainText('RugCheck report');
+  await expect(card.locator('[data-factor="market_cap_usd"]')).toContainText('Not measured');
+  const manual = card.locator('.evidence-manual-list');
+  for (const item of ['Snipers %', 'Bundle %', 'Dev Holding %', 'Holders']) await expect(manual.getByText(item, {exact: true})).toBeVisible();
+  await expect(manual.getByText('Check in Axiom').first()).toBeVisible();
+  await expect(card.getByText('Nothing here was rescored', {exact: false})).toBeVisible();
+  // No row, chip or sentence calls the token safe or says it passed.
+  const text = await card.innerText();
+  expect(text).not.toMatch(/\b(safe|passed)\b/i);
+});
+
+test('Goldmine: a response without review evidence says so rather than looking clean', async ({page}) => {
+  await mockApis(page, {'goldmine:post': {status: 200, json: goldmineChecked({candidates: [goldmineCandidate()], opportunities: 1})}});
+  await openDashboard(page);
+  await tab(page, 'Goldmine').click();
+  await page.getByRole('button', {name: 'Scan now'}).click();
+  await expect(opportunityCard(page).getByTestId('evidence-summary')).toHaveText('Evidence details were not included in this response. Treat every value as unverified.');
+});
+
+test.describe('Goldmine: snapshot times are labelled by tier, the market and RugCheck times separately', () => {
+  const MIN = 60000;
+  for (const [label, marketOffset, reportOffset, marketTier, reportTier, sentence] of [
+    ['2 minutes old', -2 * MIN, -3 * MIN, 'recent snapshot', 'recent snapshot', 'Recent snapshot, still not a live quote.'],
+    ['a recent snapshot with a 40-minute-old report', -2 * MIN, -40 * MIN, 'recent snapshot', 'past snapshot', 'Past snapshot.'],
+    ['2 minutes in the future', 2 * MIN, -3 * MIN, 'time uncertain', 'recent snapshot', 'Time uncertain (a clock difference'],
+    ['1 hour in the future', HOUR, -3 * MIN, 'time invalid', 'recent snapshot', 'Time invalid (in the future).'],
+  ]) {
+    test(label, async ({page}) => {
+      const now = Date.now();
+      const evidence = reviewEvidenceFixture({marketAt: now + marketOffset, reportAt: now + reportOffset});
+      await mockApis(page, {goldmine: {status: 200, json: goldmineTracking({signals: [trackedSignal({reviewEvidence: evidence})]})}});
+      await openDashboard(page);
+      await tab(page, 'Goldmine').click();
+      const row = page.locator('.feed-item', {hasText: 'research signal, not a trade instruction'}).first();
+      await row.getByText('Evidence & unknowns').click();
+      await expect(row.getByTestId('evidence-market-time')).toContainText(`(${marketTier})`);
+      await expect(row.getByTestId('evidence-report-time')).toContainText(`(${reportTier})`);
+      await expect(row.locator('.evidence-tier')).toContainText(sentence);
+      if (marketOffset > 0) await expect(row.getByTestId('evidence-market-time')).not.toContainText('ago');
+    });
+  }
+
+  test('a missing market time is unknown, never recent', async ({page}) => {
+    const evidence = {...reviewEvidenceFixture(), marketObservedAt: null};
+    await mockApis(page, {goldmine: {status: 200, json: goldmineTracking({signals: [trackedSignal({reviewEvidence: evidence})]})}});
+    await openDashboard(page);
+    await tab(page, 'Goldmine').click();
+    const row = page.locator('.feed-item', {hasText: 'research signal, not a trade instruction'}).first();
+    await expect(row.getByTestId('evidence-summary')).toContainText('time unknown');
+    await row.getByText('Evidence & unknowns').click();
+    await expect(row.getByTestId('evidence-market-time')).toHaveText('time unknown');
+  });
+});
+
+test('Goldmine: near misses are collapsed, research-only, list hard failures first, and never send a request', async ({page}) => {
+  const signals = [trackedSignal(), nearMissSignal(), trackedSignal({id: 'sig-rejected', address: 'RejectedMintAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA', symbol: 'REJ', state: 'REJECTED', opportunity: false, reviewEvidence: null})];
+  const posts = [];
+  await mockApis(page, {goldmine: {status: 200, json: goldmineTracking({signals})}});
+  page.on('request', request => { if (request.method() !== 'GET') posts.push(request.url()); });
+  await openDashboard(page);
+  await tab(page, 'Goldmine').click();
+  const list = page.getByTestId('near-miss-list');
+  await expect(list.locator(':scope > summary')).toContainText('Not trade-ready: recent signals that missed a gate (1)');
+  await expect(list).toHaveJSProperty('open', false);
+  await list.locator(':scope > summary').click();
+  const item = list.locator('.near-miss-item');
+  await expect(item).toHaveCount(1);
+  await expect(item).toContainText('NEAR');
+  await expect(item).toContainText('not trade-ready');
+  await expect(item.getByText('Failed safety check')).toBeVisible();
+  // Research only: no trading-app or Advisor action anywhere in the list.
+  for (const name of [/Review in Axiom/, /Open in Phantom/, /Swap in Phantom/, /Plan in Advisor/]) {
+    await expect(list.getByRole('link', {name})).toHaveCount(0);
+    await expect(list.getByRole('button', {name})).toHaveCount(0);
+  }
+  await expect(item.getByRole('button', {name: 'Copy mint for NEAR'})).toBeVisible();
+  await expect(item.getByRole('link', {name: /Pool data & chart/})).toHaveAttribute('href', `https://dexscreener.com/solana/${NEAR_POOL}`);
+  await item.getByText('Evidence & unknowns').click();
+  await expect(item.locator('.evidence-body h4').first()).toHaveText('Hard failures (1)');
+  await expect(item.getByText('Creator holds 15% of supply.').first()).toBeVisible();
+  expect(posts).toEqual([]);
+});
+
+test('Goldmine: an empty near-miss list is an honest result, distinct from no signals at all', async ({page}) => {
+  const rejected = trackedSignal({id: 'sig-rejected', state: 'REJECTED', opportunity: false, reviewEvidence: null});
+  await mockApis(page, {goldmine: {status: 200, json: goldmineTracking({signals: [rejected]})}});
+  await openDashboard(page);
+  await tab(page, 'Goldmine').click();
+  const list = page.getByTestId('near-miss-list');
+  await list.locator(':scope > summary').click();
+  await expect(list.getByRole('heading', {name: 'No near misses in the most recent 50 recorded signals'})).toBeVisible();
+  await expect(list.getByText('An empty list here is a result, not a missing scan.', {exact: false})).toBeVisible();
+
+  await mockApis(page, {goldmine: {status: 200, json: goldmineTracking({signals: []})}});
+  await page.getByRole('button', {name: /Refresh list of recorded opportunities/}).click();
+  await expect(list.getByText('Nothing has been recorded on this deployment yet.')).toBeVisible();
+});
+
+test('Goldmine: a failed history read hides the near-miss list instead of showing it empty', async ({page}) => {
+  await mockApis(page, {goldmine: {status: 503, json: {error: 'Signal storage unavailable.'}}});
+  await openDashboard(page);
+  await tab(page, 'Goldmine').click();
+  await expect(page.getByRole('alert').filter({hasText: 'Signal storage unavailable.'})).toBeVisible();
+  await expect(page.getByTestId('near-miss-list')).toHaveCount(0);
+});
+
+for (const width of [320, 390]) {
+  test(`Goldmine at ${width}px: expanded evidence and near-miss list have no horizontal overflow and usable tap targets`, async ({page}) => {
+    await page.setViewportSize({width, height: 844});
+    await mockApis(page, {goldmine: {status: 200, json: goldmineTracking({signals: [trackedSignal(), nearMissSignal()]})}});
+    await openDashboard(page);
+    await tab(page, 'Goldmine').click();
+    const row = page.locator('.feed-item', {hasText: 'research signal, not a trade instruction'}).first();
+    await row.getByText('Evidence & unknowns').click();
+    const list = page.getByTestId('near-miss-list');
+    await list.locator(':scope > summary').click();
+    await list.locator('.near-miss-item').getByText('Evidence & unknowns').click();
+    for (const summary of [row.locator('.candidate-evidence > summary'), list.locator(':scope > summary')]) {
+      const box = await summary.boundingBox();
+      expect(box.height, 'tap target height').toBeGreaterThanOrEqual(40);
+    }
+    const overflow = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
+    expect(overflow, `overflows by ${overflow}px`).toBeLessThanOrEqual(0);
+  });
+}
 
 test('Goldmine: a candidate the backend did not mark opportunity never appears as one', async ({page}) => {
   const rejected = goldmineCandidate({opportunity: false, state: 'REJECTED', score: 20, summary: 'REJECTED. Thin liquidity.', snapshot: {contractSafety: {status: 'unsafe', source: 'rugcheck'}, promoted: false}});
@@ -524,7 +682,7 @@ test('Goldmine: the scan button is disabled while a scan is in flight, so rapid 
   // Two more clicks while disabled must not queue additional requests.
   await scanButton.click({force: true});
   await scanButton.click({force: true});
-  await expect(page.getByText('1 verified opportunity found.')).toBeVisible();
+  await expect(page.getByText('1 opportunity met every gate at scan.')).toBeVisible();
   expect(postCount).toBe(1);
 });
 
