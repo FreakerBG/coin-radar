@@ -45,7 +45,8 @@ export async function POST(request: Request) {
     const database = db();
     lock = await acquireLock(LOCK_ID, SCAN_LOCK_TTL_MS);
     if (!lock) return Response.json({status: 'busy', candidates: []}, {headers: noStore});
-    const result = await runGoldmineScan(database, Date.now());
+    // Signed-in dashboard only: include the review view. The scheduled routes never ask for it.
+    const result = await runGoldmineScan(database, Date.now(), {reviewEvidence: true});
     return Response.json(result, {headers: noStore});
   } catch (error) {
     reportFailure('goldmine', 'scan', error);

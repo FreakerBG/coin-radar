@@ -3,8 +3,11 @@
 // provider or recomputes a safety decision: it only classifies data the API already returned.
 import type {Assessment} from './score';
 import type {CandidateSnapshot} from './snapshot';
+import type {ReviewEvidence} from './review-evidence';
 
-export type PostedCandidate = Assessment & {snapshot: CandidateSnapshot};
+// `reviewEvidence` is present on the signed-in interactive scan response only; a response without it
+// renders as "evidence not included", never as an empty (clean) result.
+export type PostedCandidate = Assessment & {snapshot: CandidateSnapshot; reviewEvidence?: ReviewEvidence | null};
 export type ScanStatus = 'idle' | 'loading' | 'opportunities' | 'empty' | 'busy' | 'unavailable' | 'error';
 
 // How long a scan result is shown as current before the panel calls it stale and asks for a fresh scan.

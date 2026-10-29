@@ -10,6 +10,8 @@ const {GET, POST} = await import('../app/api/goldmine/route.ts');
 const {MODEL_VERSION} = await import('../lib/goldmine/score.ts');
 const {ACTIVE_HORIZON_IDS, MAX_SCAN_GAP_MS, MIN_SCAN_GAP_MS, OBSERVATION_GRACE_MS, SCAN_CADENCE_MS} = await import('../lib/goldmine/cadence.ts');
 const {contractSafetySummary} = await import('../lib/goldmine/snapshot.ts');
+const {reviewEvidence} = await import('../lib/goldmine/review-evidence.ts');
+const {RECENT_SIGNALS_READ} = await import('../lib/goldmine/evidence-view.ts');
 const {MAX_OUTCOME_BATCHES, MAX_PAIRS_PER_REQUEST} = await import('../lib/goldmine/signals.ts');
 
 // A realistic populated RugCheck report that verifies cleanly (same shape as the Stage 03B provider
@@ -131,8 +133,11 @@ describe('scanning', () => {
       ['d7', 'pending', 7 * DAY, 7 * DAY + OBSERVATION_GRACE_MS],
     ]);
     const [stored] = d1.rows('SELECT snapshot, assessment FROM goldmine_signals WHERE address = ?', addresses.tokenA);
-    const {snapshot, ...assessment} = a;
+    const {snapshot, reviewEvidence: servedEvidence, ...assessment} = a;
     const storedSnapshot = JSON.parse(stored.snapshot);
+    // Stage 09A: the interactive response's review view is exactly what the stored row yields, so a card
+    // shown straight after a scan and the same signal read back later from GET can never disagree.
+    assert.deepEqual(servedEvidence, reviewEvidence(storedSnapshot, JSON.parse(stored.assessment)));
     // Storage (recordSignals) keeps the full scored snapshot, including raw contractSafety facts, so a
     // later model version can re-score exactly what was observed; only the served response reduces
     // contractSafety to the minimal client-facing shape. Everything else is exactly what was served.
@@ -360,7 +365,52 @@ describe('GET contractSafety: minimal client shape, defensive against malformed 
     assert.equal(json.includes('providerRisks'), false);
     assert.equal(json.includes('providerScoreNormalized'), false);
     assert.equal(json.includes('checkedAt'), false);
-    assert.equal(json.includes('rugcheck'), false, 'the provider source/name is not client-facing');
+    assert.equal(json.includes('RugCheck-authored text'), false, 'provider risk text never reaches the client');
+    // Deliberately changed in Stage 09A: the provider *name* is now client-facing as the source label of
+    // reviewEvidence's allow-listed facts. The badge shape itself still never carries it.
+    assert.equal(JSON.stringify(data.signals[0].contractSafety).includes('rugcheck'), false, 'the badge shape carries no provider name');
+  });
+
+  test('reviewEvidence (Stage 09A) carries only allow-listed facts and the stored classification', async () => {
+    seedSignal('sig-unsafe-evidence', JSON.stringify({address: addresses.tokenA, pair: addresses.pairA, observedAt: clock.now(), contractSafety: {
+      status: 'unsafe', source: 'rugcheck', checkedAt: clock.now() - 60000,
+      facts: {mintAuthorityRenounced: false, freezeAuthorityRenounced: true, creatorHoldingsPct: 2, providerRisks: [{name: 'Secret risk name', level: 'danger', description: 'RugCheck-authored text'}], providerScoreNormalized: 3},
+      failedChecks: ['Mint authority is still active.'],
+    }}));
+    const evidence = (await body(await read())).signals[0].reviewEvidence;
+    assert.deepEqual(evidence.safety, {status: 'unsafe', reportAt: clock.now() - 60000, unavailableReason: null});
+    assert.deepEqual(evidence.hardFailures, ['Mint authority is still active.']);
+    const byId = Object.fromEntries(evidence.factors.map(item => [item.id, item]));
+    assert.equal(byId.mint_authority.status, 'fails_check');
+    assert.equal(byId.creator_holding.value, 2);
+    assert.equal(byId.creator_holding.status, 'within_check', 'unsafe lists every failed available check, so an unlisted present fact passed its stored check');
+    const json = JSON.stringify(evidence);
+    for (const leak of ['Secret risk name', 'RugCheck-authored text', 'providerRisks', 'providerScoreNormalized', '"facts"', 'failedChecks', 'checkedAt']) {
+      assert.equal(json.includes(leak), false, leak);
+    }
+  });
+
+  test('reviewEvidence is withheld when the stored snapshot names a different mint or pool than its row', async () => {
+    seedSignal('sig-other-pool', JSON.stringify({address: addresses.tokenA, pair: 'SomeOtherPool', observedAt: clock.now(), liquidityUsd: 1234567,
+      contractSafety: {status: 'verified', source: 'rugcheck', checkedAt: clock.now(), facts: {mintAuthorityRenounced: true}}}));
+    const evidence = (await body(await read())).signals[0].reviewEvidence;
+    assert.equal(evidence.readable, false);
+    assert.equal(evidence.safety.status, 'unavailable');
+    assert.equal(JSON.stringify(evidence).includes('1234567'), false);
+  });
+
+  test('a REJECTED row carries no reviewEvidence (never rendered as a card), keeping the fixed read small', async () => {
+    d1.sqlite.prepare('INSERT INTO goldmine_signals (id, address, pair, symbol, model_version, state, score, opportunity, detected_at, detected_price, snapshot, assessment) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run('sig-rejected', addresses.tokenA, addresses.pairA, 'FIX', MODEL_VERSION, 'REJECTED', 10, 0, clock.now(), 0.01, '{}', '{"summary":"REJECTED."}');
+    assert.equal((await body(await read())).signals[0].reviewEvidence, null);
+  });
+
+  test(`GET returns at most RECENT_SIGNALS_READ (${RECENT_SIGNALS_READ}) signals, the window the near-miss copy names`, async () => {
+    const insert = d1.sqlite.prepare('INSERT INTO goldmine_signals (id, address, pair, symbol, model_version, state, score, opportunity, detected_at, detected_price, snapshot, assessment) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)');
+    for (let i = 0; i < RECENT_SIGNALS_READ + 7; i++) insert.run(`sig-${i}`, addresses.tokenA, addresses.pairA, 'FIX', MODEL_VERSION, 'BUILDING', 50, 0, clock.now() - i * 60000, 0.01, '{}', '{"summary":"BUILDING."}');
+    const data = await body(await read());
+    assert.equal(data.signals.length, RECENT_SIGNALS_READ);
+    assert.equal(data.signals[0].id, 'sig-0', 'newest first');
   });
 
   test('a high score never overrides an unsafe or unavailable status: both stay out of the opportunity set regardless of score/state columns', async () => {
