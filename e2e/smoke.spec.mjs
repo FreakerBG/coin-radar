@@ -103,6 +103,37 @@ test('initial dashboard renders market fixtures', async ({page}) => {
   await expect(page.getByRole('heading', {name: 'Market radar'})).toBeVisible();
 });
 
+test('Axiom setup is a manual guide with documented fields and no trading request', async ({page}) => {
+  const posts = [];
+  await mockApis(page);
+  page.on('request', request => { if (request.method() === 'POST') posts.push(request.url()); });
+  await openDashboard(page);
+  await tab(page, 'Axiom setup').click();
+  await expect(page.getByRole('heading', {name: 'Set up Axiom Pulse'})).toBeVisible();
+  await expect(page.getByRole('rowheader', {name: 'Dev Holding %'})).toBeVisible();
+  await expect(page.getByRole('rowheader', {name: 'Market Cap ($)'})).toBeVisible();
+  await expect(page.getByText('The observed Pulse screen mixed SOL and ETH cards even in Migrated;', {exact:false})).toBeVisible();
+  await expect(page.getByRole('link', {name: /Open Axiom Pulse/})).toHaveAttribute('href', 'https://axiom.trade/pulse');
+  await expect(page.getByText('Coin Radar cannot change your Axiom settings or place orders.')).toBeVisible();
+  expect(posts).toEqual([]);
+});
+
+test('full-loss planner caps spend and never sends a trade', async ({page}) => {
+  const posts = [];
+  await mockApis(page);
+  page.on('request', request => { if (request.method() === 'POST') posts.push(request.url()); });
+  await openDashboard(page);
+  await tab(page, 'Axiom setup').click();
+  await expect(page.getByRole('heading', {name: 'Full-loss trade planner'})).toBeVisible();
+  await page.getByRole('spinbutton', {name: /Speculative trading budget/}).fill('1000');
+  await page.getByRole('spinbutton', {name: /Live exact-pool liquidity/}).fill('50000');
+  await expect(page.getByText('Full-loss budget is binding.')).toBeVisible();
+  await expect(page.getByText('$4.45', {exact:true})).toBeVisible();
+  await page.getByRole('spinbutton', {name: /Maximum full loss of budget/}).fill('0.01');
+  await expect(page.getByText('Estimated fixed costs use the entire loss budget; skip this setup.')).toBeVisible();
+  expect(posts).toEqual([]);
+});
+
 test('provider outage shows an unavailable state', async ({page}) => {
   await mockApis(page, {market: {status: 502, json: {coins: [], asOf: null, error: 'Market provider unavailable. Retry shortly; no trading signals are being generated.'}}});
   await page.goto('/');
@@ -358,6 +389,19 @@ test('Goldmine: a verified opportunity renders as a card; an empty successful sc
   await expect(page.getByRole('status').getByText('Scanned 0 candidates. None currently pass every safety and momentum gate.')).toBeVisible();
   await expect(page.getByRole('heading', {name: 'No opportunities right now'})).toBeVisible();
   await expect(page.getByRole('alert')).toHaveCount(0);
+});
+
+test('opportunity review exposes exact-mint social and holder checks without claiming independent wallets', async ({page}) => {
+  await mockApis(page, {'goldmine:post': {status: 200, json: goldmineChecked({candidates: [goldmineCandidate()], opportunities: 1})}});
+  await openDashboard(page);
+  await tab(page, 'Goldmine').click();
+  await page.getByRole('button', {name: 'Scan now'}).click();
+  const review = page.getByText('Research socials and wallets before trading');
+  await review.click();
+  await expect(page.getByText('Coin Radar has no verified follower count or independent-wallet count for this mint.', {exact: false})).toBeVisible();
+  await expect(page.getByRole('link', {name: 'Open Solscan holders and flows'})).toHaveAttribute('href', 'https://solscan.io/token/' + coin.address);
+  await expect(page.getByRole('link', {name: 'Open RugCheck'})).toHaveAttribute('href', 'https://rugcheck.xyz/tokens/' + coin.address);
+  await expect(page.getByRole('link', {name: 'Search the exact mint on X'})).toHaveAttribute('href', 'https://x.com/search?q=' + encodeURIComponent(coin.address) + '&f=live');
 });
 
 test('Goldmine: a candidate the backend did not mark opportunity never appears as one', async ({page}) => {

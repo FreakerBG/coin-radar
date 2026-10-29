@@ -130,9 +130,13 @@ Migration rules:
 
 ## Provider documentation
 
+For manual trading research, use the in-app Axiom setup tab with [the handoff notes](docs/manual-trading-handoff.md), [filter outcome audit](docs/filter-outcome-audit.md), and [strategy filter research](docs/strategy-filter-research.md). Those filters are study hypotheses; a live Axiom order is always a separate manual decision.
+
 - https://docs.dexscreener.com/api/reference
 - https://docs.phantom.com/developer-powertools/token-pages
 - https://docs.phantom.com/phantom-deeplinks/other-methods/swap
 - https://docs.axiom.trade/axiom/swap/market (contract-address search; see docs/manual-trading-handoff.md for what is and is not verified about Axiom links)
 - https://docs.x.com/x-api/getting-started/pricing
 - https://developers.cloudflare.com/workers/configuration/cron-triggers/
+
+Manual trades require checking the live pool and order in Axiom or Phantom.
